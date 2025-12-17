@@ -76,48 +76,24 @@ class _FluidExpertComputation(torch.autograd.Function):
         w1 = weight1.view(num_local_experts, hidden_size, -1)
         w2 = weight2.view(num_local_experts, -1, hidden_size)
 
-        # grouped_gemm requires tokens_per_expert to be on CPU
-        tokens_per_expert_cpu = tokens_per_expert.cpu() if tokens_per_expert.is_cuda else tokens_per_expert
+        # grouped_gemm requirements:
+        # 1. Input tensors must be bfloat16 (NOT float16)
+        # 2. tokens_per_expert must be CPU int64 tensor
+        tokens_per_expert_cpu = tokens_per_expert.to(torch.int64).cpu()
 
-        # For now, use manual per-expert computation instead of grouped_gemm
-        # TODO: Optimize with proper grouped_gemm usage
-        fc1_outputs = []
-        fc2_outputs = []
-        start_idx = 0
-        for expert_idx in range(num_local_experts):
-            num_tokens = tokens_per_expert_cpu[expert_idx].item()
-            if num_tokens == 0:
-                continue
+        # Use grouped_gemm for efficient multi-expert computation
+        # FC1: [total_tokens, hidden] @ [num_experts, hidden, ffn] -> [total_tokens, ffn]
+        fc1_output = gg.ops.gmm(
+            permuted_local_hidden_states, w1, tokens_per_expert_cpu, trans_b=False
+        )
 
-            # Slice tokens for this expert
-            end_idx = start_idx + num_tokens
-            expert_input = permuted_local_hidden_states[start_idx:end_idx]  # [num_tokens, hidden]
-            expert_probs = permuted_probs[start_idx:end_idx]  # [num_tokens, 1]
+        # Activation with probs
+        intermediate_parallel = activation_func(fc1_output, permuted_probs)
 
-            # FC1: [num_tokens, hidden] x [hidden, intermediate] = [num_tokens, intermediate]
-            fc1_out = torch.matmul(expert_input, w1[expert_idx])
-
-            # Activation with probs
-            # expert_probs is already [num_tokens, 1], no need to unsqueeze again
-            intermediate = activation_func(fc1_out, expert_probs)
-
-
-            # FC2: [num_tokens, intermediate] x [intermediate, hidden] = [num_tokens, hidden]
-            fc2_out = torch.matmul(intermediate, w2[expert_idx])
-
-            fc1_outputs.append(fc1_out)
-            fc2_outputs.append(intermediate)  # For backward
-
-            if expert_idx == 0:
-                fc1_output = fc1_out
-                intermediate_parallel = intermediate
-                fc2_output = fc2_out
-            else:
-                fc1_output = torch.cat([fc1_output, fc1_out], dim=0)
-                intermediate_parallel = torch.cat([intermediate_parallel, intermediate], dim=0)
-                fc2_output = torch.cat([fc2_output, fc2_out], dim=0)
-
-            start_idx = end_idx
+        # FC2: [total_tokens, ffn] @ [num_experts, ffn, hidden] -> [total_tokens, hidden]
+        fc2_output = gg.ops.gmm(
+            intermediate_parallel, w2, tokens_per_expert_cpu, trans_b=False
+        )
 
         # Save intermediate tensors for backward
         ctx.fc1_output = fc1_output
@@ -152,33 +128,22 @@ class _FluidExpertComputation(torch.autograd.Function):
         w1 = weight1.view(num_local_experts, hidden_size, -1)
         w2 = weight2.view(num_local_experts, -1, hidden_size)
 
-        tokens_per_expert_cpu = tokens_per_expert.cpu() if tokens_per_expert.is_cuda else tokens_per_expert
+        # grouped_gemm requirements: CPU int64 tensor
+        tokens_per_expert_cpu = tokens_per_expert.to(torch.int64).cpu()
 
-        # === CRITICAL PATH: Compute dX immediately ===
-        grad_permuted_local_hidden_states = torch.zeros_like(permuted_local_hidden_states)
+        # === CRITICAL PATH: Compute dX immediately using grouped_gemm ===
+        # Grad from FC2: grad_fc2_output @ w2.T
+        # grad_fc2_output: [total_tokens, hidden], w2: [num_experts, ffn, hidden]
+        # trans_b=True: [total, hidden] @ [experts, ffn, hidden]^T = [total, ffn]
+        grad_intermediate = gg.ops.gmm(grad_fc2_output, w2, tokens_per_expert_cpu, trans_b=True)
 
-        start_idx = 0
-        for expert_idx in range(num_local_experts):
-            num_tokens = tokens_per_expert_cpu[expert_idx].item()
-            if num_tokens == 0:
-                continue
+        # Grad through activation (simplified - assumes no activation gradient modification)
+        grad_fc1 = grad_intermediate
 
-            end_idx = start_idx + num_tokens
-
-            # Grad from FC2: grad_fc2_output @ w2.T
-            grad_intermediate = torch.matmul(
-                grad_fc2_output[start_idx:end_idx],
-                w2[expert_idx].t()
-            )
-
-            # Grad through activation
-            grad_fc1 = grad_intermediate
-
-            # Grad from FC1: grad_fc1 @ w1.T (critical path)
-            grad_input = torch.matmul(grad_fc1, w1[expert_idx].t())
-            grad_permuted_local_hidden_states[start_idx:end_idx] = grad_input
-
-            start_idx = end_idx
+        # Grad from FC1: grad_fc1 @ w1.T (critical path)
+        # grad_fc1: [total_tokens, ffn], w1: [num_experts, hidden, ffn]
+        # trans_b=True: [total, ffn] @ [experts, hidden, ffn]^T = [total, hidden]
+        grad_permuted_local_hidden_states = gg.ops.gmm(grad_fc1, w1, tokens_per_expert_cpu, trans_b=True)
 
         # === LAZY REGISTRATION: Register dW computation ===
         # Detach tensors to avoid holding computation graph
