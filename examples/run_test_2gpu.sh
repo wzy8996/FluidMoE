@@ -6,7 +6,7 @@ set -e
 source /home/zju/miniconda3/bin/activate megatron
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTHONPATH=/home/zju/wzy/Fluid:/home/zju/wzy/Megatron-LM:$PYTHONPATH
+export PYTHONPATH=/home/zju/wzy/FluidMoE:/home/zju/wzy/Megatron-LM:$PYTHONPATH
 
 # ========================================
 # Profiling Configuration
@@ -20,13 +20,15 @@ NSYS_DURATION=${NSYS_DURATION:-20}
 LOG_OUTPUT=${LOG_OUTPUT:-"training_output.log"}
 
 echo "=========================================="
-echo "FluidMoE Quick Test (2 GPUs)"
+echo "FluidMoE Test (2 GPUs)"
 echo "=========================================="
 echo "Config:"
 echo "  - GPUs: 2"
-echo "  - Layers: 2"
+echo "  - Layers: 4"
 echo "  - Hidden: 512"
-echo "  - Experts: 4"
+echo "  - FFN: 2048"
+echo "  - Experts: 8"
+echo "  - Seq: 1024"
 echo "  - SP: 2, EP: 2"
 if [ "$ENABLE_NSYS" = "1" ]; then
     echo "  - Profiling: ENABLED (nsys)"
@@ -69,13 +71,13 @@ $NSYS_CMD /home/zju/miniconda3/envs/megatron/bin/torchrun \
     --context-parallel-size 2 \
     --expert-model-parallel-size 2 \
     --pipeline-model-parallel-size 1 \
-    --num-layers 2 \
+    --num-layers 4 \
     --hidden-size 512 \
     --ffn-hidden-size 2048 \
     --num-attention-heads 8 \
     --seq-length 1024 \
     --max-position-embeddings 1024 \
-    --num-experts 4 \
+    --num-experts 8 \
     --moe-router-topk 2 \
     --moe-grouped-gemm \
     --micro-batch-size 1 \

@@ -199,8 +199,6 @@ class BackwardScheduler:
 
         self.comm_in_progress = True
 
-        print(f"[BackwardScheduler] AlltoAll({comm_type}) running on comm_stream, executing dW tasks incrementally")
-
         # Execute dW tasks incrementally with AlltoAll completion checking
         self._launch_dw_tasks_incremental()
 
@@ -261,19 +259,17 @@ class BackwardScheduler:
         - dW fills GPU idle time during AlltoAll
         """
         if not self.dw_queue:
-            print("[BackwardScheduler] No dW tasks in queue")
             return
 
-        # FIFO: Execute tasks in registration order (no sorting)
-        # Tasks are added to queue tail during backward, executed from queue head
-        print(f"[BackwardScheduler] Starting incremental dW execution, {len(self.dw_queue)} tasks queued")
+        # Minimum tasks to execute before checking AllToAll completion
+        # Ensures stable overlap ratio even when AllToAll is very fast (small-scale tests)
+        MIN_DW_TASKS_PER_ALLTOALL = 2
 
         # Execute dW tasks incrementally on default_stream
         tasks_executed = 0
         while self.dw_queue:
-            # Check if AlltoAll has completed BEFORE starting next dW
-            if self._is_alltoall_complete():
-                print(f"[BackwardScheduler] AlltoAll completed after {tasks_executed} dW tasks, stopping dW execution")
+            # Only check AllToAll completion after executing minimum tasks
+            if tasks_executed >= MIN_DW_TASKS_PER_ALLTOALL and self._is_alltoall_complete():
                 break
 
             # Get next task
@@ -296,7 +292,6 @@ class BackwardScheduler:
                     else:
                         task.weight_param.grad.add_(grad_weight)
 
-                print(f"[BackwardScheduler] Completed dW task: {task.layer_name}")
             except Exception as e:
                 # If dW computation fails, log but continue
                 print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
@@ -311,9 +306,6 @@ class BackwardScheduler:
             tasks_executed += 1
 
             # After this dW block completes, loop will check AlltoAll status again
-
-        if not self._is_alltoall_complete() and len(self.dw_queue) == 0:
-            print(f"[BackwardScheduler] All {tasks_executed} dW tasks completed, AlltoAll still in progress")
 
         self.active_dw_task = None
 
