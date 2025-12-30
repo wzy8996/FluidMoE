@@ -1,0 +1,455 @@
+{
+  "E8_T256_H1024_I4096": {
+    "tiles_per_wave": 32,
+    "waves_per_comm": 1,
+    "speedup": 1.2678866515698632,
+    "all_results": {
+      "tpw16_wpc1": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.5770126978556315,
+        "speedup": 1.1412988086219957
+      },
+      "tpw16_wpc2": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 0.5197683970133463,
+        "speedup": 1.2669948931225343
+      },
+      "tpw16_wpc3": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 0.5384047826131184,
+        "speedup": 1.2231390319866562
+      },
+      "tpw16_wpc4": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.5604823430379232,
+        "speedup": 1.174959234314073
+      },
+      "tpw32_wpc1": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.519402821858724,
+        "speedup": 1.2678866515698632
+      },
+      "tpw32_wpc2": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 0.5503336588541667,
+        "speedup": 1.1966266173752307
+      },
+      "tpw32_wpc3": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 0.552058219909668,
+        "speedup": 1.192888505002519
+      },
+      "tpw32_wpc4": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.5722920099894206,
+        "speedup": 1.150713085500826
+      },
+      "tpw48_wpc1": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.5425612131754557,
+        "speedup": 1.2137688589424345
+      },
+      "tpw48_wpc2": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 0.5540688832600912,
+        "speedup": 1.1885596259215696
+      },
+      "tpw48_wpc3": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 0.5659580230712891,
+        "speedup": 1.1635914286516695
+      },
+      "tpw48_wpc4": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.5774736404418945,
+        "speedup": 1.1403878177339222
+      },
+      "tpw64_wpc1": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.552527109781901,
+        "speedup": 1.1918761866405845
+      },
+      "tpw64_wpc2": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 0.5721728006998699,
+        "speedup": 1.1509528307128172
+      },
+      "tpw64_wpc3": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 0.5760749181111653,
+        "speedup": 1.1431567039607102
+      },
+      "tpw64_wpc4": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.5752404530843098,
+        "speedup": 1.144815009256445
+      },
+      "tpw96_wpc1": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.5567312240600586,
+        "speedup": 1.1828758225914664
+      },
+      "tpw96_wpc2": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 1.200429598490397,
+        "speedup": 0.5485901925865116
+      },
+      "tpw96_wpc3": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 0.5860884984334309,
+        "speedup": 1.123625367811572
+      },
+      "tpw96_wpc4": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.5734682083129883,
+        "speedup": 1.1483529428068568
+      },
+      "tpw128_wpc1": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 0.5739053090413411,
+        "speedup": 1.1474783283019914
+      },
+      "tpw128_wpc2": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 0.5793253580729167,
+        "speedup": 1.1367427568042139
+      },
+      "tpw128_wpc3": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 1.140141487121582,
+        "speedup": 0.5775984051637006
+      },
+      "tpw128_wpc4": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 0.565346082051595,
+        "speedup": 1.1648509214614056
+      }
+    }
+  },
+  "E8_T512_H2048_I8192": {
+    "tiles_per_wave": 16,
+    "waves_per_comm": 2,
+    "speedup": 1.1829982467233848,
+    "all_results": {
+      "tpw16_wpc1": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.39411195119222,
+        "speedup": 1.0930193959150072
+      },
+      "tpw16_wpc2": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.2120157877604165,
+        "speedup": 1.1829982467233848
+      },
+      "tpw16_wpc3": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.3050785064697266,
+        "speedup": 1.1352371692765975
+      },
+      "tpw16_wpc4": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.3453394571940107,
+        "speedup": 1.1157492748515816
+      },
+      "tpw32_wpc1": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.21707820892334,
+        "speedup": 1.1802970179909884
+      },
+      "tpw32_wpc2": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.3426453272501626,
+        "speedup": 1.1170324283431659
+      },
+      "tpw32_wpc3": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.4198691050211587,
+        "speedup": 1.0813852671680515
+      },
+      "tpw32_wpc4": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.4282375971476235,
+        "speedup": 1.0776584637841482
+      },
+      "tpw48_wpc1": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.314082781473796,
+        "speedup": 1.1308198736859456
+      },
+      "tpw48_wpc2": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.6535590489705405,
+        "speedup": 0.9861513350005241
+      },
+      "tpw48_wpc3": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.453947067260742,
+        "speedup": 1.0663680702640732
+      },
+      "tpw48_wpc4": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.4714628855387373,
+        "speedup": 1.0588104777768488
+      },
+      "tpw64_wpc1": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.3366689682006836,
+        "speedup": 1.1198893956554123
+      },
+      "tpw64_wpc2": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.4282375971476235,
+        "speedup": 1.0776584637841482
+      },
+      "tpw64_wpc3": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.4777809778849287,
+        "speedup": 1.056110617524705
+      },
+      "tpw64_wpc4": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.4851322174072266,
+        "speedup": 1.0529865494944068
+      },
+      "tpw96_wpc1": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.405571937561035,
+        "speedup": 1.0878123234585766
+      },
+      "tpw96_wpc2": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.49478816986084,
+        "speedup": 1.0489110178805225
+      },
+      "tpw96_wpc3": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.5138537089029946,
+        "speedup": 1.0409558795634746
+      },
+      "tpw96_wpc4": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.4884621302286782,
+        "speedup": 1.051577505181703
+      },
+      "tpw128_wpc1": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.44754950205485,
+        "speedup": 1.069155412974514
+      },
+      "tpw128_wpc2": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.503744761149089,
+        "speedup": 1.045158771473191
+      },
+      "tpw128_wpc3": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.4837732315063477,
+        "speedup": 1.053562686581491
+      },
+      "tpw128_wpc4": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 2.5852362314860025,
+        "speedup": 1.0122134166210675
+      }
+    }
+  },
+  "E8_T256_H4096_I14336": {
+    "tiles_per_wave": 16,
+    "waves_per_comm": 2,
+    "speedup": 1.1381889187759557,
+    "all_results": {
+      "tpw16_wpc1": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 3.005226453145345,
+        "speedup": 1.0697642438747041
+      },
+      "tpw16_wpc2": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.8245608011881513,
+        "speedup": 1.1381889187759557
+      },
+      "tpw16_wpc3": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 2.9171387354532876,
+        "speedup": 1.102067503766404
+      },
+      "tpw16_wpc4": {
+        "tiles_per_wave": 16,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.00138791402181,
+        "speedup": 1.0711323882201544
+      },
+      "tpw32_wpc1": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.938230832417806,
+        "speedup": 1.094156309589819
+      },
+      "tpw32_wpc2": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 2.964433034261068,
+        "speedup": 1.084485217633749
+      },
+      "tpw32_wpc3": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 3.0280272165934248,
+        "speedup": 1.0617090185662468
+      },
+      "tpw32_wpc4": {
+        "tiles_per_wave": 32,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.0289014180501304,
+        "speedup": 1.0614025881340456
+      },
+      "tpw48_wpc1": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.9112180074055987,
+        "speedup": 1.1043088480983634
+      },
+      "tpw48_wpc2": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 3.031762440999349,
+        "speedup": 1.0604009604596785
+      },
+      "tpw48_wpc3": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 3.065180778503418,
+        "speedup": 1.0488398683913722
+      },
+      "tpw48_wpc4": {
+        "tiles_per_wave": 48,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.1059583028157554,
+        "speedup": 1.0350698531293179
+      },
+      "tpw64_wpc1": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 2.963836987813314,
+        "speedup": 1.0847033145008407
+      },
+      "tpw64_wpc2": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 3.0539592107137046,
+        "speedup": 1.0526937599700217
+      },
+      "tpw64_wpc3": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 3.1001965204874673,
+        "speedup": 1.0369935528525103
+      },
+      "tpw64_wpc4": {
+        "tiles_per_wave": 64,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.104877471923828,
+        "speedup": 1.0354301686273306
+      },
+      "tpw96_wpc1": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 3.021534283955892,
+        "speedup": 1.0639905101828788
+      },
+      "tpw96_wpc2": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 3.105600674947103,
+        "speedup": 1.035189047405796
+      },
+      "tpw96_wpc3": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 3.1356096267700195,
+        "speedup": 1.0252819027198006
+      },
+      "tpw96_wpc4": {
+        "tiles_per_wave": 96,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.108088175455729,
+        "speedup": 1.0343605531235938
+      },
+      "tpw128_wpc1": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 1,
+        "overlap_time_ms": 3.0456622441609698,
+        "speedup": 1.0555614991402098
+      },
+      "tpw128_wpc2": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 2,
+        "overlap_time_ms": 3.1248092651367188,
+        "speedup": 1.0288256119147898
+      },
+      "tpw128_wpc3": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 3,
+        "overlap_time_ms": 3.1008164087931314,
+        "speedup": 1.0367862461010886
+      },
+      "tpw128_wpc4": {
+        "tiles_per_wave": 128,
+        "waves_per_comm": 4,
+        "overlap_time_ms": 3.145273526509603,
+        "speedup": 1.0221317088084656
+      }
+    }
+  }
+}

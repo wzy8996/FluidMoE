@@ -1,2 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# CUDA build artifacts
+fluid/kernels/build/
+fluid/ops/*.so
+
+# Profiling
 *.nsys-rep
 *.sqlite
+*.qdrep
+
+# Logs
+*.log
+*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

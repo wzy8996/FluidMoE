@@ -1,2 +1,0 @@
-/usr/bin/ar qc libfluid_kernels_cuda.a CMakeFiles/fluid_kernels_cuda.dir/src/grouped_gemm.cu.o
-/usr/bin/ranlib libfluid_kernels_cuda.a

@@ -42,7 +42,7 @@ Components:
 - moe_layers: FluidGroupedMLP for expert computation
 """
 
-__version__ = "0.5.0"  # Complete custom layer implementation
+__version__ = "0.8.0"  # Fused AllToAll + FC1/FC2 kernels with deep overlap
 __author__ = "FluidMoE Team"
 __license__ = "Apache 2.0"
 
@@ -66,6 +66,10 @@ from .communication import (
     fluid_all_to_all_moe_combine,
 )
 
+# Fused forward kernels (v0.8)
+# The new fused kernels (moe_alltoall_fc1_fused, moe_fc2_alltoall_fused)
+# are exposed via fluid_kernels directly
+
 # MoE components
 from .moe_layers import FluidGroupedMLP, FluidRouter
 
@@ -86,6 +90,7 @@ from .megatron_layers import (
 
 # Pretrain function (generic training entry point)
 from .pretrain import pretrain
+
 
 __all__ = [
     # Primary API

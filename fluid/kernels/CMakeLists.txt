@@ -98,6 +98,10 @@ endif()
 # ============================================================================
 set(KERNEL_SOURCES
     src/grouped_gemm.cu
+    src/grouped_gemm_epilogue_signal.cu
+    src/alltoall_fc1_signal.cu
+    src/fc2_alltoall_signal.cu
+    src/moe_forward_fused.cu
 )
 
 set(BINDING_SOURCES

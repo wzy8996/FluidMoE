@@ -10,6 +10,7 @@ import torch.nn as nn
 import copy
 from typing import Optional, Tuple
 
+from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
@@ -19,7 +20,13 @@ from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 
 from fluid.attention_layers import FluidColumnParallelLinear, FluidRowParallelLinear
 from fluid.attention_core import FluidDotProductAttention
-from fluid.communication import fluid_all_to_all_sp2hp, fluid_all_to_all_hp2sp
+from fluid.communication import (
+    fluid_all_to_all_sp2hp,
+    fluid_all_to_all_hp2sp,
+    fluid_fused_all_to_all_sp2hp,
+    fluid_fused_all_to_all_hp2sp,
+    get_dx_num_chunks,
+)
 
 
 class FluidSelfAttention(MegatronModule):
@@ -124,6 +131,13 @@ class FluidSelfAttention(MegatronModule):
         self.q_layernorm = None
         self.k_layernorm = None
 
+        # Selective recompute for core attention (saves O(seq²) memory)
+        # Compatible with Megatron's --recompute-activations flag
+        self.checkpoint_core_attention = (
+            getattr(self.config, 'recompute_granularity', None) == 'selective'
+            and "core_attn" in getattr(self.config, 'recompute_modules', [])
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -166,9 +180,16 @@ class FluidSelfAttention(MegatronModule):
         # 只有在使用 Context Parallel 时才执行 AllToAll
         if self.cp_size > 1:
             # [seq_len/CP, batch, num_heads, head_dim] -> [seq_len, batch, num_heads/CP, head_dim]
-            query = fluid_all_to_all_sp2hp(query, self.cp_group)
-            key = fluid_all_to_all_sp2hp(key, self.cp_group)
-            value = fluid_all_to_all_sp2hp(value, self.cp_group)
+            # Use fused version when chunking is enabled for true dX + AllToAll pipeline
+            num_chunks = get_dx_num_chunks()
+            if num_chunks > 1:
+                query = fluid_fused_all_to_all_sp2hp(query, self.cp_group)
+                key = fluid_fused_all_to_all_sp2hp(key, self.cp_group)
+                value = fluid_fused_all_to_all_sp2hp(value, self.cp_group)
+            else:
+                query = fluid_all_to_all_sp2hp(query, self.cp_group)
+                key = fluid_all_to_all_sp2hp(key, self.cp_group)
+                value = fluid_all_to_all_sp2hp(value, self.cp_group)
 
         # ===== 步骤 3: 注意力计算（在完整序列上） =====
         # DotProductAttention 期望 [seq_len, batch, num_heads/CP, head_dim]
@@ -183,12 +204,21 @@ class FluidSelfAttention(MegatronModule):
             # 非 CP 模式：使用输入的 attention_mask
             attention_mask_for_attn = attention_mask
 
-        context = self.core_attention(
-            query, key, value,
-            attention_mask=attention_mask_for_attn,
-            attn_mask_type=self.attn_mask_type,
-            packed_seq_params=packed_seq_params,
-        )
+        # Use checkpointed core attention if enabled (saves O(seq²) memory)
+        if self.checkpoint_core_attention:
+            context = self._checkpointed_attention_forward(
+                query, key, value,
+                attention_mask=attention_mask_for_attn,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            context = self.core_attention(
+                query, key, value,
+                attention_mask=attention_mask_for_attn,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
 
         # ===== 步骤 4: AllToAll hp2sp (手动控制) =====
         # 只有在使用 Context Parallel 时才执行 AllToAll
@@ -201,7 +231,12 @@ class FluidSelfAttention(MegatronModule):
             context_4d = context.view(seq_len, batch, num_heads_per_cp, self.hidden_size_per_attention_head)
 
             # 执行 hp2sp AllToAll
-            context = fluid_all_to_all_hp2sp(context_4d, self.cp_group)
+            # Use fused version when chunking is enabled for true dX + AllToAll pipeline
+            num_chunks = get_dx_num_chunks()
+            if num_chunks > 1:
+                context = fluid_fused_all_to_all_hp2sp(context_4d, self.cp_group)
+            else:
+                context = fluid_all_to_all_hp2sp(context_4d, self.cp_group)
 
             # 恢复 3D 形状 [seq_len/CP, batch, hidden_size]
             context = context.view(
@@ -250,3 +285,66 @@ class FluidSelfAttention(MegatronModule):
         )
 
         return query, key, value
+
+    def _checkpointed_attention_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        packed_seq_params=None,
+    ):
+        """
+        Forward with selective activation checkpointing for core attention.
+
+        This saves O(seq²) memory by not storing attention scores during forward,
+        and recomputing them during backward.
+
+        Key insight: This is compatible with Fluid's dX/dW scheduling because:
+        1. We only checkpoint core_attention (which has no trainable parameters)
+        2. The Linear layers (QKV, proj) are NOT checkpointed - their dW still goes to scheduler
+        3. During backward, core_attention is recomputed, then the recomputed output
+           flows back through the normal backward path of Linear layers
+        """
+
+        def custom_forward(*inputs):
+            """Custom forward function for checkpointing."""
+            query_ = inputs[0]
+            key_ = inputs[1]
+            value_ = inputs[2]
+            attention_mask_ = inputs[3]
+            attn_mask_type_ = inputs[4]
+
+            # Convert attn_mask_type back from tensor
+            if isinstance(attn_mask_type_, torch.Tensor):
+                attn_mask_type_ = AttnMaskType(attn_mask_type_.item())
+
+            output_ = self.core_attention(
+                query_,
+                key_,
+                value_,
+                attention_mask=attention_mask_,
+                attn_mask_type=attn_mask_type_,
+                packed_seq_params=packed_seq_params,
+            )
+            return output_
+
+        # Convert attn_mask_type to tensor for checkpointing
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        attn_mask_type_tensor = torch.tensor([attn_mask_type.value], dtype=torch.int)
+
+        # Use Megatron's checkpoint function
+        # The False argument means: don't distribute saved activations across TP group
+        hidden_states = tensor_parallel.checkpoint(
+            custom_forward,
+            False,  # distribute_saved_activations
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type_tensor,
+        )
+
+        return hidden_states
