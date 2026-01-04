@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -11,6 +12,7 @@
 #include <cutlass/gemm/device/gemm_universal.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/bfloat16.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/gemm/threadblock/default_mma.h>
 
@@ -23,9 +25,9 @@ namespace fluid {
 // CUTLASS GEMM Type Definitions for different transpose combinations
 // ============================================================================
 
-// Element types
-using ElementInput = cutlass::half_t;
-using ElementOutput = cutlass::half_t;
+// Element types - Native BF16 Support
+using ElementInput = cutlass::bfloat16_t;
+using ElementOutput = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 
 // Epilogue
@@ -164,9 +166,9 @@ void grouped_gemm(
         offsets[i + 1] = offsets[i] + h_tokens[i];
     }
 
-    const auto* A_ptr = static_cast<const cutlass::half_t*>(A);
-    const auto* B_ptr = static_cast<const cutlass::half_t*>(B);
-    auto* C_ptr = static_cast<cutlass::half_t*>(C);
+    const auto* A_ptr = static_cast<const cutlass::bfloat16_t*>(A);
+    const auto* B_ptr = static_cast<const cutlass::bfloat16_t*>(B);
+    auto* C_ptr = static_cast<cutlass::bfloat16_t*>(C);
 
     // Launch GEMM for each expert
     for (int expert = 0; expert < num_experts; expert++) {
@@ -256,8 +258,8 @@ torch::Tensor grouped_gemm_forward(
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
     TORCH_CHECK(tokens_per_expert.is_cuda(), "tokens_per_expert must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.dtype() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "B must be bfloat16");
 
     int num_experts = tokens_per_expert.size(0);
 
@@ -329,8 +331,8 @@ torch::Tensor grouped_gemm_forward_nosync(
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
     TORCH_CHECK(tokens_per_expert.is_cuda(), "tokens_per_expert must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.dtype() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "B must be bfloat16");
 
     int num_experts = tokens_per_expert.size(0);
 
@@ -405,9 +407,9 @@ void grouped_gemm_dw(
     }
     int total_tokens = offsets[num_experts];
 
-    const auto* A_ptr = static_cast<const cutlass::half_t*>(A);
-    const auto* B_ptr = static_cast<const cutlass::half_t*>(B);
-    auto* C_ptr = static_cast<cutlass::half_t*>(C);
+    const auto* A_ptr = static_cast<const cutlass::bfloat16_t*>(A);
+    const auto* B_ptr = static_cast<const cutlass::bfloat16_t*>(B);
+    auto* C_ptr = static_cast<cutlass::bfloat16_t*>(C);
 
     // Launch GEMM for each expert: C[i] = A[tokens_i]^T @ B[tokens_i]
     for (int expert = 0; expert < num_experts; expert++) {
@@ -458,8 +460,8 @@ torch::Tensor grouped_gemm_dw_forward(
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
     TORCH_CHECK(tokens_per_expert.is_cuda(), "tokens_per_expert must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.dtype() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "B must be bfloat16");
 
     int num_experts = tokens_per_expert.size(0);
 
@@ -562,9 +564,9 @@ void grouped_gemm_chunked(
     }
     int total_tokens = offsets[num_experts];
 
-    const auto* A_ptr = static_cast<const cutlass::half_t*>(A);
-    const auto* B_ptr = static_cast<const cutlass::half_t*>(B);
-    auto* C_ptr = static_cast<cutlass::half_t*>(C);
+    const auto* A_ptr = static_cast<const cutlass::bfloat16_t*>(A);
+    const auto* B_ptr = static_cast<const cutlass::bfloat16_t*>(B);
+    auto* C_ptr = static_cast<cutlass::bfloat16_t*>(C);
 
     // Process each chunk
     for (int chunk = 0; chunk < num_chunks; chunk++) {
@@ -664,8 +666,8 @@ torch::Tensor grouped_gemm_single_chunk(
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
     TORCH_CHECK(C.is_cuda(), "C must be a CUDA tensor");
     // Note: tokens_per_expert can now be on CPU to avoid sync overhead
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.dtype() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "B must be bfloat16");
     TORCH_CHECK(num_chunks > 0, "num_chunks must be positive");
     TORCH_CHECK(chunk_idx >= 0 && chunk_idx < num_chunks, "chunk_idx out of range");
 
@@ -707,9 +709,9 @@ torch::Tensor grouped_gemm_single_chunk(
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    const auto* A_ptr = static_cast<const cutlass::half_t*>(A.data_ptr());
-    const auto* B_ptr = static_cast<const cutlass::half_t*>(B.data_ptr());
-    auto* C_ptr = static_cast<cutlass::half_t*>(C.data_ptr());
+    const auto* A_ptr = static_cast<const cutlass::bfloat16_t*>(A.data_ptr());
+    const auto* B_ptr = static_cast<const cutlass::bfloat16_t*>(B.data_ptr());
+    auto* C_ptr = static_cast<cutlass::bfloat16_t*>(C.data_ptr());
 
     // Process only the specified chunk
     for (int expert = 0; expert < num_experts; expert++) {
@@ -930,8 +932,8 @@ torch::Tensor grouped_gemm_with_gather(
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
     TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
-    TORCH_CHECK(B.dtype() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bfloat16");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "B must be bfloat16");
     TORCH_CHECK(indices.dtype() == torch::kInt32 || indices.dtype() == torch::kInt64,
                 "indices must be int32 or int64");
     TORCH_CHECK(trans_b, "Currently only trans_b=true is supported for gather GEMM");
@@ -982,9 +984,9 @@ torch::Tensor grouped_gemm_with_gather(
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    const auto* A_ptr = static_cast<const cutlass::half_t*>(A.data_ptr());
-    const auto* B_ptr = static_cast<const cutlass::half_t*>(B.data_ptr());
-    auto* C_ptr = static_cast<cutlass::half_t*>(C.data_ptr());
+    const auto* A_ptr = static_cast<const cutlass::bfloat16_t*>(A.data_ptr());
+    const auto* B_ptr = static_cast<const cutlass::bfloat16_t*>(B.data_ptr());
+    auto* C_ptr = static_cast<cutlass::bfloat16_t*>(C.data_ptr());
     const int* indices_ptr = indices_int32.data_ptr<int>();
 
     // Launch GEMM for each expert with gather
@@ -1238,10 +1240,10 @@ void grouped_gemm_dx_chunked_impl(
                 {chunk_size, intermediate_size, hidden_size},  // M=chunk_size, N=intermediate_size, K=hidden_size
                 1,
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)},
-                reinterpret_cast<const cutlass::half_t*>(grad_fc2),
-                reinterpret_cast<const cutlass::half_t*>(w2),  // [num_experts, intermediate_size, hidden_size]
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf),
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf),
+                reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc2),
+                reinterpret_cast<const cutlass::bfloat16_t*>(w2),  // [num_experts, intermediate_size, hidden_size]
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf),
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf),
                 total_tokens * hidden_size,  // batch_stride_A (unused)
                 0, 0, 0,
                 hidden_size,        // lda: grad_fc2 is [total_tokens, hidden_size] row-major
@@ -1298,10 +1300,10 @@ void grouped_gemm_dx_chunked_impl(
             // C[M,N] = A[M,K] @ B[N,K].T
             typename GemmNT::Arguments args(
                 {chunk_size, hidden_size, fc1_dim},  // M=chunk_size, N=hidden_size, K=fc1_dim
-                {reinterpret_cast<const cutlass::half_t*>(grad_fc1_buf), fc1_dim},  // A row-major
-                {reinterpret_cast<const cutlass::half_t*>(w1), fc1_dim},            // B is [hidden_size, fc1_dim] row-major, for NT use K
-                {reinterpret_cast<cutlass::half_t*>(output_chunk), hidden_size},
-                {reinterpret_cast<cutlass::half_t*>(output_chunk), hidden_size},
+                {reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc1_buf), fc1_dim},  // A row-major
+                {reinterpret_cast<const cutlass::bfloat16_t*>(w1), fc1_dim},            // B is [hidden_size, fc1_dim] row-major, for NT use K
+                {reinterpret_cast<cutlass::bfloat16_t*>(output_chunk), hidden_size},
+                {reinterpret_cast<cutlass::bfloat16_t*>(output_chunk), hidden_size},
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)}
             );
 
@@ -1348,7 +1350,7 @@ std::vector<torch::Tensor> grouped_gemm_dx_chunked(
     c10::optional<torch::Tensor> x_2        // for GLU: [total_tokens, intermediate_size]
 ) {
     TORCH_CHECK(grad_fc2.is_cuda(), "grad_fc2 must be CUDA tensor");
-    TORCH_CHECK(grad_fc2.dtype() == torch::kFloat16, "grad_fc2 must be float16");
+    TORCH_CHECK(grad_fc2.dtype() == torch::kBFloat16, "grad_fc2 must be bfloat16");
 
     int total_tokens = grad_fc2.size(0);
     int num_experts = w1.size(0);
@@ -1426,7 +1428,7 @@ std::vector<torch::Tensor> grouped_gemm_dx_all_chunks(
     c10::optional<torch::Tensor> x_2
 ) {
     TORCH_CHECK(grad_fc2.is_cuda(), "grad_fc2 must be CUDA tensor");
-    TORCH_CHECK(grad_fc2.dtype() == torch::kFloat16, "grad_fc2 must be float16");
+    TORCH_CHECK(grad_fc2.dtype() == torch::kBFloat16, "grad_fc2 must be bfloat16");
 
     int total_tokens = grad_fc2.size(0);
     int hidden_size = w1.size(1);
@@ -1494,10 +1496,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_all_chunks(
                 {chunk_size, intermediate_size, hidden_size},
                 1,
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)},
-                reinterpret_cast<const cutlass::half_t*>(grad_fc2.data_ptr()),
-                reinterpret_cast<const cutlass::half_t*>(w2.data_ptr()),
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf.data_ptr()),
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf.data_ptr()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc2.data_ptr()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(w2.data_ptr()),
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf.data_ptr()),
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf.data_ptr()),
                 total_tokens * hidden_size,
                 0, 0, 0,
                 hidden_size, hidden_size, intermediate_size, intermediate_size,
@@ -1541,10 +1543,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_all_chunks(
         {
             typename GemmNT::Arguments args(
                 {chunk_size, hidden_size, fc1_dim},
-                {reinterpret_cast<const cutlass::half_t*>(grad_fc1_chunk), fc1_dim},
-                {reinterpret_cast<const cutlass::half_t*>(w1.data_ptr()), fc1_dim},
-                {reinterpret_cast<cutlass::half_t*>(dx_chunk), hidden_size},
-                {reinterpret_cast<cutlass::half_t*>(dx_chunk), hidden_size},
+                {reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc1_chunk), fc1_dim},
+                {reinterpret_cast<const cutlass::bfloat16_t*>(w1.data_ptr()), fc1_dim},
+                {reinterpret_cast<cutlass::bfloat16_t*>(dx_chunk), hidden_size},
+                {reinterpret_cast<cutlass::bfloat16_t*>(dx_chunk), hidden_size},
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)}
             );
 
@@ -1588,7 +1590,7 @@ std::vector<torch::Tensor> grouped_gemm_dx_pipelined(
     c10::optional<torch::Tensor> x_2
 ) {
     TORCH_CHECK(grad_fc2.is_cuda(), "grad_fc2 must be CUDA tensor");
-    TORCH_CHECK(grad_fc2.dtype() == torch::kFloat16, "grad_fc2 must be float16");
+    TORCH_CHECK(grad_fc2.dtype() == torch::kBFloat16, "grad_fc2 must be bfloat16");
 
     int total_tokens = grad_fc2.size(0);
     int hidden_size = w1.size(1);
@@ -1669,10 +1671,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_pipelined(
                 {chunk_size, intermediate_size, hidden_size},
                 1,
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)},
-                reinterpret_cast<const cutlass::half_t*>(grad_fc2.data_ptr()),
-                reinterpret_cast<const cutlass::half_t*>(w2.data_ptr()),
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf.data_ptr()),
-                reinterpret_cast<cutlass::half_t*>(grad_inter_buf.data_ptr()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc2.data_ptr()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(w2.data_ptr()),
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf.data_ptr()),
+                reinterpret_cast<cutlass::bfloat16_t*>(grad_inter_buf.data_ptr()),
                 total_tokens * hidden_size,
                 0, 0, 0,
                 hidden_size, hidden_size, intermediate_size, intermediate_size,
@@ -1716,10 +1718,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_pipelined(
         {
             typename GemmNT::Arguments args(
                 {chunk_size, hidden_size, fc1_dim},
-                {reinterpret_cast<const cutlass::half_t*>(grad_fc1_chunk), fc1_dim},
-                {reinterpret_cast<const cutlass::half_t*>(w1.data_ptr()), fc1_dim},
-                {reinterpret_cast<cutlass::half_t*>(dx_chunk), hidden_size},
-                {reinterpret_cast<cutlass::half_t*>(dx_chunk), hidden_size},
+                {reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc1_chunk), fc1_dim},
+                {reinterpret_cast<const cutlass::bfloat16_t*>(w1.data_ptr()), fc1_dim},
+                {reinterpret_cast<cutlass::bfloat16_t*>(dx_chunk), hidden_size},
+                {reinterpret_cast<cutlass::bfloat16_t*>(dx_chunk), hidden_size},
                 {ElementAccumulator(1.0f), ElementAccumulator(0.0f)}
             );
 
@@ -1775,7 +1777,7 @@ std::vector<torch::Tensor> grouped_gemm_dx_fused(
     c10::optional<torch::Tensor> x_2
 ) {
     TORCH_CHECK(grad_fc2.is_cuda(), "grad_fc2 must be CUDA tensor");
-    TORCH_CHECK(grad_fc2.dtype() == torch::kFloat16, "grad_fc2 must be float16");
+    TORCH_CHECK(grad_fc2.dtype() == torch::kBFloat16, "grad_fc2 must be bfloat16");
 
     int total_tokens = grad_fc2.size(0);
     int num_experts = w1.size(0);
@@ -1817,10 +1819,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_fused(
             {chunk_size, intermediate_size, hidden_size},
             1,
             {ElementAccumulator(1.0f), ElementAccumulator(0.0f)},
-            reinterpret_cast<const cutlass::half_t*>(grad_fc2.data_ptr()),
-            reinterpret_cast<const cutlass::half_t*>(w2.data_ptr()),
-            reinterpret_cast<cutlass::half_t*>(grad_inter.data_ptr()),
-            reinterpret_cast<cutlass::half_t*>(grad_inter.data_ptr()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc2.data_ptr()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(w2.data_ptr()),
+            reinterpret_cast<cutlass::bfloat16_t*>(grad_inter.data_ptr()),
+            reinterpret_cast<cutlass::bfloat16_t*>(grad_inter.data_ptr()),
             total_tokens * hidden_size,
             0, 0, 0,
             hidden_size,
@@ -1868,10 +1870,10 @@ std::vector<torch::Tensor> grouped_gemm_dx_fused(
     {
         typename GemmNT::Arguments args(
             {chunk_size, hidden_size, fc1_dim},
-            {reinterpret_cast<const cutlass::half_t*>(grad_fc1.data_ptr()), fc1_dim},
-            {reinterpret_cast<const cutlass::half_t*>(w1.data_ptr()), fc1_dim},
-            {reinterpret_cast<cutlass::half_t*>(output.data_ptr()), hidden_size},
-            {reinterpret_cast<cutlass::half_t*>(output.data_ptr()), hidden_size},
+            {reinterpret_cast<const cutlass::bfloat16_t*>(grad_fc1.data_ptr()), fc1_dim},
+            {reinterpret_cast<const cutlass::bfloat16_t*>(w1.data_ptr()), fc1_dim},
+            {reinterpret_cast<cutlass::bfloat16_t*>(output.data_ptr()), hidden_size},
+            {reinterpret_cast<cutlass::bfloat16_t*>(output.data_ptr()), hidden_size},
             {ElementAccumulator(1.0f), ElementAccumulator(0.0f)}
         );
 

@@ -96,8 +96,14 @@ class _FluidColumnParallelLinearFunc(torch.autograd.Function):
 
         # === CRITICAL PATH: Compute dX immediately ===
         # grad_output: [s, b, output_size]
-        # weight: [h, output_size]
+        # weight: [output_size, h]
         # grad_input: [s, b, h]
+        #
+        # NOTE: Cross-layer QKV-Combine overlap is disabled because:
+        # - QKV backward output goes through LayerNorm backward and residual
+        #   before becoming the input to previous layer's combine backward
+        # - The gradient data flow is not direct, making the overlap infeasible
+        # - The existing dW-AllToAll overlap (97.50%) is already very effective
         grad_input = torch.matmul(grad_output, weight)
 
         # Handle tensor parallelism for grad_input

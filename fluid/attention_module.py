@@ -26,6 +26,9 @@ from fluid.communication import (
     fluid_fused_all_to_all_sp2hp,
     fluid_fused_all_to_all_hp2sp,
     get_dx_num_chunks,
+    # Fused backward: Linear GEMM + AllToAll pipeline
+    fluid_fused_hp2sp_linear_proj,
+    fluid_fused_sp2hp_core_attention,
 )
 
 
@@ -220,7 +223,7 @@ class FluidSelfAttention(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
 
-        # ===== 步骤 4: AllToAll hp2sp (手动控制) =====
+        # ===== 步骤 4+5: AllToAll hp2sp + 输出投影 =====
         # 只有在使用 Context Parallel 时才执行 AllToAll
         if self.cp_size > 1:
             # [seq_len, batch, num_heads/CP, head_dim] -> [seq_len/CP, batch, num_heads, head_dim]
@@ -230,24 +233,39 @@ class FluidSelfAttention(MegatronModule):
             num_heads_per_cp = self.num_attention_heads_per_partition // self.cp_size
             context_4d = context.view(seq_len, batch, num_heads_per_cp, self.hidden_size_per_attention_head)
 
-            # 执行 hp2sp AllToAll
-            # Use fused version when chunking is enabled for true dX + AllToAll pipeline
             num_chunks = get_dx_num_chunks()
             if num_chunks > 1:
-                context = fluid_fused_all_to_all_hp2sp(context_4d, self.cp_group)
+                # ============================================================
+                # Fused hp2sp AllToAll + Linear Projection
+                # Backward: chunked Linear GEMM + sp2hp AllToAll pipeline
+                # ============================================================
+                output = fluid_fused_hp2sp_linear_proj(
+                    context_4d,
+                    self.linear_proj.weight,
+                    self.linear_proj.bias,  # For dBias computation
+                    self.cp_group,
+                    f"layer_{self.layer_number}_attn_proj",
+                    self.layer_number,
+                )
+                # Bias is returned separately (skip_bias_add=True pattern)
+                output_bias = self.linear_proj.bias
             else:
+                # Non-fused path: separate hp2sp AllToAll + linear_proj
                 context = fluid_all_to_all_hp2sp(context_4d, self.cp_group)
 
-            # 恢复 3D 形状 [seq_len/CP, batch, hidden_size]
-            context = context.view(
-                seq_len // self.cp_size,
-                batch,
-                self.num_attention_heads_per_partition * self.hidden_size_per_attention_head
-            )
+                # 恢复 3D 形状 [seq_len/CP, batch, hidden_size]
+                context = context.view(
+                    seq_len // self.cp_size,
+                    batch,
+                    self.num_attention_heads_per_partition * self.hidden_size_per_attention_head
+                )
 
-        # ===== 步骤 5: 输出投影 =====
-        # [seq_len/CP, batch, hidden_size] -> [seq_len/CP, batch, hidden_size]
-        output, output_bias = self.linear_proj(context)
+                # 输出投影
+                output, output_bias = self.linear_proj(context)
+        else:
+            # ===== 非 CP 模式: 直接输出投影 =====
+            # [seq_len, batch, hidden_size] -> [seq_len, batch, hidden_size]
+            output, output_bias = self.linear_proj(context)
 
         return output, output_bias
 

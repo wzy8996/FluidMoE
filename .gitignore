@@ -9,6 +9,7 @@ build/
 
 # CUDA build artifacts
 fluid/kernels/build/
+fluid/kernels/*.so
 fluid/ops/*.so
 
 # Profiling
@@ -16,9 +17,9 @@ fluid/ops/*.so
 *.sqlite
 *.qdrep
 
-# Logs
+# Training outputs
 *.log
-*.txt
+training_output*.txt
 
 # IDE
 .vscode/
@@ -29,3 +30,7 @@ fluid/ops/*.so
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary
+*.tmp
+*.bak

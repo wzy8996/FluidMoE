@@ -97,6 +97,17 @@ class BackwardScheduler:
         # built-in gradient accumulation
         self.auto_finish = True  # Default: enabled for ease of use
 
+        # ============================================================
+        # Cross-layer QKV-Combine overlap context
+        # ============================================================
+        # Pending combine contexts: registered during combine forward,
+        # consumed by QKV backward to pre-launch AllToAll
+        self.pending_combine_contexts: List[dict] = []
+
+        # Pre-launched AllToAll results: launched by QKV backward,
+        # consumed by combine backward
+        self.prelaunched_combine_results: Optional[dict] = None
+
     @classmethod
     def get_instance(cls):
         """Get the singleton instance"""
@@ -285,10 +296,16 @@ class BackwardScheduler:
                 # Execute dW computation - returns gradient tensor
                 grad_weight = task.compute_fn()
 
+                # DEBUG: Print dW norm for MoE experts
+                import os
+                if os.environ.get('FLUID_DEBUG_DW_NORM', '0') == '1' and 'moe_expert' in task.layer_name:
+                    print(f"[Scheduler] {task.layer_name} grad norm: {grad_weight.norm().item():.6f}", flush=True)
+
                 # Accumulate gradient into weight parameter
+                # Note: clone() when setting to match PyTorch autograd behavior
                 if task.weight_param is not None and grad_weight is not None:
                     if task.weight_param.grad is None:
-                        task.weight_param.grad = grad_weight
+                        task.weight_param.grad = grad_weight.clone()
                     else:
                         task.weight_param.grad.add_(grad_weight)
 
@@ -340,9 +357,10 @@ class BackwardScheduler:
                 grad_weight = task.compute_fn()
 
                 # Accumulate gradient into weight parameter
+                # Note: clone() when setting to match PyTorch autograd behavior
                 if task.weight_param is not None and grad_weight is not None:
                     if task.weight_param.grad is None:
-                        task.weight_param.grad = grad_weight
+                        task.weight_param.grad = grad_weight.clone()
                     else:
                         task.weight_param.grad.add_(grad_weight)
 
@@ -356,6 +374,131 @@ class BackwardScheduler:
             self.finish_batch_completed_dw_tasks += 1  # Count as finish_batch completion
 
         print(f"[BackwardScheduler] All {remaining} remaining dW tasks completed")
+
+    def _execute_all_dw_tasks_sync(self) -> int:
+        """
+        Execute all pending dW tasks synchronously on default_stream.
+
+        This is used by TRUE ASYNC mode where dW runs in parallel with AllToAll.
+        Unlike _launch_dw_tasks_incremental(), this does NOT poll AllToAll status.
+
+        Returns:
+            Number of dW tasks executed
+        """
+        if not self.enabled:
+            return 0
+
+        tasks_executed = 0
+
+        while self.dw_queue:
+            task = self.dw_queue.popleft()
+            self.active_dw_task = task
+
+            try:
+                # Execute dW computation on default_stream
+                grad_weight = task.compute_fn()
+
+                # Accumulate gradient into weight parameter
+                # Note: clone() when setting to match PyTorch autograd behavior
+                if task.weight_param is not None and grad_weight is not None:
+                    if task.weight_param.grad is None:
+                        task.weight_param.grad = grad_weight.clone()
+                    else:
+                        task.weight_param.grad.add_(grad_weight)
+
+            except Exception as e:
+                print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
+                continue
+
+            task.completed = True
+            self.completed_dw_tasks += 1
+            self.overlap_completed_dw_tasks += 1  # Count as overlap completion
+            tasks_executed += 1
+
+        self.active_dw_task = None
+        return tasks_executed
+
+    # ============================================================
+    # Cross-layer QKV-Combine overlap methods
+    # ============================================================
+
+    def register_combine_context(
+        self,
+        output_splits: List[int],
+        input_splits: List[int],
+        group,
+        permutation_map: torch.Tensor,
+        permuted_probs: Optional[torch.Tensor] = None,
+    ):
+        """
+        Register combine context during combine forward.
+        This will be consumed by QKV backward to pre-launch AllToAll.
+
+        Args:
+            output_splits: AllToAll output splits (backward input)
+            input_splits: AllToAll input splits (backward output)
+            group: Process group
+            permutation_map: Token permutation map
+            permuted_probs: Permuted probs for gradient scaling
+        """
+        if not self.enabled:
+            return
+
+        ctx = {
+            'output_splits': output_splits,
+            'input_splits': input_splits,
+            'group': group,
+            'permutation_map': permutation_map,
+            'permuted_probs': permuted_probs,
+        }
+        self.pending_combine_contexts.append(ctx)
+
+    def get_pending_combine_context(self) -> Optional[dict]:
+        """
+        Get the next pending combine context (LIFO order - stack).
+
+        Why LIFO: Forward registers contexts as Layer 0, 1, ..., N.
+        Backward processes Layer N first, then N-1, etc.
+        Layer N's QKV backward should pre-launch for Layer N-1's combine.
+        With LIFO, after Layer N's combine pops its own context (N),
+        the next pop() returns N-1's context for Layer N's QKV to use.
+
+        Returns None if no context is pending.
+        """
+        if not self.enabled or not self.pending_combine_contexts:
+            return None
+        return self.pending_combine_contexts.pop()  # LIFO - pop from end
+
+    def set_prelaunched_combine_results(
+        self,
+        results: List[torch.Tensor],
+        events: List[torch.cuda.Event],
+    ):
+        """
+        Store pre-launched AllToAll results from QKV backward.
+
+        Args:
+            results: List of AllToAll result chunks (hidden dim chunks)
+            events: List of events marking each chunk's completion
+        """
+        self.prelaunched_combine_results = {
+            'results': results,
+            'events': events,
+        }
+
+    def get_prelaunched_combine_results(self) -> Optional[dict]:
+        """
+        Get pre-launched combine results. Returns None if not available.
+        Clears the storage after retrieval.
+        """
+        results = self.prelaunched_combine_results
+        self.prelaunched_combine_results = None
+        return results
+
+    def clear_combine_context(self):
+        """Clear all pending combine contexts (called at batch boundary)."""
+        self.pending_combine_contexts.clear()
+        self.prelaunched_combine_results = None
 
     def get_stats(self) -> dict:
         """

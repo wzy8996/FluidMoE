@@ -221,6 +221,33 @@ std::vector<int64_t> get_moe_fused_nccl_unique_id();
 void init_moe_fused_nccl(int rank, int world_size, std::vector<int64_t> nccl_id_vec);
 void destroy_moe_fused_nccl();
 
+// Declarations from moe_backward_fused.cu
+std::vector<int64_t> get_moe_backward_nccl_unique_id();
+void init_moe_backward_nccl(int rank, int world_size, std::vector<int64_t> nccl_id_vec);
+void destroy_moe_backward_nccl();
+
+std::vector<torch::Tensor> moe_backward_dx_alltoall_fused(
+    torch::Tensor grad_fc2,
+    torch::Tensor act_deriv,
+    torch::Tensor probs,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    std::vector<int> h_tokens_per_expert,
+    std::vector<int64_t> send_splits,
+    std::vector<int64_t> recv_splits,
+    int num_chunks
+);
+
+std::vector<torch::Tensor> moe_backward_dx_chunked(
+    torch::Tensor grad_fc2,
+    torch::Tensor act_deriv,
+    torch::Tensor probs,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    std::vector<int> h_tokens_per_expert,
+    int num_chunks
+);
+
 // Direct output GEMM (for overlap without copy overhead)
 void grouped_gemm_to_output(
     torch::Tensor input,
@@ -348,6 +375,29 @@ void destroy_fc2_alltoall_nccl();
 //     bool use_predictive
 // );
 // int get_compute_sms(int total_sms, int nccl_sms);
+
+// Declarations from stream_sync.cu (True Async Communication)
+std::vector<int64_t> get_stream_sync_nccl_unique_id();
+void init_stream_sync(int rank, int world_size, const std::vector<int64_t>& nccl_id_vec);
+void destroy_stream_sync();
+bool is_stream_sync_initialized();
+
+torch::Tensor compute_stream_release(torch::Tensor input, int sync_idx);
+torch::Tensor compute_stream_acquire(torch::Tensor input, int sync_idx);
+torch::Tensor comm_stream_release(torch::Tensor input, int sync_idx);
+torch::Tensor comm_stream_acquire(torch::Tensor input, int sync_idx);
+
+torch::Tensor async_alltoall(
+    torch::Tensor input,
+    std::vector<int64_t> send_splits,
+    std::vector<int64_t> recv_splits,
+    int sync_idx
+);
+
+void sync_comm_to_compute_sync();
+void wait_comm_on_compute();
+int64_t get_comm_stream_handle();
+int64_t get_compute_stream_handle();
 
 } // namespace fluid
 
@@ -1246,4 +1296,166 @@ PYBIND11_MODULE(fluid_kernels, m) {
           py::arg("total_tokens"),
           py::arg("trans_a") = false,
           py::arg("trans_b") = false);
+
+    // ============================================================================
+    // MoE Backward Fused (dX + AllToAll Pipelining)
+    // ============================================================================
+
+    m.def("get_moe_backward_nccl_unique_id", &fluid::get_moe_backward_nccl_unique_id,
+          "Get NCCL unique ID for fused backward\n"
+          "Returns: List of int64 representing ncclUniqueId bytes");
+
+    m.def("init_moe_backward_nccl", &fluid::init_moe_backward_nccl,
+          "Initialize NCCL for fused backward\n"
+          "Args:\n"
+          "  rank: Current rank\n"
+          "  world_size: Total ranks\n"
+          "  nccl_id: NCCL unique ID from get_moe_backward_nccl_unique_id()",
+          py::arg("rank"),
+          py::arg("world_size"),
+          py::arg("nccl_id"));
+
+    m.def("destroy_moe_backward_nccl", &fluid::destroy_moe_backward_nccl,
+          "Destroy NCCL for fused backward");
+
+    m.def("moe_backward_dx_alltoall_fused", &fluid::moe_backward_dx_alltoall_fused,
+          "Fused dX + AllToAll Pipelined Backward\n"
+          "Computes dX in chunks and sends each chunk as soon as it's ready.\n"
+          "Timeline (2 chunks):\n"
+          "  Compute: [dX_chunk0]    [dX_chunk1]\n"
+          "                 ↓event         ↓event\n"
+          "  Comm:    [recv_all]  → [send_0] → [send_1]\n"
+          "                    ^overlap with dX_chunk1!\n"
+          "Args:\n"
+          "  grad_fc2: [total_tokens, hidden_size]\n"
+          "  act_deriv: [total_tokens, ffn_hidden_size]\n"
+          "  probs: [total_tokens] or [total_tokens, 1]\n"
+          "  w1: [num_experts, fc1_out_dim, hidden_size]\n"
+          "  w2: [num_experts, hidden_size, ffn_hidden_size]\n"
+          "  h_tokens_per_expert: PRE-COMPUTED HOST list (List[int])\n"
+          "  send_splits: Tokens to send to each rank [ep_size]\n"
+          "  recv_splits: Tokens to receive from each rank [ep_size]\n"
+          "  num_chunks: Number of chunks for pipelining\n"
+          "Returns: [grad_input, grad_fc1]\n"
+          "  - grad_input: [total_recv_tokens, hidden_size]\n"
+          "  - grad_fc1: [total_tokens, fc1_out_dim]",
+          py::arg("grad_fc2"),
+          py::arg("act_deriv"),
+          py::arg("probs"),
+          py::arg("w1"),
+          py::arg("w2"),
+          py::arg("h_tokens_per_expert"),
+          py::arg("send_splits"),
+          py::arg("recv_splits"),
+          py::arg("num_chunks"));
+
+    m.def("moe_backward_dx_chunked", &fluid::moe_backward_dx_chunked,
+          "Chunked dX computation (no AllToAll)\n"
+          "Useful for testing dX chunking performance separately.\n"
+          "Args:\n"
+          "  grad_fc2: [total_tokens, hidden_size]\n"
+          "  act_deriv: [total_tokens, ffn_hidden_size]\n"
+          "  probs: [total_tokens] or [total_tokens, 1]\n"
+          "  w1: [num_experts, fc1_out_dim, hidden_size]\n"
+          "  w2: [num_experts, hidden_size, ffn_hidden_size]\n"
+          "  h_tokens_per_expert: PRE-COMPUTED HOST list (List[int])\n"
+          "  num_chunks: Number of chunks\n"
+          "Returns: [grad_dx, grad_fc1]",
+          py::arg("grad_fc2"),
+          py::arg("act_deriv"),
+          py::arg("probs"),
+          py::arg("w1"),
+          py::arg("w2"),
+          py::arg("h_tokens_per_expert"),
+          py::arg("num_chunks"));
+
+    // ============================================================================
+    // Stream Sync Primitives (True Async Communication)
+    // ============================================================================
+
+    m.def("get_stream_sync_nccl_unique_id", &fluid::get_stream_sync_nccl_unique_id,
+          "Get NCCL unique ID for stream sync initialization\n"
+          "Returns: List of int64 representing ncclUniqueId bytes");
+
+    m.def("init_stream_sync", &fluid::init_stream_sync,
+          "Initialize stream sync context for true async communication\n"
+          "Args:\n"
+          "  rank: Current rank\n"
+          "  world_size: Total ranks\n"
+          "  nccl_id: NCCL unique ID from get_stream_sync_nccl_unique_id()",
+          py::arg("rank"),
+          py::arg("world_size"),
+          py::arg("nccl_id"));
+
+    m.def("destroy_stream_sync", &fluid::destroy_stream_sync,
+          "Destroy stream sync context and cleanup resources");
+
+    m.def("is_stream_sync_initialized", &fluid::is_stream_sync_initialized,
+          "Check if stream sync is initialized");
+
+    m.def("compute_stream_release", &fluid::compute_stream_release,
+          "Record event on compute stream (for comm stream to wait)\n"
+          "Forward: release, Backward: acquire\n"
+          "Args:\n"
+          "  input: Pass-through tensor\n"
+          "  sync_idx: Sync index for event management\n"
+          "Returns: input tensor (pass-through)",
+          py::arg("input"),
+          py::arg("sync_idx"));
+
+    m.def("compute_stream_acquire", &fluid::compute_stream_acquire,
+          "Wait for comm stream event on compute stream\n"
+          "Forward: acquire, Backward: release\n"
+          "Args:\n"
+          "  input: Pass-through tensor\n"
+          "  sync_idx: Sync index for event management\n"
+          "Returns: input tensor (pass-through)",
+          py::arg("input"),
+          py::arg("sync_idx"));
+
+    m.def("comm_stream_release", &fluid::comm_stream_release,
+          "Record event on comm stream (for compute stream to wait)\n"
+          "Args:\n"
+          "  input: Pass-through tensor\n"
+          "  sync_idx: Sync index for event management\n"
+          "Returns: input tensor (pass-through)",
+          py::arg("input"),
+          py::arg("sync_idx"));
+
+    m.def("comm_stream_acquire", &fluid::comm_stream_acquire,
+          "Wait for compute stream event on comm stream\n"
+          "Args:\n"
+          "  input: Pass-through tensor\n"
+          "  sync_idx: Sync index for event management\n"
+          "Returns: input tensor (pass-through)",
+          py::arg("input"),
+          py::arg("sync_idx"));
+
+    m.def("async_alltoall", &fluid::async_alltoall,
+          "Execute AllToAll on comm stream asynchronously\n"
+          "This is the key function for true async communication.\n"
+          "Args:\n"
+          "  input: Input tensor [total_tokens, hidden_size]\n"
+          "  send_splits: Number of tokens to send to each rank\n"
+          "  recv_splits: Number of tokens to receive from each rank\n"
+          "  sync_idx: Sync index for event management\n"
+          "Returns: Output tensor [total_recv_tokens, hidden_size]",
+          py::arg("input"),
+          py::arg("send_splits"),
+          py::arg("recv_splits"),
+          py::arg("sync_idx"));
+
+    m.def("sync_comm_to_compute", &fluid::sync_comm_to_compute_sync,
+          "Synchronize comm stream back to compute stream (blocking)");
+
+    m.def("wait_comm_on_compute", &fluid::wait_comm_on_compute,
+          "Make compute stream wait for comm stream (non-blocking)");
+
+    m.def("get_comm_stream_handle", &fluid::get_comm_stream_handle,
+          "Get comm stream handle as int64");
+
+    m.def("get_compute_stream_handle", &fluid::get_compute_stream_handle,
+          "Get compute stream handle as int64");
+
+    // ============================================================================
 }

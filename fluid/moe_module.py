@@ -145,21 +145,26 @@ class FluidMoELayer(MegatronModule):
 
         # ===== 选择执行路径 =====
         use_fused = forward == "fused" and self.ep_size > 1 and not self._is_glu
+
         if use_fused:
             # Fused path: AllToAll + FC1/FC2 深度重叠
             output = self._forward_fused(hidden_states, routing_map, probs)
         else:
             # Standard path: separate dispatch + expert + combine
-            dispatched_input, tokens_per_expert, probs = self._dispatch(
+            # 保存 probs 和 routing_map 用于 _combine 中的 unpermute
+            self.original_probs = probs
+            self.routing_map = routing_map
+
+            dispatched_input, tokens_per_expert = self._dispatch(
                 hidden_states,
                 routing_map=routing_map,
                 probs=probs,
             )
 
+            # NOTE: probs 不再传给 experts，在 _combine 的 unpermute 里乘
             expert_output, _ = self.experts(
                 dispatched_input,
                 tokens_per_expert,
-                probs,
             )
 
             output = self._combine(expert_output, restore_shape=hidden_states.shape)
@@ -251,27 +256,28 @@ class FluidMoELayer(MegatronModule):
             self.pg_collection.expt_tp.rank()
         ]
 
-        # ===== 预计算 HOST 数组 (避免 D2H 同步) =====
+        # ===== 预计算 HOST 数组 =====
+        # OPTIMIZED: 合并所有 D2H 传输为单次同步，避免多次 .cpu().tolist() 调用
+        # 原来有 3 + (ep_size-1) 次同步，现在只有 3 次同步
         input_splits_list = input_splits.tolist()
         output_splits_list = output_splits.tolist()
 
         self_input_offset = sum(input_splits_list[:rank])
         self_input_count = input_splits_list[rank]
 
-        self_tokens_per_expert = num_global_tokens_per_local_expert[
-            self.pg_collection.expt_tp.rank(), rank
-        ].to(torch.int32)
-        h_self_tokens_per_expert = self_tokens_per_expert.cpu().tolist()
+        # 一次性将整个 tensor 复制到 CPU，避免循环中多次同步
+        tp_rank = self.pg_collection.expt_tp.rank()
+        tokens_per_local_expert_cpu = num_global_tokens_per_local_expert[tp_rank].to(torch.int32).cpu()
+
+        h_self_tokens_per_expert = tokens_per_local_expert_cpu[rank].tolist()
 
         h_peer_tokens_per_expert_all = []
         peer_token_counts = []
         for peer in range(self.ep_size):
             if peer == rank:
                 continue
-            peer_tpe = num_global_tokens_per_local_expert[
-                self.pg_collection.expt_tp.rank(), peer
-            ].to(torch.int32).cpu().tolist()
-            h_peer_tokens_per_expert_all.append(peer_tpe)
+            # 直接从 CPU tensor 切片，不再触发 D2H 同步
+            h_peer_tokens_per_expert_all.append(tokens_per_local_expert_cpu[peer].tolist())
             peer_token_counts.append(output_splits_list[peer])
 
         # 获取激活函数类型
@@ -455,15 +461,9 @@ class FluidMoELayer(MegatronModule):
             ]  # [ep_size]
 
             # 使用 Fluid MoE dispatch (不需要单独的 Dispatcher 类!)
+            # NOTE: probs 不需要 AllToAll，在 combine 后的 unpermute 里乘（Megatron 标准行为）
             global_input_tokens = fluid_all_to_all_moe_dispatch(
                 permuted_tokens,
-                output_splits,
-                input_splits,
-                self.ep_group,
-            )
-
-            global_probs = fluid_all_to_all_moe_dispatch(
-                permuted_probs,
                 output_splits,
                 input_splits,
                 self.ep_group,
@@ -490,7 +490,6 @@ class FluidMoELayer(MegatronModule):
 
         else:
             global_input_tokens = permuted_tokens
-            global_probs = permuted_probs
             tokens_per_expert = num_local_tokens_per_expert
             self.num_global_tokens_per_local_expert = None
 
@@ -499,24 +498,18 @@ class FluidMoELayer(MegatronModule):
             global_input_tokens = gather_from_sequence_parallel_region(
                 global_input_tokens, group=self.tp_group
             )
-            global_probs = gather_from_sequence_parallel_region(
-                global_probs, group=self.tp_group
-            )
 
         # ===== 步骤 4: Sort by local experts (当 num_local_experts > 1 时) =====
         # AllToAll 后数据布局是 source-rank-major: [R0_E0][R0_E1][R1_E0][R1_E1]
         # GroupedGEMM 需要 expert-major: [E0_all][E1_all]
         if self.num_local_experts > 1 and self.num_global_tokens_per_local_expert is not None:
-            global_input_tokens, global_probs = sort_chunks_by_idxs(
+            global_input_tokens, _ = sort_chunks_by_idxs(
                 global_input_tokens,
                 self.num_global_tokens_per_local_expert.ravel(),
                 self.sort_input_by_local_experts,
-                probs=global_probs,
             )
 
-        self.probs = global_probs
-
-        return global_input_tokens, tokens_per_expert, global_probs
+        return global_input_tokens, tokens_per_expert
 
     def _combine(
         self,
@@ -552,11 +545,12 @@ class FluidMoELayer(MegatronModule):
         # ===== 步骤 2: ReduceScatter (TP) =====
         if self.tp_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.probs.dtype),
+                hidden_states,
                 group=self.tp_group,
-            ).to(hidden_states.dtype)
+            )
 
         # ===== 步骤 3 & 4: AllToAll Combine + Unpermute =====
+        # NOTE: probs 在 unpermute 里乘（Megatron 标准行为）
         num_chunks = get_dx_num_chunks()
         if self.ep_size > 1:
             if num_chunks > 1:
@@ -568,6 +562,8 @@ class FluidMoELayer(MegatronModule):
                     group=self.ep_group,
                     permutation_map=self.permutation_map,
                     restore_shape=restore_shape,
+                    probs=self.original_probs,
+                    routing_map=self.routing_map,
                 )
             else:
                 # Standard path: separate combine + unpermute
@@ -581,6 +577,8 @@ class FluidMoELayer(MegatronModule):
                     hidden_states,
                     self.permutation_map,
                     restore_shape,
+                    probs=self.original_probs,
+                    routing_map=self.routing_map,
                 )
         else:
             # No EP, just unpermute
@@ -588,6 +586,8 @@ class FluidMoELayer(MegatronModule):
                 hidden_states,
                 self.permutation_map,
                 restore_shape,
+                probs=self.original_probs,
+                routing_map=self.routing_map,
             )
 
         return output

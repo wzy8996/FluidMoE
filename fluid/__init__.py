@@ -42,7 +42,7 @@ Components:
 - moe_layers: FluidGroupedMLP for expert computation
 """
 
-__version__ = "0.8.0"  # Fused AllToAll + FC1/FC2 kernels with deep overlap
+__version__ = "0.8.1"  # Stable dW-AllToAll overlap with TRUE ASYNC streams
 __author__ = "FluidMoE Team"
 __license__ = "Apache 2.0"
 
@@ -64,6 +64,9 @@ from .communication import (
     fluid_all_to_all_hp2sp,
     fluid_all_to_all_moe_dispatch,
     fluid_all_to_all_moe_combine,
+    # Fused attention backward with chunked dX + AllToAll pipeline
+    fluid_fused_hp2sp_linear_proj,
+    fluid_fused_sp2hp_core_attention,
 )
 
 # Fused forward kernels (v0.8)
@@ -120,6 +123,9 @@ __all__ = [
     "fluid_all_to_all_hp2sp",
     "fluid_all_to_all_moe_dispatch",
     "fluid_all_to_all_moe_combine",
+    # Fused attention backward
+    "fluid_fused_hp2sp_linear_proj",
+    "fluid_fused_sp2hp_core_attention",
 
     # Layer components (advanced users)
     "FluidColumnParallelLinear",

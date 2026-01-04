@@ -53,11 +53,44 @@
 namespace fluid {
 
 // ============================================================================
-// CUTLASS GEMM Type Definitions
+// Timing Helper
+// ============================================================================
+static bool g_debug_cpp_timing = false;
+static bool g_debug_cpp_timing_checked = false;
+
+static void check_debug_timing() {
+    if (!g_debug_cpp_timing_checked) {
+        const char* env = std::getenv("FLUID_DEBUG_CPP_TIMING");
+        g_debug_cpp_timing = (env && std::string(env) == "1");
+        g_debug_cpp_timing_checked = true;
+    }
+}
+
+#define TIMING_START() \
+    cudaEvent_t _timing_start, _timing_end; \
+    float _timing_ms = 0; \
+    if (g_debug_cpp_timing) { \
+        cudaEventCreate(&_timing_start); \
+        cudaEventCreate(&_timing_end); \
+        cudaEventRecord(_timing_start, compute_stream); \
+    }
+
+#define TIMING_END(name) \
+    if (g_debug_cpp_timing) { \
+        cudaEventRecord(_timing_end, compute_stream); \
+        cudaEventSynchronize(_timing_end); \
+        cudaEventElapsedTime(&_timing_ms, _timing_start, _timing_end); \
+        std::cout << "[C++ Timing] " << name << ": " << _timing_ms << " ms" << std::endl; \
+        cudaEventDestroy(_timing_start); \
+        cudaEventDestroy(_timing_end); \
+    }
+
+// ============================================================================
+// CUTLASS GEMM Type Definitions - Native BF16 Support
 // ============================================================================
 
-using ElementInput = cutlass::half_t;
-using ElementOutput = cutlass::half_t;
+using ElementInput = cutlass::bfloat16_t;
+using ElementOutput = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
@@ -225,10 +258,10 @@ enum class ActivationType : int {
     NONE = 3   // Identity (no activation)
 };
 
-__global__ void activation_kernel(half* data, int64_t n, int act_type) {
+__global__ void activation_kernel(__nv_bfloat16* data, int64_t n, int act_type) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float x = __half2float(data[idx]);
+        float x = __bfloat162float(data[idx]);
         float result;
 
         switch (act_type) {
@@ -249,11 +282,11 @@ __global__ void activation_kernel(half* data, int64_t n, int act_type) {
                 break;
         }
 
-        data[idx] = __float2half(result);
+        data[idx] = __float2bfloat16(result);
     }
 }
 
-void launch_activation(half* data, int64_t n, int act_type, cudaStream_t stream) {
+void launch_activation(__nv_bfloat16* data, int64_t n, int act_type, cudaStream_t stream) {
     if (act_type == 3) return;  // Skip for identity
     int block_size = 256;
     int num_blocks = (n + block_size - 1) / block_size;
@@ -261,7 +294,7 @@ void launch_activation(half* data, int64_t n, int act_type, cudaStream_t stream)
 }
 
 // Legacy GELU interface for compatibility
-void launch_gelu(half* data, int64_t n, cudaStream_t stream) {
+void launch_gelu(__nv_bfloat16* data, int64_t n, cudaStream_t stream) {
     launch_activation(data, n, 0, stream);
 }
 
@@ -270,9 +303,9 @@ void launch_gelu(half* data, int64_t n, cudaStream_t stream) {
 // ============================================================================
 
 static cudaError_t launch_gemm_single(
-    const cutlass::half_t* input,   // [M, K] row-major
-    const cutlass::half_t* weight,  // [N, K] row-major (will be transposed)
-    cutlass::half_t* output,        // [M, N] row-major (pre-allocated!)
+    const ElementInput* input,      // [M, K] row-major
+    const ElementInput* weight,     // [N, K] row-major (will be transposed)
+    ElementOutput* output,          // [M, N] row-major (pre-allocated!)
     int M, int N, int K,
     cudaStream_t stream
 ) {
@@ -305,9 +338,9 @@ static cudaError_t launch_gemm_single(
 // ============================================================================
 
 static void grouped_gemm_true(
-    const cutlass::half_t* input,           // [total_input_tokens, K]
-    const cutlass::half_t* weight,          // [num_experts, N, K]
-    cutlass::half_t* output,                // Pre-allocated output buffer
+    const ElementInput* input,              // [total_input_tokens, K]
+    const ElementInput* weight,             // [num_experts, N, K]
+    ElementOutput* output,                  // Pre-allocated output buffer
     const int* h_tokens_per_expert,         // Host array!
     int num_experts,
     int N,                                  // Output dimension (per expert)
@@ -445,9 +478,9 @@ static void grouped_gemm_true(
 // ============================================================================
 
 static void grouped_gemm_loop(
-    const cutlass::half_t* input,           // [total_input_tokens, K]
-    const cutlass::half_t* weight,          // [num_experts, N, K]
-    cutlass::half_t* output,                // Pre-allocated output buffer
+    const ElementInput* input,              // [total_input_tokens, K]
+    const ElementInput* weight,             // [num_experts, N, K]
+    ElementOutput* output,                  // Pre-allocated output buffer
     const int* h_tokens_per_expert,         // Host array!
     int num_experts,
     int N,                                  // Output dimension (per expert)
@@ -481,9 +514,9 @@ static void grouped_gemm_loop(
 // ============================================================================
 
 static void grouped_gemm_to_buffer(
-    const cutlass::half_t* input,           // [total_input_tokens, K]
-    const cutlass::half_t* weight,          // [num_experts, N, K]
-    cutlass::half_t* output,                // Pre-allocated output buffer
+    const ElementInput* input,              // [total_input_tokens, K]
+    const ElementInput* weight,             // [num_experts, N, K]
+    ElementOutput* output,                  // Pre-allocated output buffer
     const int* h_tokens_per_expert,         // Host array!
     int num_experts,
     int N,                                  // Output dimension (per expert)
@@ -770,17 +803,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
 
         // Send tokens to this peer
         if (send_splits[peer] > 0) {
-            const half* send_ptr = reinterpret_cast<const half*>(permuted_tokens.data_ptr<at::Half>())
+            const __nv_bfloat16* send_ptr = reinterpret_cast<const __nv_bfloat16*>(permuted_tokens.data_ptr<at::BFloat16>())
                                    + send_offsets[peer] * hidden_size;
-            ncclSend(send_ptr, send_splits[peer] * hidden_size, ncclFloat16,
+            ncclSend(send_ptr, send_splits[peer] * hidden_size, ncclBfloat16,
                      peer, ctx.nccl_comm, peer_comm_stream);
         }
 
         // Receive tokens directly into dispatched_input
         if (recv_splits[peer] > 0) {
-            half* recv_ptr = reinterpret_cast<half*>(dispatched_input.data_ptr<at::Half>())
+            __nv_bfloat16* recv_ptr = reinterpret_cast<__nv_bfloat16*>(dispatched_input.data_ptr<at::BFloat16>())
                              + peer_recv_offsets[peer] * hidden_size;
-            ncclRecv(recv_ptr, recv_splits[peer] * hidden_size, ncclFloat16,
+            ncclRecv(recv_ptr, recv_splits[peer] * hidden_size, ncclBfloat16,
                      peer, ctx.nccl_comm, peer_comm_stream);
         }
 
@@ -796,26 +829,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
     segment_ptr[rank] = self_input_count;
 
     if (self_input_count > 0) {
-        const cutlass::half_t* self_input =
-            reinterpret_cast<const cutlass::half_t*>(permuted_tokens.data_ptr<at::Half>())
+        const cutlass::bfloat16_t* self_input =
+            reinterpret_cast<const cutlass::bfloat16_t*>(permuted_tokens.data_ptr<at::BFloat16>())
             + self_input_offset * hidden_size;
 
         // Copy self tokens to dispatched_input for backward
         cudaMemcpyAsync(
-            dispatched_input.data_ptr<at::Half>(),
-            permuted_tokens.data_ptr<at::Half>() + self_input_offset * hidden_size,
-            self_input_count * hidden_size * sizeof(at::Half),
+            dispatched_input.data_ptr<at::BFloat16>(),
+            permuted_tokens.data_ptr<at::BFloat16>() + self_input_offset * hidden_size,
+            self_input_count * hidden_size * sizeof(at::BFloat16),
             cudaMemcpyDeviceToDevice,
             compute_stream
         );
 
-        cutlass::half_t* self_fc1_out =
-            reinterpret_cast<cutlass::half_t*>(fc1_output.data_ptr<at::Half>());
+        cutlass::bfloat16_t* self_fc1_out =
+            reinterpret_cast<cutlass::bfloat16_t*>(fc1_output.data_ptr<at::BFloat16>());
 
         // FC1: dispatched_input -> fc1_output
         grouped_gemm_to_buffer(
             self_input,
-            reinterpret_cast<const cutlass::half_t*>(fc1_weight.data_ptr<at::Half>()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(fc1_weight.data_ptr<at::BFloat16>()),
             self_fc1_out,
             h_self_tokens_per_expert.data(),
             num_experts,
@@ -826,16 +859,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
 
         // Copy fc1_output to fc1_pre_activation (before activation)
         cudaMemcpyAsync(
-            fc1_pre_activation.data_ptr<at::Half>(),
-            fc1_output.data_ptr<at::Half>(),
-            self_input_count * ffn_hidden_size * sizeof(at::Half),
+            fc1_pre_activation.data_ptr<at::BFloat16>(),
+            fc1_output.data_ptr<at::BFloat16>(),
+            self_input_count * ffn_hidden_size * sizeof(at::BFloat16),
             cudaMemcpyDeviceToDevice,
             compute_stream
         );
 
         // Apply activation in-place on fc1_output
         launch_activation(
-            reinterpret_cast<half*>(self_fc1_out),
+            reinterpret_cast<__nv_bfloat16*>(self_fc1_out),
             self_input_count * ffn_hidden_size,
             activation_type,
             compute_stream
@@ -863,22 +896,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
             const std::vector<int>& h_peer_tokens = h_peer_tokens_per_expert_all[peer_idx];
 
             // Input from dispatched_input (received via AllToAll)
-            const cutlass::half_t* peer_input =
-                reinterpret_cast<const cutlass::half_t*>(dispatched_input.data_ptr<at::Half>())
+            const cutlass::bfloat16_t* peer_input =
+                reinterpret_cast<const cutlass::bfloat16_t*>(dispatched_input.data_ptr<at::BFloat16>())
                 + peer_recv_offsets[peer] * hidden_size;
 
-            cutlass::half_t* peer_fc1_out =
-                reinterpret_cast<cutlass::half_t*>(fc1_output.data_ptr<at::Half>())
+            cutlass::bfloat16_t* peer_fc1_out =
+                reinterpret_cast<cutlass::bfloat16_t*>(fc1_output.data_ptr<at::BFloat16>())
                 + peer_recv_offsets[peer] * ffn_hidden_size;
 
-            cutlass::half_t* peer_fc1_pre =
-                reinterpret_cast<cutlass::half_t*>(fc1_pre_activation.data_ptr<at::Half>())
+            cutlass::bfloat16_t* peer_fc1_pre =
+                reinterpret_cast<cutlass::bfloat16_t*>(fc1_pre_activation.data_ptr<at::BFloat16>())
                 + peer_recv_offsets[peer] * ffn_hidden_size;
 
             // FC1: dispatched_input -> fc1_output
             grouped_gemm_to_buffer(
                 peer_input,
-                reinterpret_cast<const cutlass::half_t*>(fc1_weight.data_ptr<at::Half>()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(fc1_weight.data_ptr<at::BFloat16>()),
                 peer_fc1_out,
                 h_peer_tokens.data(),
                 num_experts,
@@ -891,14 +924,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
             cudaMemcpyAsync(
                 peer_fc1_pre,
                 peer_fc1_out,
-                peer_count * ffn_hidden_size * sizeof(at::Half),
+                peer_count * ffn_hidden_size * sizeof(at::BFloat16),
                 cudaMemcpyDeviceToDevice,
                 compute_stream
             );
 
             // Apply activation in-place
             launch_activation(
-                reinterpret_cast<half*>(peer_fc1_out),
+                reinterpret_cast<__nv_bfloat16*>(peer_fc1_out),
                 peer_count * ffn_hidden_size,
                 activation_type,
                 compute_stream
@@ -906,7 +939,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_allto
         }
     }
 
-    cudaStreamSynchronize(compute_stream);
+    // NOTE: Removed cudaStreamSynchronize here!
+    // The caller (FC2) uses fc1_output on the same compute_stream,
+    // so CUDA stream ordering automatically ensures correct execution order.
+    // Explicit sync would block overlap with FC2 and chunk-level reordering.
 
     return {fc1_output, segment_sizes, dispatched_input, fc1_pre_activation};
 }
@@ -989,38 +1025,14 @@ torch::Tensor moe_fc2_alltoall_fused(
     );
 
     // ========================================================================
-    // STEP 1: Start receiving from all peers (runs throughout the operation)
-    // We need to start recv early so peers can send as soon as their FC2 is done
+    // STEP 1: Compute FC2 for ALL PEER tokens first, then do ALL communication
+    // This enables TRUE overlap: Self FC2 runs while AllToAll is in progress
+    //
+    // FIXED DESIGN: Separate compute from communication to enable real overlap
+    // Old design had ncclGroupStart before FC2 compute, blocking communication
     // ========================================================================
 
-    // We'll use one comm stream for all recv operations
-    cudaStream_t recv_stream = nullptr;
-    for (int i = 0; i < ep_size; i++) {
-        if (i != rank && ctx.comm_streams[i]) {
-            recv_stream = ctx.comm_streams[i];
-            break;
-        }
-    }
-
-    // Start all recv operations in a group
-    ncclGroupStart();
-    for (int peer = 0; peer < ep_size; peer++) {
-        if (peer == rank) continue;
-
-        int64_t recv_count = original_send_splits[peer];
-        if (recv_count > 0) {
-            half* recv_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>())
-                             + recv_offsets[peer] * hidden_size;
-            ncclRecv(recv_ptr, recv_count * hidden_size, ncclFloat16,
-                     peer, ctx.nccl_comm, recv_stream);
-        }
-    }
-
-    // ========================================================================
-    // STEP 2: Compute FC2 for PEER tokens and send immediately
-    // Each peer's FC2 is followed by send - this enables overlap with subsequent peers
-    // ========================================================================
-
+    // Compute FC2 for all peer tokens FIRST (on compute_stream)
     for (int peer = 0; peer < ep_size; peer++) {
         if (peer == rank) continue;
 
@@ -1028,19 +1040,17 @@ torch::Tensor moe_fc2_alltoall_fused(
         int64_t peer_count = seg_ptr[peer];
 
         if (peer_count > 0) {
-            // Compute FC2 for this peer's tokens
-            const cutlass::half_t* peer_fc1_ptr =
-                reinterpret_cast<const cutlass::half_t*>(fc1_output.data_ptr<at::Half>())
+            const cutlass::bfloat16_t* peer_fc1_ptr =
+                reinterpret_cast<const cutlass::bfloat16_t*>(fc1_output.data_ptr<at::BFloat16>())
                 + send_offsets[peer] * ffn_hidden_size;
 
-            cutlass::half_t* peer_fc2_ptr =
-                reinterpret_cast<cutlass::half_t*>(fc2_output.data_ptr<at::Half>())
+            cutlass::bfloat16_t* peer_fc2_ptr =
+                reinterpret_cast<cutlass::bfloat16_t*>(fc2_output.data_ptr<at::BFloat16>())
                 + send_offsets[peer] * hidden_size;
 
-            // Use per-peer tokens_per_expert (pre-computed host array)
             grouped_gemm_to_buffer(
                 peer_fc1_ptr,
-                reinterpret_cast<const cutlass::half_t*>(fc2_weight.data_ptr<at::Half>()),
+                reinterpret_cast<const cutlass::bfloat16_t*>(fc2_weight.data_ptr<at::BFloat16>()),
                 peer_fc2_ptr,
                 h_peer_tokens_per_expert_all[peer_idx].data(),
                 num_experts,
@@ -1048,24 +1058,52 @@ torch::Tensor moe_fc2_alltoall_fused(
                 ffn_hidden_size,
                 compute_stream
             );
-
-            // Record when this peer's FC2 is done
-            cudaEventRecord(ctx.peer_recv_done[peer], compute_stream);
-        }
-
-        // Start send for this peer (in the ncclGroup started above)
-        int64_t send_count = seg_ptr[peer];
-        if (send_count > 0) {
-            // Wait for this peer's FC2 to complete before sending
-            cudaStreamWaitEvent(recv_stream, ctx.peer_recv_done[peer], 0);
-
-            const half* send_ptr = reinterpret_cast<const half*>(fc2_output.data_ptr<at::Half>())
-                                   + send_offsets[peer] * hidden_size;
-            ncclSend(send_ptr, send_count * hidden_size, ncclFloat16,
-                     peer, ctx.nccl_comm, recv_stream);
         }
     }
-    ncclGroupEnd();
+
+    // Record when all peer FC2 is done
+    cudaEventRecord(ctx.self_fc1_done, compute_stream);
+
+    // ========================================================================
+    // STEP 2: Start ALL communication (send + recv) in one ncclGroup
+    // This happens on comm_stream, OVERLAPPING with Self FC2 on compute_stream!
+    // ========================================================================
+
+    cudaStream_t comm_stream = nullptr;
+    for (int i = 0; i < ep_size; i++) {
+        if (i != rank && ctx.comm_streams[i]) {
+            comm_stream = ctx.comm_streams[i];
+            break;
+        }
+    }
+
+    // Wait for peer FC2 to complete before sending
+    cudaStreamWaitEvent(comm_stream, ctx.self_fc1_done, 0);
+
+    // Now start all communication at once
+    ncclGroupStart();
+    for (int peer = 0; peer < ep_size; peer++) {
+        if (peer == rank) continue;
+
+        // Send peer's FC2 output back to peer
+        int64_t send_count = seg_ptr[peer];
+        if (send_count > 0) {
+            const __nv_bfloat16* send_ptr = reinterpret_cast<const __nv_bfloat16*>(fc2_output.data_ptr<at::BFloat16>())
+                                   + send_offsets[peer] * hidden_size;
+            ncclSend(send_ptr, send_count * hidden_size, ncclBfloat16,
+                     peer, ctx.nccl_comm, comm_stream);
+        }
+
+        // Receive from peer
+        int64_t recv_count = original_send_splits[peer];
+        if (recv_count > 0) {
+            __nv_bfloat16* recv_ptr = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>())
+                             + recv_offsets[peer] * hidden_size;
+            ncclRecv(recv_ptr, recv_count * hidden_size, ncclBfloat16,
+                     peer, ctx.nccl_comm, comm_stream);
+        }
+    }
+    ncclGroupEnd();  // Communication starts NOW and runs in parallel with Self FC2!
 
     // ========================================================================
     // STEP 3: Compute FC2 for SELF tokens (overlaps with peer sends!)
@@ -1074,18 +1112,18 @@ torch::Tensor moe_fc2_alltoall_fused(
 
     int64_t self_count = seg_ptr[rank];
     if (self_count > 0) {
-        const cutlass::half_t* self_fc1_ptr =
-            reinterpret_cast<const cutlass::half_t*>(fc1_output.data_ptr<at::Half>())
+        const cutlass::bfloat16_t* self_fc1_ptr =
+            reinterpret_cast<const cutlass::bfloat16_t*>(fc1_output.data_ptr<at::BFloat16>())
             + send_offsets[rank] * ffn_hidden_size;
 
-        cutlass::half_t* self_fc2_ptr =
-            reinterpret_cast<cutlass::half_t*>(fc2_output.data_ptr<at::Half>())
+        cutlass::bfloat16_t* self_fc2_ptr =
+            reinterpret_cast<cutlass::bfloat16_t*>(fc2_output.data_ptr<at::BFloat16>())
             + send_offsets[rank] * hidden_size;
 
         // Use self tokens_per_expert (pre-computed host array)
         grouped_gemm_to_buffer(
             self_fc1_ptr,
-            reinterpret_cast<const cutlass::half_t*>(fc2_weight.data_ptr<at::Half>()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(fc2_weight.data_ptr<at::BFloat16>()),
             self_fc2_ptr,
             h_self_tokens_per_expert.data(),
             num_experts,
@@ -1098,18 +1136,15 @@ torch::Tensor moe_fc2_alltoall_fused(
         // STEP 4: Copy self segment locally (no AllToAll needed for self)
         // ========================================================================
 
-        const half* self_out_src = reinterpret_cast<const half*>(fc2_output.data_ptr<at::Half>())
+        const __nv_bfloat16* self_out_src = reinterpret_cast<const __nv_bfloat16*>(fc2_output.data_ptr<at::BFloat16>())
                                    + send_offsets[rank] * hidden_size;
-        half* self_out_dst = reinterpret_cast<half*>(output.data_ptr<at::Half>())
+        __nv_bfloat16* self_out_dst = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>())
                              + recv_offsets[rank] * hidden_size;
 
         cudaMemcpyAsync(self_out_dst, self_out_src,
-                        self_count * hidden_size * sizeof(half),
+                        self_count * hidden_size * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToDevice, compute_stream);
     }
-
-    // Record self FC2 completion
-    cudaEventRecord(ctx.self_fc1_done, compute_stream);
 
     // ========================================================================
     // STEP 5: Wait for all operations to complete
@@ -1118,8 +1153,8 @@ torch::Tensor moe_fc2_alltoall_fused(
     // Wait for compute stream (self FC2 + self copy)
     cudaStreamSynchronize(compute_stream);
 
-    // Wait for all communication (recv_stream handles both send and recv)
-    cudaStreamSynchronize(recv_stream);
+    // Wait for all communication (comm_stream handles both send and recv)
+    cudaStreamSynchronize(comm_stream);
 
     return output;
 }
@@ -1162,12 +1197,12 @@ void grouped_gemm_to_output(
     cudaStreamSynchronize(stream);
 
     // Get pointers (apply output_offset)
-    const cutlass::half_t* input_ptr = reinterpret_cast<const cutlass::half_t*>(
-        input.data_ptr<at::Half>());
-    const cutlass::half_t* weight_ptr = reinterpret_cast<const cutlass::half_t*>(
-        weight.data_ptr<at::Half>());
-    cutlass::half_t* output_ptr = reinterpret_cast<cutlass::half_t*>(
-        output.data_ptr<at::Half>()) + output_offset * N;
+    const cutlass::bfloat16_t* input_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        input.data_ptr<at::BFloat16>());
+    const cutlass::bfloat16_t* weight_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        weight.data_ptr<at::BFloat16>());
+    cutlass::bfloat16_t* output_ptr = reinterpret_cast<cutlass::bfloat16_t*>(
+        output.data_ptr<at::BFloat16>()) + output_offset * N;
 
     // Use TRUE GroupedGEMM - single kernel for all experts!
     grouped_gemm_true(input_ptr, weight_ptr, output_ptr, h_tokens.data(),
@@ -1200,19 +1235,19 @@ void grouped_gemm_gelu_to_output(
         total_tokens += h_tokens[i];
     }
 
-    const cutlass::half_t* input_ptr = reinterpret_cast<const cutlass::half_t*>(
-        input.data_ptr<at::Half>());
-    const cutlass::half_t* weight_ptr = reinterpret_cast<const cutlass::half_t*>(
-        weight.data_ptr<at::Half>());
-    cutlass::half_t* output_ptr = reinterpret_cast<cutlass::half_t*>(
-        output.data_ptr<at::Half>()) + output_offset * N;
+    const cutlass::bfloat16_t* input_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        input.data_ptr<at::BFloat16>());
+    const cutlass::bfloat16_t* weight_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        weight.data_ptr<at::BFloat16>());
+    cutlass::bfloat16_t* output_ptr = reinterpret_cast<cutlass::bfloat16_t*>(
+        output.data_ptr<at::BFloat16>()) + output_offset * N;
 
     // Use TRUE GroupedGEMM - single kernel for all experts!
     grouped_gemm_true(input_ptr, weight_ptr, output_ptr, h_tokens.data(),
                       num_experts, N, K, stream);
 
     // Apply GELU to entire output at once (more efficient than per-expert)
-    launch_gelu(reinterpret_cast<half*>(output_ptr), total_tokens * N, stream);
+    launch_gelu(reinterpret_cast<__nv_bfloat16*>(output_ptr), total_tokens * N, stream);
 }
 
 // ============================================================================
@@ -1256,12 +1291,12 @@ torch::Tensor grouped_gemm_true_forward(
     // Allocate output
     torch::Tensor output = torch::empty({total_tokens, N}, input.options());
 
-    const cutlass::half_t* input_ptr = reinterpret_cast<const cutlass::half_t*>(
-        input.data_ptr<at::Half>());
-    const cutlass::half_t* weight_ptr = reinterpret_cast<const cutlass::half_t*>(
-        weight.data_ptr<at::Half>());
-    cutlass::half_t* output_ptr = reinterpret_cast<cutlass::half_t*>(
-        output.data_ptr<at::Half>());
+    const cutlass::bfloat16_t* input_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        input.data_ptr<at::BFloat16>());
+    const cutlass::bfloat16_t* weight_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(
+        weight.data_ptr<at::BFloat16>());
+    cutlass::bfloat16_t* output_ptr = reinterpret_cast<cutlass::bfloat16_t*>(
+        output.data_ptr<at::BFloat16>());
 
     // Use TRUE GroupedGEMM
     grouped_gemm_true(input_ptr, weight_ptr, output_ptr, h_tokens.data(),
@@ -1338,9 +1373,9 @@ void launch_reorder_to_expert_major(
 
     // Use vectorized kernel for better performance
     int block_size = 256;
-    reorder_to_expert_major_vectorized_kernel<half><<<total_tokens, block_size, 0, stream>>>(
-        reinterpret_cast<const half*>(input),
-        reinterpret_cast<half*>(output),
+    reorder_to_expert_major_vectorized_kernel<__nv_bfloat16><<<total_tokens, block_size, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<__nv_bfloat16*>(output),
         reorder_indices,
         total_tokens,
         dim
@@ -1413,7 +1448,8 @@ __global__ void compute_reorder_indices_kernel(
     }
 }
 
-// Compute reorder indices on GPU
+// Compute reorder indices on CPU and copy to GPU
+// OPTIMIZED: No cudaMalloc/cudaFree, no GPU kernel, just CPU compute + async copy
 std::pair<torch::Tensor, torch::Tensor> compute_reorder_indices(
     const std::vector<int>& h_self_tokens_per_expert,
     const std::vector<std::vector<int>>& h_peer_tokens_per_expert_all,
@@ -1424,40 +1460,142 @@ std::pair<torch::Tensor, torch::Tensor> compute_reorder_indices(
     int num_experts = h_self_tokens_per_expert.size();
     int num_segments = 1 + h_peer_tokens_per_expert_all.size();
 
-    // Flatten segment tokens to GPU
-    std::vector<int> segment_tokens_flat;
-    for (int t : h_self_tokens_per_expert) {
-        segment_tokens_flat.push_back(t);
+    // Compute indices on CPU (fast, no GPU sync)
+    std::vector<int64_t> h_reorder(total_tokens);
+    std::vector<int64_t> h_inverse(total_tokens);
+
+    // Compute expert offsets in expert-major layout
+    std::vector<int64_t> expert_offsets(num_experts + 1, 0);
+    for (int e = 0; e < num_experts; e++) {
+        int64_t expert_total = h_self_tokens_per_expert[e];
+        for (const auto& peer_tokens : h_peer_tokens_per_expert_all) {
+            expert_total += peer_tokens[e];
+        }
+        expert_offsets[e + 1] = expert_offsets[e] + expert_total;
     }
-    for (const auto& peer_tokens : h_peer_tokens_per_expert_all) {
-        for (int t : peer_tokens) {
-            segment_tokens_flat.push_back(t);
+
+    // Track write position for each expert
+    std::vector<int64_t> expert_write_pos = expert_offsets;
+
+    // Compute segment starts in rank-major layout
+    std::vector<int64_t> segment_starts(num_segments + 1, 0);
+    for (int s = 0; s < num_segments; s++) {
+        int64_t seg_total = 0;
+        if (s == 0) {
+            for (int e = 0; e < num_experts; e++) seg_total += h_self_tokens_per_expert[e];
+        } else {
+            for (int e = 0; e < num_experts; e++) seg_total += h_peer_tokens_per_expert_all[s-1][e];
+        }
+        segment_starts[s + 1] = segment_starts[s] + seg_total;
+    }
+
+    // Fill indices
+    for (int s = 0; s < num_segments; s++) {
+        int64_t seg_offset = segment_starts[s];
+        for (int e = 0; e < num_experts; e++) {
+            int count = (s == 0) ? h_self_tokens_per_expert[e] : h_peer_tokens_per_expert_all[s-1][e];
+            for (int t = 0; t < count; t++) {
+                int64_t rank_pos = seg_offset + t;
+                int64_t expert_pos = expert_write_pos[e]++;
+                h_reorder[expert_pos] = rank_pos;
+                h_inverse[rank_pos] = expert_pos;
+            }
+            seg_offset += count;
         }
     }
 
-    // Allocate GPU memory
-    int* d_segment_tokens;
-    cudaMalloc(&d_segment_tokens, segment_tokens_flat.size() * sizeof(int));
-    cudaMemcpyAsync(d_segment_tokens, segment_tokens_flat.data(),
-                    segment_tokens_flat.size() * sizeof(int),
-                    cudaMemcpyHostToDevice, stream);
-
+    // Allocate GPU tensors and copy asynchronously
     torch::Tensor reorder_indices = torch::empty({total_tokens}, torch::dtype(torch::kInt64).device(device));
     torch::Tensor inverse_indices = torch::empty({total_tokens}, torch::dtype(torch::kInt64).device(device));
 
-    // Launch kernel
-    compute_reorder_indices_kernel<<<1, 1, 0, stream>>>(
-        reorder_indices.data_ptr<int64_t>(),
-        inverse_indices.data_ptr<int64_t>(),
-        d_segment_tokens,
-        num_segments,
-        num_experts,
-        total_tokens
-    );
-
-    cudaFree(d_segment_tokens);
+    cudaMemcpyAsync(reorder_indices.data_ptr<int64_t>(), h_reorder.data(),
+                    total_tokens * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(inverse_indices.data_ptr<int64_t>(), h_inverse.data(),
+                    total_tokens * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
 
     return {reorder_indices, inverse_indices};
+}
+
+// ============================================================================
+// Chunk-level reordering (rank-major -> expert-major)
+// ============================================================================
+// Much more efficient than token-level reordering: O(num_segments * num_experts) memcpy
+// instead of O(total_tokens) random accesses.
+//
+// Uses cudaMemcpyAsync for each contiguous chunk.
+
+void launch_reorder_chunks_to_expert_major(
+    const void* input,          // rank-major layout
+    void* output,               // expert-major layout
+    const std::vector<int>& h_self_tokens_per_expert,
+    const std::vector<std::vector<int>>& h_peer_tokens_per_expert_all,
+    int64_t dim,                // hidden_size or ffn_hidden_size
+    size_t element_size,        // sizeof element (e.g., 2 for bf16)
+    cudaStream_t stream
+) {
+    int num_experts = h_self_tokens_per_expert.size();
+    int num_segments = 1 + h_peer_tokens_per_expert_all.size();
+
+    // Compute segment starts in rank-major layout
+    // segment_starts[s] = offset of segment s in rank-major layout
+    std::vector<int64_t> segment_starts(num_segments + 1, 0);
+    for (int s = 0; s < num_segments; s++) {
+        int64_t seg_total = 0;
+        if (s == 0) {
+            for (int e = 0; e < num_experts; e++) {
+                seg_total += h_self_tokens_per_expert[e];
+            }
+        } else {
+            for (int e = 0; e < num_experts; e++) {
+                seg_total += h_peer_tokens_per_expert_all[s-1][e];
+            }
+        }
+        segment_starts[s + 1] = segment_starts[s] + seg_total;
+    }
+
+    // Compute expert totals for expert-major layout
+    // expert_offsets[e] = starting offset of expert e in expert-major layout
+    std::vector<int64_t> expert_offsets(num_experts + 1, 0);
+    for (int e = 0; e < num_experts; e++) {
+        int64_t expert_total = h_self_tokens_per_expert[e];
+        for (int p = 0; p < (int)h_peer_tokens_per_expert_all.size(); p++) {
+            expert_total += h_peer_tokens_per_expert_all[p][e];
+        }
+        expert_offsets[e + 1] = expert_offsets[e] + expert_total;
+    }
+
+    // Track write position for each expert (within expert's region)
+    std::vector<int64_t> expert_write_pos(num_experts, 0);
+    for (int e = 0; e < num_experts; e++) {
+        expert_write_pos[e] = expert_offsets[e];
+    }
+
+    const char* src_base = reinterpret_cast<const char*>(input);
+    char* dst_base = reinterpret_cast<char*>(output);
+    int64_t row_bytes = dim * element_size;
+
+    // Copy each chunk from rank-major to expert-major position
+    for (int s = 0; s < num_segments; s++) {
+        int64_t seg_offset = segment_starts[s];
+
+        for (int e = 0; e < num_experts; e++) {
+            int count = (s == 0) ? h_self_tokens_per_expert[e]
+                                 : h_peer_tokens_per_expert_all[s-1][e];
+
+            if (count > 0) {
+                // Source: rank-major position
+                const char* src = src_base + seg_offset * row_bytes;
+                // Destination: expert-major position
+                char* dst = dst_base + expert_write_pos[e] * row_bytes;
+
+                size_t copy_bytes = count * row_bytes;
+                cudaMemcpyAsync(dst, src, copy_bytes, cudaMemcpyDeviceToDevice, stream);
+
+                expert_write_pos[e] += count;
+            }
+            seg_offset += count;
+        }
+    }
 }
 
 // ============================================================================
@@ -1479,6 +1617,8 @@ moe_alltoall_fc1_fused_expert_major(
     std::vector<std::vector<int>> h_peer_tokens_per_expert_all,
     int activation_type = 0
 ) {
+    check_debug_timing();  // Initialize timing flag
+
     auto& ctx = g_moe_fused_ctx;
     TORCH_CHECK(ctx.initialized, "MoE fused context not initialized");
 
@@ -1496,6 +1636,18 @@ moe_alltoall_fc1_fused_expert_major(
         total_recv_tokens += recv_splits[i];
     }
 
+    // ===== Timing: FC1 fused =====
+    cudaEvent_t t0, t1, t2, t3, t4, t5;
+    if (g_debug_cpp_timing) {
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        cudaEventCreate(&t2);
+        cudaEventCreate(&t3);
+        cudaEventCreate(&t4);
+        cudaEventCreate(&t5);
+        cudaEventRecord(t0, compute_stream);
+    }
+
     // First, call the original function to get rank-major outputs
     auto [fc1_output, segment_sizes, dispatched_input_rank, fc1_pre_act_rank] =
         moe_alltoall_fc1_fused(
@@ -1506,19 +1658,30 @@ moe_alltoall_fc1_fused_expert_major(
             activation_type
         );
 
-    // Compute reorder indices on GPU
+    if (g_debug_cpp_timing) {
+        cudaEventRecord(t1, compute_stream);
+    }
+
+    // Compute reorder indices on CPU + async copy
     auto [reorder_indices, inverse_indices] = compute_reorder_indices(
         h_self_tokens_per_expert, h_peer_tokens_per_expert_all,
         total_recv_tokens, permuted_tokens.device(), compute_stream
     );
+
+    if (g_debug_cpp_timing) {
+        cudaEventRecord(t2, compute_stream);
+    }
 
     // fc1_output stays in RANK-MAJOR layout (needed by FC2!)
     // Only reorder dispatched_input and fc1_pre_act to EXPERT-MAJOR (for backward)
     torch::Tensor dispatched_input = torch::empty_like(dispatched_input_rank);
     torch::Tensor fc1_pre_act = torch::empty_like(fc1_pre_act_rank);
 
-    // Reorder dispatched_input and fc1_pre_act to expert-major
-    // This reordering can overlap with FC2 computation!
+    if (g_debug_cpp_timing) {
+        cudaEventRecord(t3, compute_stream);
+    }
+
+    // Use kernel-based reordering (single kernel launch) instead of chunk-level memcpy
     launch_reorder_to_expert_major(
         dispatched_input_rank.data_ptr(),
         dispatched_input.data_ptr(),
@@ -1536,6 +1699,30 @@ moe_alltoall_fc1_fused_expert_major(
         ffn_hidden_size,
         compute_stream
     );
+
+    if (g_debug_cpp_timing) {
+        cudaEventRecord(t4, compute_stream);
+        cudaEventSynchronize(t4);
+
+        float ms01, ms12, ms23, ms34;
+        cudaEventElapsedTime(&ms01, t0, t1);
+        cudaEventElapsedTime(&ms12, t1, t2);
+        cudaEventElapsedTime(&ms23, t2, t3);
+        cudaEventElapsedTime(&ms34, t3, t4);
+
+        std::cout << "[C++ FC1 Expert-Major] moe_alltoall_fc1_fused: " << ms01 << " ms" << std::endl;
+        std::cout << "[C++ FC1 Expert-Major] compute_reorder_indices: " << ms12 << " ms" << std::endl;
+        std::cout << "[C++ FC1 Expert-Major] torch::empty_like x2: " << ms23 << " ms" << std::endl;
+        std::cout << "[C++ FC1 Expert-Major] reorder kernels x2: " << ms34 << " ms" << std::endl;
+        std::cout << "[C++ FC1 Expert-Major] TOTAL: " << (ms01+ms12+ms23+ms34) << " ms" << std::endl;
+
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+        cudaEventDestroy(t2);
+        cudaEventDestroy(t3);
+        cudaEventDestroy(t4);
+        cudaEventDestroy(t5);
+    }
 
     // Don't sync - let reordering overlap with FC2!
     // The caller will sync when needed (e.g., when accessing the reordered tensors)

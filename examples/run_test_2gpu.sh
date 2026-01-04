@@ -133,6 +133,7 @@ echo "  - Experts: 2 (num_local_experts=1)"
 echo "  - Seq: $SEQ"
 echo "  - CP: $CP, EP: $EP"
 echo "  - FLUID_DX_NUM_CHUNKS: ${FLUID_DX_NUM_CHUNKS:-1}"
+echo "  - FLUID_USE_ASYNC_COMM: ${FLUID_USE_ASYNC_COMM:-0}"
 if [ "$ENABLE_NSYS" = "1" ]; then
     echo "  - Profiling: ENABLED (nsys)"
     echo "  - Profile output: ${NSYS_OUTPUT}.nsys-rep"

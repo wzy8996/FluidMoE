@@ -102,6 +102,8 @@ set(KERNEL_SOURCES
     src/alltoall_fc1_signal.cu
     src/fc2_alltoall_signal.cu
     src/moe_forward_fused.cu
+    src/moe_backward_fused.cu
+    src/stream_sync.cu
 )
 
 set(BINDING_SOURCES
