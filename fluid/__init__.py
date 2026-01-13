@@ -42,7 +42,7 @@ Components:
 - moe_layers: FluidGroupedMLP for expert computation
 """
 
-__version__ = "0.8.1"  # Stable dW-AllToAll overlap with TRUE ASYNC streams
+__version__ = "0.9.0"  # Multi-card P2P overlap with Round-Robin Tournament scheduling
 __author__ = "FluidMoE Team"
 __license__ = "Apache 2.0"
 
@@ -67,6 +67,10 @@ from .communication import (
     # Fused attention backward with chunked dX + AllToAll pipeline
     fluid_fused_hp2sp_linear_proj,
     fluid_fused_sp2hp_core_attention,
+    # Pipelined Q/K/V sp2hp for forward compute-communication overlap
+    fluid_pipelined_sp2hp_qkv,
+    # TRUE overlap: V AllToAll with Q@K^T computation
+    fluid_pipelined_sp2hp_with_qk_matmul,
 )
 
 # Fused forward kernels (v0.8)
@@ -93,6 +97,36 @@ from .megatron_layers import (
 
 # Pretrain function (generic training entry point)
 from .pretrain import pretrain
+
+# Forward compute-communication overlap (P2P based)
+# DEPRECATED: 这些2卡专用函数已被统一的多卡Round-Robin实现替代
+# 保留导出仅为向后兼容，请使用 multicard_p2p 中的函数
+from .overlap_forward import (
+    # QKV + sp2hp overlap (Heads Split方式) - Deprecated
+    qkv_sp2hp_heads_split,
+    prepare_qkv_split_weights,
+    # hp2sp + output projection overlap - Deprecated
+    hp2sp_output_proj_overlap,
+    # MoE P2P overlap - Deprecated
+    moe_p2p_overlap_forward,
+    # Context manager - Deprecated
+    OverlapContext,
+)
+
+# Multi-card P2P overlap (Round-Robin Tournament scheduling)
+from .multicard_p2p import (
+    # Round-Robin scheduling algorithm
+    compute_round_robin_schedule,
+    get_partner_for_round,
+    get_all_partners_ordered,
+    # MoE multi-card P2P overlap
+    MultiCardOverlapContext,
+    moe_multicard_p2p_overlap_forward,
+    # Attention multi-card P2P overlap
+    AttentionMultiCardOverlapContext,
+    attention_multicard_qkv_sp2hp_with_grad,
+    attention_multicard_hp2sp_proj,
+)
 
 
 __all__ = [
@@ -126,11 +160,32 @@ __all__ = [
     # Fused attention backward
     "fluid_fused_hp2sp_linear_proj",
     "fluid_fused_sp2hp_core_attention",
+    # Pipelined Q/K/V sp2hp for forward overlap
+    "fluid_pipelined_sp2hp_qkv",
 
     # Layer components (advanced users)
     "FluidColumnParallelLinear",
     "FluidRowParallelLinear",
     "FluidGroupedMLP",
+
+    # Forward overlap (P2P based - Heads Split方式)
+    # DEPRECATED: 已被统一的多卡实现替代，保留仅为向后兼容
+    "qkv_sp2hp_heads_split",
+    "prepare_qkv_split_weights",
+    "hp2sp_output_proj_overlap",
+    "moe_p2p_overlap_forward",
+    "OverlapContext",
+
+    # Multi-card P2P overlap (Round-Robin Tournament scheduling)
+    # 统一实现：2卡场景自动退化为1轮通信
+    "compute_round_robin_schedule",
+    "get_partner_for_round",
+    "get_all_partners_ordered",
+    "MultiCardOverlapContext",
+    "moe_multicard_p2p_overlap_forward",
+    "AttentionMultiCardOverlapContext",
+    "attention_multicard_qkv_sp2hp_with_grad",
+    "attention_multicard_hp2sp_proj",
 ]
 
 

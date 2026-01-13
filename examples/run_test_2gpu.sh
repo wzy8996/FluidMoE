@@ -1,5 +1,6 @@
 #!/bin/bash
-# Quick test script for 2 GPUs with configurable model sizes
+# FluidMoE Test Script for 2 GPUs
+# Tests baseline vs overlap mode with full forward+backward training
 set -e
 
 # Activate conda environment
@@ -9,230 +10,152 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTHONPATH=/home/zju/wzy/FluidMoE:/home/zju/wzy/Megatron-LM:$PYTHONPATH
 
 # ========================================
-# Model Size Configuration
+# Configuration
 # ========================================
-# Usage: bash run_test_2gpu.sh [small|medium|large|xlarge]
-# Default: small
-MODEL_SIZE=${1:-small}
+# MODE: baseline | overlap | compare (run both and compare)
+MODE=${MODE:-compare}
+
+# Number of iterations
+ITERS=${ITERS:-10}
+
+# Model size
+MODEL_SIZE=${1:-medium}
 
 case $MODEL_SIZE in
     small)
-        # Small: quick test, ~150ms/iter
-        HIDDEN=512
-        FFN=2048
-        SEQ=1024
-        HEADS=8
-        LAYERS=4
+        HIDDEN=512; FFN=2048; SEQ=1024; HEADS=8; LAYERS=4
         ;;
     medium)
-        # Medium: ~300ms/iter
-        HIDDEN=1024
-        FFN=4096
-        SEQ=2048
-        HEADS=8
-        LAYERS=4
+        HIDDEN=1024; FFN=4096; SEQ=2048; HEADS=8; LAYERS=4
         ;;
     large)
-        # Large: dX+A2A pipeline should help
-        HIDDEN=1024
-        FFN=4096
-        SEQ=4096
-        HEADS=8
-        LAYERS=4
+        HIDDEN=2048; FFN=8192; SEQ=4096; HEADS=16; LAYERS=4
         ;;
     xlarge)
-        # XLarge: dX+A2A pipeline should definitely help
-        # Reduced FFN size to fit in memory with recompute
-        HIDDEN=1536
-        FFN=6144
-        SEQ=4096
-        HEADS=12
-        LAYERS=2
-        ;;
-    comm_heavy)
-        # Comm-heavy: Large FFN with longer seq for better overlap
-        HIDDEN=1024
-        FFN=24576
-        SEQ=2048
-        HEADS=8
-        LAYERS=4
-        ;;
-    moe_heavy)
-        # MoE-heavy: Maximize MoE comm relative to Attention
-        # - Small hidden (reduces Attention compute: O(seq² × hidden))
-        # - Long seq (increases MoE comm: O(seq × hidden))
-        # - Large FFN (increases MoE compute)
-        # - Few layers (reduces total Attention)
-        # MoE AllToAll size per layer: seq × hidden × 2 (bf16)
-        #   = 4096 × 512 × 2 = 4MB per AllToAll
-        # Attention vs MoE ratio: seq²×hidden vs seq×hidden×FFN
-        #   = 4096² × 512 vs 4096 × 512 × 8192
-        #   = 8.6B vs 17.2B (MoE compute > Attention!)
-        HIDDEN=512
-        FFN=8192
-        SEQ=4096
-        HEADS=8
-        LAYERS=2
-        ;;
-    moe_heavy2)
-        # MoE-heavy v2: Even more tokens, smaller model
-        # - Tiny hidden (minimize Attention compute)
-        # - Longer seq (more tokens to communicate)
-        # - Moderate FFN
-        # MoE AllToAll size: 6144 × 384 × 2 = 4.7MB
-        HIDDEN=384
-        FFN=4096
-        SEQ=6144
-        HEADS=6
-        LAYERS=2
-        ;;
-    many_experts)
-        # Many experts: Test with larger number of experts
-        # - Moderate hidden size
-        # - Small FFN per expert (since we have many)
-        # - Medium seq length for reasonable AllToAll size
-        # Use with NUM_EXPERTS=8 or 16
-        HIDDEN=768
-        FFN=3072
-        SEQ=2048
-        HEADS=12
-        LAYERS=2
+        HIDDEN=4096; FFN=16384; SEQ=4096; HEADS=32; LAYERS=2
         ;;
     *)
         echo "Unknown model size: $MODEL_SIZE"
-        echo "Usage: bash run_test_2gpu.sh [small|medium|large|xlarge]"
+        echo "Valid: small | medium | large | xlarge"
         exit 1
         ;;
 esac
 
-# Fixed parallelism: CP=2, EP=2
 CP=2
 EP=2
 
 # ========================================
-# Profiling Configuration
+# Helper Functions
 # ========================================
-# Set ENABLE_NSYS=1 to enable nsys profiling
-# Usage: ENABLE_NSYS=1 bash run_test_2gpu.sh
-ENABLE_NSYS=${ENABLE_NSYS:-0}
-NSYS_OUTPUT=${NSYS_OUTPUT:-"fluid_profile"}
-NSYS_DELAY=${NSYS_DELAY:-5}
-NSYS_DURATION=${NSYS_DURATION:-20}
-LOG_OUTPUT=${LOG_OUTPUT:-"training_output.log"}
+
+run_test() {
+    local mode_name=$1
+    local overlap_flag=$2
+
+    echo ""
+    echo "=========================================="
+    echo "Running: $mode_name (forward + backward)"
+    echo "=========================================="
+
+    export FLUID_FORWARD_OVERLAP=$overlap_flag
+
+    /home/zju/miniconda3/envs/megatron/bin/torchrun \
+        --nproc_per_node 2 \
+        --nnodes 1 \
+        examples/pretrain_gpt_moe.py \
+        --tensor-model-parallel-size 1 \
+        --context-parallel-size $CP \
+        --expert-model-parallel-size $EP \
+        --pipeline-model-parallel-size 1 \
+        --num-layers $LAYERS \
+        --hidden-size $HIDDEN \
+        --ffn-hidden-size $FFN \
+        --num-attention-heads $HEADS \
+        --seq-length $SEQ \
+        --max-position-embeddings $SEQ \
+        --num-experts 2 \
+        --moe-router-topk 2 \
+        --moe-grouped-gemm \
+        --moe-token-dispatcher-type allgather \
+        --micro-batch-size 1 \
+        --global-batch-size 2 \
+        --lr 1e-4 \
+        --train-iters $ITERS \
+        --bf16 \
+        --disable-bias-linear \
+        --use-distributed-optimizer \
+        --mock-data \
+        --tokenizer-type NullTokenizer \
+        --vocab-size 50257 \
+        --log-interval 1 \
+        --timing-log-level 1 2>&1 | tee /tmp/fluid_${mode_name}.log
+
+    # Extract average iteration time (get last few iterations and average)
+    local times=$(grep "elapsed time per iteration" /tmp/fluid_${mode_name}.log | tail -5 | grep -oP 'iteration \(ms\): \K[\d.]+')
+    local sum=0
+    local count=0
+    for t in $times; do
+        sum=$(echo "$sum + $t" | bc)
+        count=$((count + 1))
+    done
+    local avg_time=$(echo "scale=2; $sum / $count" | bc)
+    echo "${mode_name}: $avg_time ms/iter" >> /tmp/fluid_results.txt
+    echo "  -> $mode_name avg time: $avg_time ms/iter (from last $count iterations)"
+}
+
+print_comparison() {
+    echo ""
+    echo "=========================================="
+    echo "Comparison Results"
+    echo "=========================================="
+
+    local base_time=$(grep "^baseline:" /tmp/fluid_results.txt | grep -oP '[\d.]+')
+    local over_time=$(grep "^overlap:" /tmp/fluid_results.txt | grep -oP '[\d.]+')
+
+    printf "%-15s %15s\n" "Mode" "Time (ms/iter)"
+    printf "%-15s %15s\n" "----" "--------------"
+    printf "%-15s %13.2f ms\n" "Baseline" "$base_time"
+    printf "%-15s %13.2f ms\n" "Overlap" "$over_time"
+
+    if [ -n "$base_time" ] && [ -n "$over_time" ]; then
+        local speedup=$(echo "scale=2; $base_time / $over_time" | bc)
+        printf "%-15s %14.2fx\n" "Speedup" "$speedup"
+    fi
+    echo "=========================================="
+}
+
+# ========================================
+# Main
+# ========================================
 
 echo "=========================================="
-echo "FluidMoE Test (2 GPUs) - ${MODEL_SIZE^^}"
+echo "FluidMoE Benchmark - ${MODEL_SIZE^^}"
 echo "=========================================="
 echo "Config:"
-echo "  - GPUs: 2"
-echo "  - Model size: $MODEL_SIZE"
+echo "  - Mode: $MODE"
+echo "  - Iterations: $ITERS"
+echo "  - Hidden: $HIDDEN, FFN: $FFN"
+echo "  - Seq: $SEQ, Heads: $HEADS"
 echo "  - Layers: $LAYERS"
-echo "  - Hidden: $HIDDEN"
-echo "  - FFN: $FFN"
-echo "  - Experts: 2 (num_local_experts=1)"
-echo "  - Seq: $SEQ"
 echo "  - CP: $CP, EP: $EP"
-echo "  - FLUID_DX_NUM_CHUNKS: ${FLUID_DX_NUM_CHUNKS:-1}"
-echo "  - FLUID_USE_ASYNC_COMM: ${FLUID_USE_ASYNC_COMM:-0}"
-if [ "$ENABLE_NSYS" = "1" ]; then
-    echo "  - Profiling: ENABLED (nsys)"
-    echo "  - Profile output: ${NSYS_OUTPUT}.nsys-rep"
-    echo "  - Log output: ${LOG_OUTPUT}"
-    echo "  - Delay: ${NSYS_DELAY}s, Duration: ${NSYS_DURATION}s"
-else
-    echo "  - Profiling: DISABLED"
-    echo "  - Log output: ${LOG_OUTPUT}"
-fi
 echo "=========================================="
-echo ""
 
-# Build nsys command prefix if profiling is enabled
-NSYS_CMD=""
-if [ "$ENABLE_NSYS" = "1" ]; then
-    NSYS_CMD="nsys profile \
-        -o ${NSYS_OUTPUT} \
-        --stats=true \
-        --force-overwrite=true \
-        --trace=cuda,nvtx,osrt \
-        --cuda-memory-usage=true \
-        --delay=${NSYS_DELAY} \
-        --duration=${NSYS_DURATION} \
-        --export=sqlite"
+# Clear results file
+> /tmp/fluid_results.txt
 
-    echo "[Profiling] Starting nsys profiler..."
-    echo "[Profiling] Will start profiling after ${NSYS_DELAY}s delay"
-    echo "[Profiling] Command output will be saved to: ${LOG_OUTPUT}"
-    echo ""
-fi
-
-# Run training
-$NSYS_CMD /home/zju/miniconda3/envs/megatron/bin/torchrun \
-    --nproc_per_node 2 \
-    --nnodes 1 \
-    pretrain_gpt_moe.py \
-    --tensor-model-parallel-size 1 \
-    --context-parallel-size $CP \
-    --expert-model-parallel-size $EP \
-    --pipeline-model-parallel-size 1 \
-    --num-layers $LAYERS \
-    --hidden-size $HIDDEN \
-    --ffn-hidden-size $FFN \
-    --num-attention-heads $HEADS \
-    --seq-length $SEQ \
-    --max-position-embeddings $SEQ \
-    --num-experts ${NUM_EXPERTS:-2} \
-    --moe-router-topk ${MOE_TOPK:-2} \
-    --moe-grouped-gemm \
-    --micro-batch-size 1 \
-    --global-batch-size 2 \
-    --lr 1e-4 \
-    --train-iters 10 \
-    --bf16 \
-    --disable-bias-linear \
-    --use-distributed-optimizer \
-    --recompute-activations \
-    --mock-data \
-    --tokenizer-type NullTokenizer \
-    --vocab-size 50257 \
-    --save /tmp/fluid-test \
-    --save-interval 1000 \
-    --log-interval 1 \
-    --no-save-optim \
-    --no-save-rng \
-    --no-load-optim \
-    --no-load-rng 2>&1 | tee "${LOG_OUTPUT}"
+case $MODE in
+    baseline)
+        run_test "baseline" "0"
+        ;;
+    overlap)
+        run_test "overlap" "1"
+        ;;
+    compare)
+        run_test "baseline" "0"
+        run_test "overlap" "1"
+        print_comparison
+        ;;
+esac
 
 echo ""
-echo "=========================================="
-echo "Test completed!"
-echo "=========================================="
-
-# Show profiling results if enabled
-if [ "$ENABLE_NSYS" = "1" ]; then
-    echo ""
-    echo "=========================================="
-    echo "Profiling Results"
-    echo "=========================================="
-    echo "Profile report: ${NSYS_OUTPUT}.nsys-rep"
-    echo "Training log: ${LOG_OUTPUT}"
-    echo ""
-    echo "View results with:"
-    echo "  1. Command-line stats:"
-    echo "     nsys stats ${NSYS_OUTPUT}.nsys-rep"
-    echo ""
-    echo "  2. GPU kernel summary:"
-    echo "     nsys stats --report cuda_gpu_kern_sum ${NSYS_OUTPUT}.nsys-rep"
-    echo ""
-    echo "  3. CUDA API summary:"
-    echo "     nsys stats --report cuda_api_sum ${NSYS_OUTPUT}.nsys-rep"
-    echo ""
-    echo "  4. GUI viewer (if available):"
-    echo "     nsys-ui ${NSYS_OUTPUT}.nsys-rep"
-    echo ""
-    echo "  5. Export to CSV:"
-    echo "     nsys stats --report cuda_gpu_kern_sum ${NSYS_OUTPUT}.nsys-rep --format csv -o kernels.csv"
-    echo "=========================================="
-else
-    echo ""
-    echo "Training log saved to: ${LOG_OUTPUT}"
-fi
+echo "Done! Logs saved to /tmp/fluid_*.log"

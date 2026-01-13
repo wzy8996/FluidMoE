@@ -2,22 +2,17 @@
 
 """
 完全自定义的 Fluid MoE 模块
-支持前向计算优化和通信重叠
+支持反向计算-通信重叠（dW 与 AllToAll 并行）
 
-Forward Overlap (v0.7):
-- FC2 + AllToAll tile-level pipeline
-- Enabled via FLUID_FORWARD_NUM_CHUNKS environment variable
-- Timeline: FC2[i] || AllToAll[i-1]
+前向：Baseline 模式（dispatch -> FC1 -> FC2 -> combine）
+反向：dX 分块 + dW 调度（与 AllToAll 重叠）
 """
 
-import os
 import torch
-import torch.nn as nn
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_default_pg_collection,
@@ -30,19 +25,24 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-from fluid.moe_layers import FluidGroupedMLP, set_dispatch_alltoall_ctx, FusedForwardStandardBackward
+from fluid.moe_layers import FluidGroupedMLP, set_dispatch_alltoall_ctx, get_dispatch_alltoall_ctx
 from fluid.communication import (
     fluid_all_to_all_moe_dispatch,
     fluid_all_to_all_moe_combine,
     fluid_fused_combine_unpermute,
     get_dx_num_chunks,
 )
-# Forward mode: "baseline" or "fused"
-# Can be overridden by environment variable FLUID_FORWARD_MODE
-# NOTE: "fused" mode currently has overhead from dtype/layout conversion.
-# Using "baseline" as default until C++ kernel is optimized.
+
 import os
-forward = os.environ.get('FLUID_FORWARD_MODE', 'baseline')
+
+# 动态读取环境变量（允许运行时切换）
+def get_forward_overlap_enabled():
+    """Check if forward overlap mode is enabled (动态读取环境变量)"""
+    return os.environ.get('FLUID_FORWARD_OVERLAP', '0') == '1'
+
+def get_prealloc_buffers_enabled():
+    """Check if pre-allocated buffers are enabled"""
+    return os.environ.get('FLUID_PREALLOC_BUFFERS', '0') == '1'
 
 
 class FluidMoELayer(MegatronModule):
@@ -129,8 +129,65 @@ class FluidMoELayer(MegatronModule):
         # 保存 num_global_tokens_per_local_expert 用于 sort/unsort
         self.num_global_tokens_per_local_expert = None
 
-        self._fused_nccl_initialized = False
-        self._is_glu = config.gated_linear_unit
+        # ===== Pre-allocated P2P buffers for fine-grained mode =====
+        # Lazy initialization: allocate on first use and reuse
+        self._dispatch_recv_buffers = None  # {peer_rank: buffer}
+        self._combine_recv_buffers = None   # {peer_rank: buffer}
+        self._buffer_hidden_size = None
+        self._buffer_max_tokens = None  # Maximum tokens per peer seen so far
+
+    def _get_or_allocate_p2p_buffers(
+        self,
+        hidden_size: int,
+        max_tokens_per_peer: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+        """
+        Get or allocate pre-allocated P2P buffers for dispatch and combine.
+
+        Uses lazy allocation: allocate on first use, and re-allocate if larger
+        buffers are needed.
+
+        Args:
+            hidden_size: Hidden dimension size
+            max_tokens_per_peer: Maximum tokens expected from/to each peer
+            dtype: Tensor dtype
+            device: Tensor device
+
+        Returns:
+            (dispatch_recv_buffers, combine_recv_buffers)
+        """
+        my_rank = self.ep_group.rank()
+
+        # Check if we need to (re)allocate
+        need_realloc = (
+            self._dispatch_recv_buffers is None
+            or self._buffer_hidden_size != hidden_size
+            or (self._buffer_max_tokens is not None and max_tokens_per_peer > self._buffer_max_tokens)
+        )
+
+        if need_realloc:
+            # Allocate buffers for each peer
+            self._dispatch_recv_buffers = {}
+            self._combine_recv_buffers = {}
+
+            for peer_rank in range(self.ep_size):
+                if peer_rank == my_rank:
+                    continue
+                # Allocate with some extra margin (1.5x) to handle variance
+                buffer_size = int(max_tokens_per_peer * 1.5) + 1
+                self._dispatch_recv_buffers[peer_rank] = torch.empty(
+                    buffer_size, hidden_size, dtype=dtype, device=device
+                )
+                self._combine_recv_buffers[peer_rank] = torch.empty(
+                    buffer_size, hidden_size, dtype=dtype, device=device
+                )
+
+            self._buffer_hidden_size = hidden_size
+            self._buffer_max_tokens = max_tokens_per_peer
+
+        return self._dispatch_recv_buffers, self._combine_recv_buffers
 
     def forward(
         self,
@@ -143,17 +200,26 @@ class FluidMoELayer(MegatronModule):
         # ===== 步骤 1: Router =====
         probs, routing_map = self.router(hidden_states)
 
-        # ===== 选择执行路径 =====
-        use_fused = forward == "fused" and self.ep_size > 1 and not self._is_glu
+        # 保存 probs 和 routing_map 用于 _combine 中的 unpermute
+        self.original_probs = probs
+        self.routing_map = routing_map
 
-        if use_fused:
-            # Fused path: AllToAll + FC1/FC2 深度重叠
-            output = self._forward_fused(hidden_states, routing_map, probs)
+        # ===== 选择前向路径 =====
+        debug_path = os.environ.get('FLUID_DEBUG_OVERLAP', '0') == '1'
+        if debug_path:
+            print(f"[DEBUG] ep_size={self.ep_size}, overlap_enabled={get_forward_overlap_enabled()}", flush=True)
+        if get_forward_overlap_enabled() and self.ep_size > 1:
+            # 前向重叠模式（使用 overlap_forward.py 的新实现）
+            if debug_path:
+                print(f"[DEBUG] Taking OVERLAP path", flush=True)
+            output = self._forward_with_overlap(hidden_states, routing_map, probs)
         else:
-            # Standard path: separate dispatch + expert + combine
-            # 保存 probs 和 routing_map 用于 _combine 中的 unpermute
-            self.original_probs = probs
-            self.routing_map = routing_map
+            # Baseline 模式：dispatch -> expert -> combine
+            import time
+            debug_baseline = os.environ.get('FLUID_DEBUG_FORWARD_TIMING', '0') == '1'
+            if debug_baseline:
+                torch.cuda.synchronize()
+                t_start = time.perf_counter()
 
             dispatched_input, tokens_per_expert = self._dispatch(
                 hidden_states,
@@ -161,74 +227,72 @@ class FluidMoELayer(MegatronModule):
                 probs=probs,
             )
 
+            if debug_baseline:
+                torch.cuda.synchronize()
+                t_dispatch = time.perf_counter()
+                print(f"[Baseline] Dispatch (AllToAll): {(t_dispatch-t_start)*1000:.2f} ms", flush=True)
+
             # NOTE: probs 不再传给 experts，在 _combine 的 unpermute 里乘
             expert_output, _ = self.experts(
                 dispatched_input,
                 tokens_per_expert,
             )
 
+            if debug_baseline:
+                torch.cuda.synchronize()
+                t_expert = time.perf_counter()
+                print(f"[Baseline] Expert (FC1+Act+FC2): {(t_expert-t_dispatch)*1000:.2f} ms", flush=True)
+
             output = self._combine(expert_output, restore_shape=hidden_states.shape)
+
+            if debug_baseline:
+                torch.cuda.synchronize()
+                t_combine = time.perf_counter()
+                print(f"[Baseline] Combine (AllToAll): {(t_combine-t_expert)*1000:.2f} ms", flush=True)
+                print(f"[Baseline] Total: {(t_combine-t_start)*1000:.2f} ms", flush=True)
 
         # 恢复原始 shape
         output = output.view(input_shape)
 
         return output, None  # 第二个返回值是 mlp_bias
 
-    def _forward_fused(
+    def _forward_with_overlap(
         self,
         hidden_states: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
     ) -> torch.Tensor:
         """
-        非对称流水线前向传播：
-        - 前向：AllToAll + FC1 + Activation + FC2 + AllToAll 深度重叠（融合算子）
-        - 反向：标准 dX + dW 分离调度（FluidGroupedMLP autograd）
+        使用多轮 P2P 重叠实现的 MoE 前向（统一实现）
 
-        这是 FluidMoE 的核心优化设计！
+        前向：本地 token 计算与远程 token 通信重叠
+        反向：使用标准 AllToAll（保持反向调度不变）
 
-        Timeline:
-          Forward (融合，计算-通信重叠):
-            Self FC1:    [=========] <- 与 AllToAll 并行
-            AllToAll:    [=========]
-            Peer FC1:          [===][===] <- 数据到达即计算
-            Peer FC2:    [===]
-            Peer Send:        [=====] <- 与下一个 FC2 并行
-            Self FC2:         [===]
-
-          Backward (标准，dW 调度):
-            dX:          [=========]
-            AllToAll:    [=========] <- dX + AllToAll 分块重叠
-            dW:                [===] <- 与下一层 AllToAll 重叠
+        使用 Round-Robin Tournament 调度：
+        - 将"每个rank和所有其他rank交换数据"拆成多轮
+        - 若卡数P为偶数：总轮数 R = P-1（2卡时只有1轮）
+        - 每轮每张卡只和一个peer通信，避免冲突
+        - 通信流在跑第r轮的同时，计算流在吃第r-1轮的数据
         """
-        from fluid.ops import fluid_kernels
-        import torch.distributed as dist
+        from fluid.multicard_p2p import (
+            MultiCardOverlapContext,
+            moe_multicard_p2p_overlap_forward,
+        )
+        import time
 
-        rank = self.pg_collection.ep.rank()
-        world_size = self.ep_size
+        debug_timing = os.environ.get('FLUID_DEBUG_FORWARD_TIMING', '0') == '1'
+        if debug_timing:
+            torch.cuda.synchronize()
+            t_start = time.perf_counter()
+            print(f"[Forward Overlap MoE] Starting, tokens: {hidden_states.shape[0]}, ep_size: {self.ep_size}", flush=True)
 
-        # Initialize fused NCCL communicator on first call
-        if not self._fused_nccl_initialized:
-            nccl_id = fluid_kernels.get_moe_fused_nccl_unique_id()
-            if rank == 0:
-                nccl_id_tensor = torch.tensor(nccl_id, dtype=torch.int64, device='cuda')
-            else:
-                nccl_id_tensor = torch.zeros(len(nccl_id), dtype=torch.int64, device='cuda')
-            dist.broadcast(nccl_id_tensor, src=0, group=self.ep_group)
-            nccl_id_list = nccl_id_tensor.cpu().tolist()
-            fluid_kernels.init_moe_fused_nccl(rank, world_size, nccl_id_list)
-            self._fused_nccl_initialized = True
-            if rank == 0:
-                print(f"[FluidMoE] Fused NCCL communicator initialized")
-
-        # ===== Step 1: Local Permutation =====
-        permuted_tokens, permuted_probs_flat, permutation_map = permute(
+        # ===== Step 1: Permute tokens by expert =====
+        permuted_tokens, _, self.permutation_map = permute(
             hidden_states,
             routing_map,
             probs=probs,
             num_out_tokens=routing_map.size(0) * self.config.moe_router_topk,
         )
-        self.permutation_map = permutation_map  # 保存用于 combine
 
         # 计算每个 expert 接收的 token 数量
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
@@ -256,153 +320,96 @@ class FluidMoELayer(MegatronModule):
             self.pg_collection.expt_tp.rank()
         ]
 
-        # ===== 预计算 HOST 数组 =====
-        # OPTIMIZED: 合并所有 D2H 传输为单次同步，避免多次 .cpu().tolist() 调用
-        # 原来有 3 + (ep_size-1) 次同步，现在只有 3 次同步
-        input_splits_list = input_splits.tolist()
-        output_splits_list = output_splits.tolist()
+        # Save for unpermute
+        self.dispatch_input_splits = input_splits
+        self.dispatch_output_splits = output_splits
+        self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert
 
-        self_input_offset = sum(input_splits_list[:rank])
-        self_input_count = input_splits_list[rank]
+        if debug_timing:
+            torch.cuda.synchronize()
+            t_permute = time.perf_counter()
+            print(f"[Forward Overlap MoE] Permute: {(t_permute-t_start)*1000:.2f} ms", flush=True)
 
-        # 一次性将整个 tensor 复制到 CPU，避免循环中多次同步
-        tp_rank = self.pg_collection.expt_tp.rank()
-        tokens_per_local_expert_cpu = num_global_tokens_per_local_expert[tp_rank].to(torch.int32).cpu()
+        # ===== Step 2: 计算 tokens_per_expert =====
+        tokens_per_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
 
-        h_self_tokens_per_expert = tokens_per_local_expert_cpu[rank].tolist()
+        # ===== Step 3: 创建或获取 overlap context =====
+        if not hasattr(self, '_multicard_overlap_ctx'):
+            self._multicard_overlap_ctx = MultiCardOverlapContext(
+                permuted_tokens.device, self.ep_size
+            )
 
-        h_peer_tokens_per_expert_all = []
-        peer_token_counts = []
-        for peer in range(self.ep_size):
-            if peer == rank:
-                continue
-            # 直接从 CPU tensor 切片，不再触发 D2H 同步
-            h_peer_tokens_per_expert_all.append(tokens_per_local_expert_cpu[peer].tolist())
-            peer_token_counts.append(output_splits_list[peer])
+        if debug_timing:
+            my_rank = self.ep_group.rank()
+            print(f"[Forward Overlap MoE Rank {my_rank}] Using Round-Robin P2P with {self._multicard_overlap_ctx.num_rounds} rounds", flush=True)
 
-        # 获取激活函数类型
-        if self.config.activation_func == torch.nn.functional.silu:
-            activation_type = 1
-        elif self.config.activation_func == torch.nn.functional.relu:
-            activation_type = 2
-        else:
-            activation_type = 0
-
-        # ===== 融合前向 + 标准反向 =====
-        # probs multiplication happens in unpermute (standard Megatron behavior)
-        output = FusedForwardStandardBackward.apply(
-            hidden_states,
-            routing_map,
-            probs,  # probs will be used in unpermute and backward
+        # ===== Step 4: 使用统一的多轮 P2P 重叠实现 =====
+        combined_output = moe_multicard_p2p_overlap_forward(
             permuted_tokens,
-            permutation_map,
+            input_splits,
+            output_splits,
             self.experts.weight1,
             self.experts.weight2,
-            self.num_local_experts,
-            self.config.hidden_size,
-            input_splits_list,
-            output_splits_list,
-            self_input_offset,
-            self_input_count,
-            peer_token_counts,
-            h_self_tokens_per_expert,
-            h_peer_tokens_per_expert_all,
-            activation_type,
-            self,
+            self.ep_group,
+            self.experts.activation_func,
+            self._multicard_overlap_ctx,
+            layer_id=self.layer_number if self.layer_number is not None else 0,
+            num_local_experts=self.num_local_experts,
+            tokens_per_expert=tokens_per_expert,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
         )
+
+        if debug_timing:
+            torch.cuda.synchronize()
+            t_expert = time.perf_counter()
+            print(f"[Forward Overlap MoE] P2P overlap expert: {(t_expert-t_permute)*1000:.2f} ms", flush=True)
+
+        # ===== Step 5: Unpermute to restore original token order =====
+        output = unpermute(
+            combined_output,
+            self.permutation_map,
+            restore_shape=hidden_states.shape,
+            probs=self.original_probs,
+            routing_map=self.routing_map,
+        )
+
+        if debug_timing:
+            torch.cuda.synchronize()
+            t_unpermute = time.perf_counter()
+            print(f"[Forward Overlap MoE] Unpermute: {(t_unpermute-t_expert)*1000:.2f} ms", flush=True)
+            print(f"[Forward Overlap MoE] Total: {(t_unpermute-t_start)*1000:.2f} ms", flush=True)
 
         return output
 
-    def _prepare_backward_ctx(
+    def _compute_fc1_per_expert(
         self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        dispatched_input: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_tokens: torch.Tensor,
+        weight1: torch.Tensor,
+        source_rank: int,
+        output_splits_list: List[int],
+    ) -> torch.Tensor:
         """
-        为反向传播准备 context（不执行 AllToAll）
+        对于 num_local_experts > 1，按 expert 分别计算 FC1
 
-        用于融合前向时，我们已经有了 dispatched_input，
-        只需要计算元信息和设置反向 AllToAll 的 context。
-
-        Returns:
-            (sorted_dispatched_input, tokens_per_expert, permuted_probs)
+        数据按rank排列时，每个rank的token可能发往不同的local experts
+        这里简化处理：假设token均匀分配给所有local experts
         """
-        # Permute probs
-        _, permuted_probs_flat, self.permutation_map = permute(
-            hidden_states,
-            routing_map,
-            probs=probs,
-            num_out_tokens=routing_map.size(0) * self.config.moe_router_topk,
-        )
-        permuted_probs = permuted_probs_flat.view(-1, 1) if permuted_probs_flat is not None else probs.view(-1, 1)
+        # 简化实现：直接用一个大的 matmul
+        # 完整实现需要根据 routing 信息分配到各 expert
+        return torch.mm(input_tokens, weight1)
 
-        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
-
-        if self.ep_size > 1:
-            input_splits = num_local_tokens_per_expert.reshape(
-                self.ep_size, self.num_local_experts
-            ).sum(axis=1)
-
-            num_global_tokens_per_expert = (
-                gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
-                )
-                .reshape(self.ep_size, self.tp_size, -1)
-                .transpose(0, 1)
-            )
-
-            num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-                :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-            ].contiguous()
-
-            num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
-            output_splits = num_global_tokens_per_rank[self.pg_collection.expt_tp.rank()]
-
-            tokens_per_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
-
-            # 保存用于 combine
-            self.dispatch_input_splits = input_splits
-            self.dispatch_output_splits = output_splits
-            self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert
-
-            # 设置反向 AllToAll context
-            set_dispatch_alltoall_ctx(
-                ep_group=self.ep_group,
-                input_splits=output_splits,
-                output_splits=input_splits,
-                enabled=True,
-                num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-                sort_indices=self.sort_input_by_local_experts,
-                restore_indices=self.restore_output_by_local_experts,
-            )
-
-            # AllToAll probs（这个很小，开销可忽略）
-            global_probs = fluid_all_to_all_moe_dispatch(
-                permuted_probs, output_splits, input_splits, self.ep_group,
-            )
-        else:
-            global_probs = permuted_probs
-            tokens_per_expert = num_local_tokens_per_expert
-            self.num_global_tokens_per_local_expert = None
-
-        # TP gather for probs
-        if self.tp_size > 1:
-            global_probs = gather_from_sequence_parallel_region(global_probs, group=self.tp_group)
-
-        # Sort dispatched_input by local experts
-        sorted_input = dispatched_input
-        if self.num_local_experts > 1 and self.num_global_tokens_per_local_expert is not None:
-            sorted_input, global_probs = sort_chunks_by_idxs(
-                dispatched_input,
-                self.num_global_tokens_per_local_expert.ravel(),
-                self.sort_input_by_local_experts,
-                probs=global_probs,
-            )
-
-        self.probs = global_probs
-        return sorted_input, tokens_per_expert, global_probs
+    def _compute_fc2_per_expert(
+        self,
+        activated: torch.Tensor,
+        weight2: torch.Tensor,
+        source_rank: int,
+        output_splits_list: List[int],
+    ) -> torch.Tensor:
+        """
+        对于 num_local_experts > 1，按 expert 分别计算 FC2
+        """
+        # 简化实现：直接用一个大的 matmul
+        return torch.mm(activated, weight2)
 
     def _dispatch(
         self,

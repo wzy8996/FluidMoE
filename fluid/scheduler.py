@@ -179,6 +179,11 @@ class BackwardScheduler:
         self.dw_queue.append(task)
         self.total_dw_tasks += 1
 
+        # Debug: print registered tasks
+        import os
+        if os.environ.get('FLUID_DEBUG_DW_TASKS', '0') == '1':
+            print(f"[DEBUG-DW] Task #{self.total_dw_tasks}: {layer_name} (layer_id={layer_id})", flush=True)
+
     def set_auto_finish(self, enabled: bool):
         """
         Enable or disable auto-finish mode.

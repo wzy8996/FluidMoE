@@ -12,18 +12,13 @@ Key Features:
 - dW computation overlaps with AllToAll communication
 
 Usage:
-    python examples/pretrain_gpt_moe.py \\
-        --num-layers 2 \\
-        --hidden-size 512 \\
-        --num-attention-heads 8 \\
-        --num-experts 4 \\
-        --moe-router-topk 2 \\
-        --context-parallel-size 2 \\
-        --expert-model-parallel-size 2 \\
-        --tensor-model-parallel-size 1 \\
-        --micro-batch-size 1 \\
-        --global-batch-size 2 \\
-        --train-iters 10
+    # Baseline mode
+    FLUID_FORWARD_OVERLAP=0 torchrun --nproc_per_node 2 examples/pretrain_gpt_moe.py \\
+        --num-layers 4 --hidden-size 1024 ...
+
+    # Overlap mode
+    FLUID_FORWARD_OVERLAP=1 torchrun --nproc_per_node 2 examples/pretrain_gpt_moe.py \\
+        --num-layers 4 --hidden-size 1024 ...
 """
 
 import sys
@@ -170,9 +165,6 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step_func=forward_step_func,
-        # args_defaults={
-        #     'tokenizer_type': 'GPT2BPETokenizer',
-        # }
     )
 
     # Print final statistics
@@ -183,4 +175,4 @@ if __name__ == "__main__":
     import fluid
     fluid.print_status()
 
-    print("\n[FluidMoE] Training session finished successfully! 🚀\n")
+    print("\n[FluidMoE] Training session finished successfully!\n")

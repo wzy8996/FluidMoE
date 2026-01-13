@@ -554,3 +554,6 @@ class FluidRowParallelLinear(MegatronModule):
             return output, self.bias
         else:
             return output, None
+
+
+# 旧的细粒度重叠代码已移除，新实现在 overlap_forward.py 中

@@ -251,6 +251,10 @@ class FluidDotProductAttention(MegatronModule):
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
+        # 确保dtype一致（attention_probs可能是float32，需要转换为value的dtype）
+        if attention_probs.dtype != value.dtype:
+            attention_probs = attention_probs.to(value.dtype)
+
         # matmul: [b * np, sq, hn]
         context = torch.bmm(attention_probs, value.transpose(0, 1))
 

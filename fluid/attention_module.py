@@ -18,11 +18,19 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 
-from fluid.attention_layers import FluidColumnParallelLinear, FluidRowParallelLinear
+import os
+
+from fluid.attention_layers import (
+    FluidColumnParallelLinear,
+    FluidRowParallelLinear,
+)
 from fluid.attention_core import FluidDotProductAttention
 from fluid.communication import (
     fluid_all_to_all_sp2hp,
     fluid_all_to_all_hp2sp,
+    fluid_all_to_all_qkv_sp2hp_batched,  # QKV合并通信
+    fluid_all_to_all_qkv_hp2sp_batched,  # QKV合并通信
+    fluid_all_to_all_mixed_qkv_sp2hp,    # 直接对mixed_qkv做AllToAll（Baseline优化）
     fluid_fused_all_to_all_sp2hp,
     fluid_fused_all_to_all_hp2sp,
     get_dx_num_chunks,
@@ -30,6 +38,11 @@ from fluid.communication import (
     fluid_fused_hp2sp_linear_proj,
     fluid_fused_sp2hp_core_attention,
 )
+
+# 前向重叠功能开关
+def get_forward_overlap_enabled():
+    """Check if forward overlap mode is enabled (动态读取环境变量)"""
+    return os.environ.get('FLUID_FORWARD_OVERLAP', '0') == '1'
 
 
 class FluidSelfAttention(MegatronModule):
@@ -86,8 +99,13 @@ class FluidSelfAttention(MegatronModule):
         )
 
         # Context Parallel 配置
-        self.cp_size = config.context_parallel_size
+        # 优先从 pg_collection 获取 cp_size，确保与实际进程组一致
+        # 这与 FluidMoELayer 的行为一致（从 pg_collection.ep.size() 获取 ep_size）
         self.cp_group = self.pg_collection.cp if self.pg_collection else None
+        if self.cp_group is not None:
+            self.cp_size = self.cp_group.size()
+        else:
+            self.cp_size = config.context_parallel_size
 
         # 1. QKV 投影层 (直接创建 Fluid 版本)
         self.linear_qkv = FluidColumnParallelLinear(
@@ -165,34 +183,78 @@ class FluidSelfAttention(MegatronModule):
         关键：手动 AllToAll 允许 scheduler 在通信时调度 dW 计算
         """
 
+        # ===== Forward Overlap Path =====
+        # 使用 overlap_forward.py 的新实现
+        # Enable with: FLUID_FORWARD_OVERLAP=1
+        if get_forward_overlap_enabled() and self.cp_size > 1:
+            if os.environ.get('FLUID_DEBUG_FORWARD_TIMING', '0') == '1':
+                print(f"[Forward Overlap Attn] Using overlap path, cp_size={self.cp_size}", flush=True)
+            return self._forward_with_overlap(
+                hidden_states, attention_mask, rotary_pos_emb, packed_seq_params
+            )
+
         # ===== 步骤 1: QKV 投影 =====
         # [seq_len/CP, batch, hidden_size] -> [seq_len/CP, batch, 3*hidden_size]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
-        # 分割 QKV
-        # [seq_len/CP, batch, num_heads, head_dim]
-        query, key, value = self._split_qkv(mixed_qkv)
-
-        # 应用 Q/K LayerNorm (如果启用)
-        if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
-        if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
-
         # ===== 步骤 2: AllToAll sp2hp (手动控制) =====
         # 只有在使用 Context Parallel 时才执行 AllToAll
+        # Note: Pipelined mode (FLUID_PIPELINED_SP2HP=1) uses _forward_pipelined_qk_overlap path
+        debug_timing = os.environ.get('FLUID_DEBUG_FORWARD_TIMING', '0') == '1'
+        if debug_timing and self.cp_size > 1:
+            if not hasattr(self, '_baseline_timing_count'):
+                self._baseline_timing_count = 0
+            self._baseline_timing_count += 1
+            if self._baseline_timing_count <= 20:
+                import torch.cuda
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_end = torch.cuda.Event(enable_timing=True)
+                ev_start.record()
+
         if self.cp_size > 1:
             # [seq_len/CP, batch, num_heads, head_dim] -> [seq_len, batch, num_heads/CP, head_dim]
-            # Use fused version when chunking is enabled for true dX + AllToAll pipeline
             num_chunks = get_dx_num_chunks()
             if num_chunks > 1:
+                # Chunked mode: need to split first, then do separate AllToAll
+                query, key, value = self._split_qkv(mixed_qkv)
+                # Apply Q/K LayerNorm if enabled
+                if self.q_layernorm is not None:
+                    query = self.q_layernorm(query)
+                if self.k_layernorm is not None:
+                    key = self.k_layernorm(key)
+                # TODO: Add fused batched version for chunked mode
                 query = fluid_fused_all_to_all_sp2hp(query, self.cp_group)
                 key = fluid_fused_all_to_all_sp2hp(key, self.cp_group)
                 value = fluid_fused_all_to_all_sp2hp(value, self.cp_group)
             else:
-                query = fluid_all_to_all_sp2hp(query, self.cp_group)
-                key = fluid_all_to_all_sp2hp(key, self.cp_group)
-                value = fluid_all_to_all_sp2hp(value, self.cp_group)
+                # Optimized Baseline path: Direct AllToAll on mixed_qkv
+                # Avoids redundant split->concat->split operations
+                query, key, value = fluid_all_to_all_mixed_qkv_sp2hp(
+                    mixed_qkv,
+                    self.num_attention_heads_per_partition,
+                    self.num_query_groups_per_partition,  # num_kv_heads
+                    self.hidden_size_per_attention_head,
+                    self.cp_group
+                )
+                # Apply Q/K LayerNorm after AllToAll (if enabled)
+                if self.q_layernorm is not None:
+                    query = self.q_layernorm(query)
+                if self.k_layernorm is not None:
+                    key = self.k_layernorm(key)
+        else:
+            # No CP: Just split locally
+            query, key, value = self._split_qkv(mixed_qkv)
+            # Apply Q/K LayerNorm if enabled
+            if self.q_layernorm is not None:
+                query = self.q_layernorm(query)
+            if self.k_layernorm is not None:
+                key = self.k_layernorm(key)
+
+        # Baseline timing - sp2hp
+        if debug_timing and self.cp_size > 1 and hasattr(self, '_baseline_timing_count') and self._baseline_timing_count <= 20:
+            ev_sp2hp_end = torch.cuda.Event(enable_timing=True)
+            ev_sp2hp_end.record()
+            ev_attn_end = None  # will be set after attention
 
         # ===== 步骤 3: 注意力计算（在完整序列上） =====
         # DotProductAttention 期望 [seq_len, batch, num_heads/CP, head_dim]
@@ -222,6 +284,15 @@ class FluidSelfAttention(MegatronModule):
                 attn_mask_type=self.attn_mask_type,
                 packed_seq_params=packed_seq_params,
             )
+
+        # Baseline timing - after attention
+        if debug_timing and self.cp_size > 1 and hasattr(self, '_baseline_timing_count') and self._baseline_timing_count <= 20:
+            ev_attn_end = torch.cuda.Event(enable_timing=True)
+            ev_attn_end.record()
+            torch.cuda.synchronize()
+            t_sp2hp = ev_start.elapsed_time(ev_sp2hp_end)
+            t_attn = ev_sp2hp_end.elapsed_time(ev_attn_end)
+            print(f"[Baseline Attn] sp2hp: {t_sp2hp:.2f}ms, core_attn: {t_attn:.2f}ms, total: {t_sp2hp+t_attn:.2f}ms")
 
         # ===== 步骤 4+5: AllToAll hp2sp + 输出投影 =====
         # 只有在使用 Context Parallel 时才执行 AllToAll
@@ -366,3 +437,102 @@ class FluidSelfAttention(MegatronModule):
         )
 
         return hidden_states
+
+    def _forward_with_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        packed_seq_params=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        使用多轮 P2P 重叠实现的前向传播（统一实现）
+
+        使用 Round-Robin Tournament 调度：
+        - 将"每个rank和所有其他rank交换数据"拆成多轮
+        - 若卡数P为偶数：总轮数 R = P-1
+        - 若卡数P为奇数：添加dummy，总轮数 R = P
+        - 每轮每张卡只和一个peer通信（避免冲突）
+        - 通信流在跑第r轮的同时，计算流在处理第r-1轮的数据
+
+        2卡场景自然退化为1轮通信（P=2, R=1）
+
+        注意力层通信是规则的（Ulysses SP），每个rank发送/接收相同大小的数据
+
+        Timeline:
+        [QKV Round 0] → [P2P Round 1] || [Process Round 0] → ... → [Attention] → [hp2sp+proj]
+        """
+        from fluid.multicard_p2p import (
+            AttentionMultiCardOverlapContext,
+            attention_multicard_qkv_sp2hp_with_grad,
+            attention_multicard_hp2sp_proj,
+        )
+
+        seq_local, batch, hidden_size = hidden_states.shape
+        cp = self.cp_size
+        my_rank = self.cp_group.rank()
+
+        # 获取 QKV 权重
+        qkv_weight = self.linear_qkv.weight
+        heads = self.num_attention_heads_per_partition
+        num_kv_heads = self.num_query_groups_per_partition
+        dim = self.hidden_size_per_attention_head
+
+        # 创建或获取多卡 overlap context（统一管理所有卡数场景）
+        if not hasattr(self, '_multicard_overlap_ctx'):
+            self._multicard_overlap_ctx = AttentionMultiCardOverlapContext(
+                hidden_states.device, cp
+            )
+
+        debug_timing = os.environ.get('FLUID_DEBUG_FORWARD_TIMING', '0') == '1'
+        if debug_timing:
+            print(f"[Forward Overlap Attn Rank {my_rank}] Using P2P overlap with {self._multicard_overlap_ctx.num_rounds} rounds", flush=True)
+
+        # ===== Step 1: QKV + sp2hp with multicard P2P overlap =====
+        query, key, value = attention_multicard_qkv_sp2hp_with_grad(
+            hidden_states,
+            qkv_weight,
+            heads,
+            num_kv_heads,
+            dim,
+            self.cp_group,
+            self._multicard_overlap_ctx,
+            layer_name=f"layer_{self.layer_number}_attn_qkv",
+            layer_id=self.layer_number,
+        )
+
+        # ===== Step 2: Core Attention =====
+        attention_mask_for_attn = None  # Ulysses mode: use causal mask
+
+        if self.checkpoint_core_attention:
+            context = self._checkpointed_attention_forward(
+                query, key, value,
+                attention_mask=attention_mask_for_attn,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            context = self.core_attention(
+                query, key, value,
+                attention_mask=attention_mask_for_attn,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+
+        # ===== Step 3: hp2sp + Output Projection with multicard overlap =====
+        seq_full = seq_local * cp
+        heads_local = heads // cp
+        context_4d = context.view(seq_full, batch, heads_local, dim)
+
+        output = attention_multicard_hp2sp_proj(
+            context_4d,
+            self.linear_proj.weight,
+            self.linear_proj.bias,
+            self.cp_group,
+            self._multicard_overlap_ctx,
+        )
+
+        # Bias is returned separately (skip_bias_add=True pattern)
+        output_bias = self.linear_proj.bias
+
+        return output, output_bias
