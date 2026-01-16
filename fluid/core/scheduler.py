@@ -14,10 +14,14 @@ Key Innovation:
 - Prioritize dX (critical path) while overlapping dW with communication
 """
 
+import os
 import torch
 from typing import List, Optional, Callable, Tuple
 from collections import deque
 import threading
+
+# Debug flag for scheduler verbose output
+_DEBUG_SCHEDULER = os.environ.get('FLUID_DEBUG_SCHEDULER', '0') == '1'
 
 
 class DWTask:
@@ -132,6 +136,25 @@ class BackwardScheduler:
         self.comm_in_progress = False
         self.total_dw_tasks = 0
         self.completed_dw_tasks = 0
+        self.overlap_completed_dw_tasks = 0
+        self.finish_batch_completed_dw_tasks = 0
+
+    def clear_iteration(self):
+        """
+        Clear the queue and stats for a new iteration while keeping the scheduler enabled.
+
+        Use this between benchmark iterations instead of reset() to avoid
+        destroying the singleton and losing the enabled state.
+        """
+        self.dw_queue.clear()
+        self.active_dw_task = None
+        self.comm_in_progress = False
+        self.total_dw_tasks = 0
+        self.completed_dw_tasks = 0
+        self.overlap_completed_dw_tasks = 0
+        self.finish_batch_completed_dw_tasks = 0
+        self.pending_combine_contexts.clear()
+        self.prelaunched_combine_results = None
 
     def enable(self):
         """Enable the scheduler"""
@@ -180,8 +203,7 @@ class BackwardScheduler:
         self.total_dw_tasks += 1
 
         # Debug: print registered tasks
-        import os
-        if os.environ.get('FLUID_DEBUG_DW_TASKS', '0') == '1':
+        if _DEBUG_SCHEDULER or os.environ.get('FLUID_DEBUG_DW_TASKS', '0') == '1':
             print(f"[DEBUG-DW] Task #{self.total_dw_tasks}: {layer_name} (layer_id={layer_id})", flush=True)
 
     def set_auto_finish(self, enabled: bool):
@@ -192,7 +214,8 @@ class BackwardScheduler:
             enabled: If True, automatically call finish_batch() when backward ends
         """
         self.auto_finish = enabled
-        print(f"[BackwardScheduler] Auto-finish mode: {'enabled' if enabled else 'disabled'}")
+        if _DEBUG_SCHEDULER:
+            print(f"[BackwardScheduler] Auto-finish mode: {'enabled' if enabled else 'disabled'}")
 
     def on_alltoall_start(self, comm_type: str = "unknown"):
         """
@@ -277,15 +300,12 @@ class BackwardScheduler:
         if not self.dw_queue:
             return
 
-        # Minimum tasks to execute before checking AllToAll completion
-        # Ensures stable overlap ratio even when AllToAll is very fast (small-scale tests)
-        MIN_DW_TASKS_PER_ALLTOALL = 2
-
-        # Execute dW tasks incrementally on default_stream
+        # Goal: hide AllToAll communication under dW compute
+        # Execute dW tasks until AllToAll completes or queue is empty
         tasks_executed = 0
         while self.dw_queue:
-            # Only check AllToAll completion after executing minimum tasks
-            if tasks_executed >= MIN_DW_TASKS_PER_ALLTOALL and self._is_alltoall_complete():
+            # Check if AllToAll has completed - if so, stop to continue dX
+            if tasks_executed > 0 and self._is_alltoall_complete():
                 break
 
             # Get next task
@@ -302,7 +322,6 @@ class BackwardScheduler:
                 grad_weight = task.compute_fn()
 
                 # DEBUG: Print dW norm for MoE experts
-                import os
                 if os.environ.get('FLUID_DEBUG_DW_NORM', '0') == '1' and 'moe_expert' in task.layer_name:
                     print(f"[Scheduler] {task.layer_name} grad norm: {grad_weight.norm().item():.6f}", flush=True)
 
@@ -316,7 +335,8 @@ class BackwardScheduler:
 
             except Exception as e:
                 # If dW computation fails, log but continue
-                print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
+                if _DEBUG_SCHEDULER:
+                    print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
                 continue
 
             task_end_event.record(self.default_stream)
@@ -351,7 +371,8 @@ class BackwardScheduler:
             return
 
         remaining = len(self.dw_queue)
-        print(f"[BackwardScheduler] Batch finished, completing {remaining} remaining dW tasks")
+        if _DEBUG_SCHEDULER:
+            print(f"[BackwardScheduler] Batch finished, completing {remaining} remaining dW tasks")
 
         # Execute all remaining tasks synchronously
         while self.dw_queue:
@@ -369,16 +390,19 @@ class BackwardScheduler:
                     else:
                         task.weight_param.grad.add_(grad_weight)
 
-                print(f"[BackwardScheduler] Completed remaining dW: {task.layer_name}")
+                if _DEBUG_SCHEDULER:
+                    print(f"[BackwardScheduler] Completed remaining dW: {task.layer_name}")
             except Exception as e:
-                print(f"[BackwardScheduler] Warning: Failed to complete dW {task.layer_name}: {e}")
+                if _DEBUG_SCHEDULER:
+                    print(f"[BackwardScheduler] Warning: Failed to complete dW {task.layer_name}: {e}")
                 continue
 
             task.completed = True
             self.completed_dw_tasks += 1
             self.finish_batch_completed_dw_tasks += 1  # Count as finish_batch completion
 
-        print(f"[BackwardScheduler] All {remaining} remaining dW tasks completed")
+        if _DEBUG_SCHEDULER:
+            print(f"[BackwardScheduler] All {remaining} remaining dW tasks completed")
 
     def _execute_all_dw_tasks_sync(self) -> int:
         """
@@ -412,7 +436,8 @@ class BackwardScheduler:
                         task.weight_param.grad.add_(grad_weight)
 
             except Exception as e:
-                print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
+                if _DEBUG_SCHEDULER:
+                    print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
                 continue
 
             task.completed = True

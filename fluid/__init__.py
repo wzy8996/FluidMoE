@@ -1,191 +1,180 @@
-# Copyright (c) 2024, FluidMoE Team. All rights reserved.
-
 """
-FluidMoE: Complete Custom Layer Implementation for Megatron-LM MoE
+FluidMoE: Standalone MoE/Attention Implementation with Communication-Computation Overlap
 
-FluidMoE provides full custom layer implementation with computation-
-communication overlap optimization:
+This package provides standalone implementations of:
+- MoE (Mixture of Experts) with Expert Parallel
+- Attention with Ulysses-style Context Parallel
+- Scheduler for dW overlap during backward AllToAll
+- P2P communication overlap for forward pass (Round-Robin Tournament)
 
-- Complete custom FluidSelfAttention and FluidMoELayer
-- No global function patching required
-- Full control over forward and backward computation
-- Support for forward optimization (future)
+Key Features:
+- dW tasks registered during backward, executed during AllToAll communication
+- Chunked dX computation pipelined with AllToAll
+- Multi-card P2P overlap for both MoE dispatch/combine and Attention sp2hp/hp2sp
+- No external dependencies (Megatron-free)
 
-Architecture:
-- FluidSelfAttention: Custom attention with Ulysses Sequence Parallel (SP)
-- FluidMoELayer: Custom MoE with Expert Parallel (EP)
-- FluidTokenDispatcher: Custom token routing with Fluid AllToAll
-- dW computation overlaps with AllToAll communication
-
-Quick Start:
-    from megatron.core.transformer import TransformerConfig
-    from megatron.core import GPTModel
-    from fluid import get_fluid_custom_layers
-
-    config = TransformerConfig(
-        num_layers=32,
-        hidden_size=4096,
-        num_moe_experts=8,
-        context_parallel_size=4,  # SP
-        expert_model_parallel_size=2,  # EP
-    )
-
-    custom_layers = get_fluid_custom_layers()
-    model = GPTModel(config, transformer_layer_spec=custom_layers)
-
-Components:
-- scheduler: Global backward scheduler with dW task queue
-- communication: Fluid AllToAll primitives (no patching needed)
-- attention_module: FluidSelfAttention with custom forward logic
-- moe_module: FluidMoELayer and FluidTokenDispatcher
-- attention_layers: Fluid linear layers for dW scheduling
-- moe_layers: FluidGroupedMLP for expert computation
+Modules:
+- core: AllToAll primitives, P2P scheduling, overlap context, scheduler
+- moe: Router, MoE baseline, chunked backward, P2P overlap
+- attention: Attention baseline, chunked backward, P2P overlap
+- layers: TransformerLayer, Megatron-LM integration
 """
 
-__version__ = "0.9.0"  # Multi-card P2P overlap with Round-Robin Tournament scheduling
+__version__ = "1.0.0"
 __author__ = "FluidMoE Team"
 __license__ = "Apache 2.0"
 
-# Core scheduler
-from .scheduler import BackwardScheduler, get_backward_scheduler
-
-# Optimizer component (for automatic finish_batch)
-from .optimizer_wrapper import (
-    FluidOptimizerWrapper,
-    get_fluid_optimizer,
-    wrap_optimizer,
-)
-
-# Communication primitives
-from .communication import (
-    _FluidAllToAll,
-    fluid_all_to_all,
-    fluid_all_to_all_sp2hp,
-    fluid_all_to_all_hp2sp,
-    fluid_all_to_all_moe_dispatch,
-    fluid_all_to_all_moe_combine,
-    # Fused attention backward with chunked dX + AllToAll pipeline
-    fluid_fused_hp2sp_linear_proj,
-    fluid_fused_sp2hp_core_attention,
-    # Pipelined Q/K/V sp2hp for forward compute-communication overlap
-    fluid_pipelined_sp2hp_qkv,
-    # TRUE overlap: V AllToAll with Q@K^T computation
-    fluid_pipelined_sp2hp_with_qk_matmul,
-)
-
-# Fused forward kernels (v0.8)
-# The new fused kernels (moe_alltoall_fc1_fused, moe_fc2_alltoall_fused)
-# are exposed via fluid_kernels directly
-
-# MoE components
-from .moe_layers import FluidGroupedMLP, FluidRouter
-
-# Attention components
-from .attention_layers import FluidColumnParallelLinear, FluidRowParallelLinear
-
-# Custom layer modules
-from .attention_module import FluidSelfAttention
-from .moe_module import FluidMoELayer
-
-# Primary API (complete custom layer implementation)
-from .megatron_layers import (
-    get_fluid_custom_layers,
-    get_fluid_moe_layer_spec,  # Deprecated alias
-    print_fluid_layer_info,
-    is_fluid_enabled,
-)
-
-# Pretrain function (generic training entry point)
-from .pretrain import pretrain
-
-# Forward compute-communication overlap (P2P based)
-# DEPRECATED: 这些2卡专用函数已被统一的多卡Round-Robin实现替代
-# 保留导出仅为向后兼容，请使用 multicard_p2p 中的函数
-from .overlap_forward import (
-    # QKV + sp2hp overlap (Heads Split方式) - Deprecated
-    qkv_sp2hp_heads_split,
-    prepare_qkv_split_weights,
-    # hp2sp + output projection overlap - Deprecated
-    hp2sp_output_proj_overlap,
-    # MoE P2P overlap - Deprecated
-    moe_p2p_overlap_forward,
-    # Context manager - Deprecated
-    OverlapContext,
-)
-
-# Multi-card P2P overlap (Round-Robin Tournament scheduling)
-from .multicard_p2p import (
-    # Round-Robin scheduling algorithm
+# =============================================================================
+# Core module
+# =============================================================================
+from .core import (
+    # AllToAll primitives
+    _all_to_all,
+    _all_to_all_sp2hp_forward,
+    _all_to_all_hp2sp_forward,
+    _sort_chunks_by_idxs,
+    # Utility functions
+    _gelu_grad_exact,
+    _compute_activation_derivative,
+    _compute_activation_grad,
+    get_optimal_num_chunks,
+    # P2P scheduling
     compute_round_robin_schedule,
     get_partner_for_round,
     get_all_partners_ordered,
-    # MoE multi-card P2P overlap
+    get_num_rounds,
+    # Overlap context
     MultiCardOverlapContext,
-    moe_multicard_p2p_overlap_forward,
-    # Attention multi-card P2P overlap
     AttentionMultiCardOverlapContext,
-    attention_multicard_qkv_sp2hp_with_grad,
-    attention_multicard_hp2sp_proj,
+    # Scheduler
+    BackwardScheduler,
+    get_backward_scheduler,
 )
 
+# =============================================================================
+# MoE module
+# =============================================================================
+from .moe import (
+    # Router
+    _RouterFunction,
+    compute_routing,
+    # Baseline
+    MoEBaseline,
+    _MoEBaselineFunction,
+    # Chunked backward
+    backward_dispatch_chunked,
+    # P2P overlap
+    moe_multicard_p2p_overlap_forward,
+    _MoEMultiCardP2POverlapFunction,
+    _compute_fc1_act_per_source,
+    _compute_fc2_per_source,
+    _compute_expert_forward_per_source,
+    _merge_tokens_and_fc1_expert_major,
+    _precompute_backward_sort_indices,
+)
 
+# =============================================================================
+# Attention module
+# =============================================================================
+from .attention import (
+    # Baseline
+    AttentionBaseline,
+    _QKVProjectionFunction,
+    _OutputProjectionFunction,
+    _SP2HPFunction,
+    _HP2SPFunction,
+    scaled_dot_product_attention,
+    # Chunked backward
+    backward_output_proj_chunked,
+    # P2P overlap
+    _qkv_sp2hp_multicard_impl,
+    _hp2sp_output_proj_multicard_impl,
+    qkv_sp2hp_multicard_overlap,
+    hp2sp_output_proj_multicard_overlap,
+    _QKVSp2HpMultiCardFunction,
+    _HP2SpOutputProjMultiCardFunction,
+)
+
+# =============================================================================
+# Layers module
+# =============================================================================
+from .layers import (
+    # Transformer layer
+    TransformerLayer,
+    # Megatron integration
+    get_fluid_custom_layers,
+    get_fluid_moe_layer_spec,  # Deprecated
+    is_fluid_enabled,
+    print_fluid_layer_info,
+)
+
+# =============================================================================
+# Public API
+# =============================================================================
 __all__ = [
-    # Primary API
-    "get_fluid_custom_layers",
-    "get_fluid_optimizer",  # New: Fluid optimizer component
-    "pretrain",  # FluidMoE pretrain function
-    "get_fluid_moe_layer_spec",  # Deprecated, use get_fluid_custom_layers
-    "print_fluid_layer_info",
-    "is_fluid_enabled",
-
-    # Custom components (for customization)
-    "FluidSelfAttention",
-    "FluidMoELayer",
-    "FluidOptimizerWrapper",
-
-    # Optimizer utilities
-    "wrap_optimizer",
-
-    # Scheduler (advanced users)
-    "BackwardScheduler",
-    "get_backward_scheduler",
-
-    # Communication (advanced users)
-    "_FluidAllToAll",
-    "fluid_all_to_all",
-    "fluid_all_to_all_sp2hp",
-    "fluid_all_to_all_hp2sp",
-    "fluid_all_to_all_moe_dispatch",
-    "fluid_all_to_all_moe_combine",
-    # Fused attention backward
-    "fluid_fused_hp2sp_linear_proj",
-    "fluid_fused_sp2hp_core_attention",
-    # Pipelined Q/K/V sp2hp for forward overlap
-    "fluid_pipelined_sp2hp_qkv",
-
-    # Layer components (advanced users)
-    "FluidColumnParallelLinear",
-    "FluidRowParallelLinear",
-    "FluidGroupedMLP",
-
-    # Forward overlap (P2P based - Heads Split方式)
-    # DEPRECATED: 已被统一的多卡实现替代，保留仅为向后兼容
-    "qkv_sp2hp_heads_split",
-    "prepare_qkv_split_weights",
-    "hp2sp_output_proj_overlap",
-    "moe_p2p_overlap_forward",
-    "OverlapContext",
-
-    # Multi-card P2P overlap (Round-Robin Tournament scheduling)
-    # 统一实现：2卡场景自动退化为1轮通信
+    # Core - AllToAll primitives
+    "_all_to_all",
+    "_all_to_all_sp2hp_forward",
+    "_all_to_all_hp2sp_forward",
+    "_sort_chunks_by_idxs",
+    # Core - Utility functions
+    "_gelu_grad_exact",
+    "_compute_activation_derivative",
+    "_compute_activation_grad",
+    "get_optimal_num_chunks",
+    # Core - P2P scheduling
     "compute_round_robin_schedule",
     "get_partner_for_round",
     "get_all_partners_ordered",
+    "get_num_rounds",
+    # Core - Overlap context
     "MultiCardOverlapContext",
-    "moe_multicard_p2p_overlap_forward",
     "AttentionMultiCardOverlapContext",
-    "attention_multicard_qkv_sp2hp_with_grad",
-    "attention_multicard_hp2sp_proj",
+    # Core - Scheduler
+    "BackwardScheduler",
+    "get_backward_scheduler",
+
+    # MoE - Router
+    "_RouterFunction",
+    "compute_routing",
+    # MoE - Baseline
+    "MoEBaseline",
+    "_MoEBaselineFunction",
+    # MoE - Chunked backward
+    "backward_dispatch_chunked",
+    # MoE - P2P overlap
+    "moe_multicard_p2p_overlap_forward",
+    "_MoEMultiCardP2POverlapFunction",
+    "_compute_fc1_act_per_source",
+    "_compute_fc2_per_source",
+    "_compute_expert_forward_per_source",
+    "_merge_tokens_and_fc1_expert_major",
+    "_precompute_backward_sort_indices",
+
+    # Attention - Baseline
+    "AttentionBaseline",
+    "_QKVProjectionFunction",
+    "_OutputProjectionFunction",
+    "_SP2HPFunction",
+    "_HP2SPFunction",
+    "scaled_dot_product_attention",
+    # Attention - Chunked backward
+    "backward_output_proj_chunked",
+    # Attention - P2P overlap
+    "_qkv_sp2hp_multicard_impl",
+    "_hp2sp_output_proj_multicard_impl",
+    "qkv_sp2hp_multicard_overlap",
+    "hp2sp_output_proj_multicard_overlap",
+    "_QKVSp2HpMultiCardFunction",
+    "_HP2SpOutputProjMultiCardFunction",
+
+    # Layers
+    "TransformerLayer",
+    # Megatron integration
+    "get_fluid_custom_layers",
+    "get_fluid_moe_layer_spec",
+    "is_fluid_enabled",
+    "print_fluid_layer_info",
 ]
 
 
@@ -193,9 +182,9 @@ def print_status():
     """Print FluidMoE status and statistics"""
     scheduler = get_backward_scheduler()
 
-    print("="*60)
+    print("=" * 60)
     print("FluidMoE Status")
-    print("="*60)
+    print("=" * 60)
     print(f"Version: {__version__}")
     print(f"Scheduler enabled: {scheduler.is_enabled()}")
 
@@ -211,4 +200,4 @@ def print_status():
             overlap_ratio = stats['overlap_completed_dw_tasks'] / stats['total_dw_tasks'] * 100
             print(f"  Overlap ratio: {overlap_ratio:.2f}%")
 
-    print("="*60)
+    print("=" * 60)

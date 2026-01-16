@@ -1,31 +1,48 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
+*.egg
 *.egg-info/
 .eggs/
 dist/
 build/
+*.whl
 
-# CUDA build artifacts
-fluid/kernels/build/
-fluid/kernels/*.so
-fluid/ops/*.so
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# PyTorch / CUDA
+*.pt
+*.pth
+*.ckpt
+checkpoints/
 
 # Profiling
 *.nsys-rep
 *.sqlite
 *.qdrep
+*.nvvp
+*.ncu-rep
+chrome_trace.json
 
 # Training outputs
 *.log
 training_output*.txt
+wandb/
+runs/
+tensorboard/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
@@ -34,3 +51,13 @@ Thumbs.db
 # Temporary
 *.tmp
 *.bak
+*.cache
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
