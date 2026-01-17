@@ -31,419 +31,148 @@ from fluid.core.forward_comm import AttentionMultiCardOverlapContext, MultiCardO
 
 
 # =============================================================================
-# Multi-card Internal Implementation (No Gradient Tracking)
-# =============================================================================
-
-def _qkv_sp2hp_multicard_impl(
-    hidden_states: torch.Tensor,
-    weight_qkv: torch.Tensor,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    cp_group: dist.ProcessGroup,
-    overlap_ctx: MultiCardOverlapContext,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """QKV computation + sp2hp multi-card P2P overlap implementation (no gradient tracking)
-
-    Multi-card extension: use Round-Robin scheduling, pipeline overlap computation and communication
-
-    Core idea (pipeline overlap, consistent with overlap_forward.py):
-    - Round 0: Compute peer_0's QKV, start P2P_0
-    - Round i (i > 0): Parallel with P2P_{i-1}, compute peer_i's QKV, start P2P_i
-    - Final: Parallel with last P2P, compute local QKV, wait for all P2P
-
-    This way each round's QKV computation overlaps with the previous round's P2P!
-
-    Args:
-        hidden_states: [seq_local, B, hidden]
-        weight_qkv: [total_proj, hidden] full QKV weight
-        num_heads: total Q heads
-        num_kv_heads: total K/V heads (groups)
-        head_dim: dimension per head
-        cp_group: Context Parallel process group
-        overlap_ctx: multi-card overlap context
-
-    Returns:
-        q, k, v: [seq_full, B, heads_local, head_dim]
-    """
-    cp_size = cp_group.size()
-    my_rank = cp_group.rank()
-    device = hidden_states.device
-    dtype = hidden_states.dtype
-    seq_local, batch_size, hidden_size = hidden_states.shape
-
-    if cp_size == 1:
-        # Single card: compute directly
-        qkv = torch.matmul(hidden_states, weight_qkv.t())
-        qkv = qkv.view(seq_local, batch_size, num_kv_heads, -1)
-        q_per_group = num_heads // num_kv_heads
-        q_size = q_per_group * head_dim
-        q, k, v = torch.split(qkv, [q_size, head_dim, head_dim], dim=-1)
-        q = q.reshape(seq_local, batch_size, num_heads, head_dim)
-        return q, k, v
-
-    # Multi-card setup
-    num_rounds = cp_size - 1
-    seq_full = seq_local * cp_size
-    q_per_group = num_heads // num_kv_heads
-    groups_per_rank = num_kv_heads // cp_size
-    heads_local = groups_per_rank * q_per_group
-    group_size = (q_per_group + 2) * head_dim
-    proj_per_rank = groups_per_rank * group_size
-
-    default_stream = torch.cuda.current_stream(device)
-    comm_stream = overlap_ctx.get_stream()
-
-    # Split weight by group: [num_groups, group_size, hidden]
-    weight_grouped = weight_qkv.view(num_kv_heads, group_size, hidden_size)
-
-    # Weight for local groups
-    local_group_start = my_rank * groups_per_rank
-    weight_local = weight_grouped[local_group_start:local_group_start + groups_per_rank]
-    weight_local = weight_local.reshape(-1, hidden_size)  # [proj_per_rank, hidden]
-
-    # Pre-prepare weight for each peer
-    weight_per_partner = {}
-    partners = []
-    for round_idx in range(num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner == -1:
-            continue
-        partners.append(partner)
-        r_group_start = partner * groups_per_rank
-        weight_r = weight_grouped[r_group_start:r_group_start + groups_per_rank]
-        weight_per_partner[partner] = weight_r.reshape(-1, hidden_size)
-
-    # =========================================================================
-    # Pipeline overlap: each remote matmul parallel with previous P2P
-    # =========================================================================
-    # Timing (assuming partners = [p1, p2, p3]):
-    #   Round -1: Compute matmul_p1, event_p1.synchronize()
-    #   Round 0:  Start P2P_0, parallel compute matmul_p2 (parallel with P2P_0)
-    #   Round 1:  event_p2.synchronize(), start P2P_1, parallel compute matmul_p3
-    #   Round 2:  event_p3.synchronize(), start P2P_2, parallel compute matmul_local
-    #
-    # Using event.synchronize() (CPU wait):
-    # - CPU waits for matmul to complete, then submits both P2P and next matmul
-    # - This allows GPU to recognize both can run in parallel
-
-    qkv_full = torch.empty(seq_full, batch_size, proj_per_rank, dtype=dtype, device=device)
-    send_data_dict = {}
-    send_data_events = {}
-
-    # =========================================================================
-    # Round -1: Pre-compute first round's send_data
-    # =========================================================================
-    if len(partners) > 0:
-        first_partner = partners[0]
-        send_data_dict[first_partner] = torch.matmul(
-            hidden_states, weight_per_partner[first_partner].t()
-        )
-        send_data_events[first_partner] = torch.cuda.Event()
-        send_data_events[first_partner].record(default_stream)
-
-    # =========================================================================
-    # Pipeline loop: use CPU-side event.synchronize() to ensure data is ready
-    # =========================================================================
-    all_reqs = []
-    for round_idx, partner in enumerate(partners):
-        # Receive buffer
-        partner_seq_start = partner * seq_local
-        recv_buffer = qkv_full[partner_seq_start:partner_seq_start + seq_local]
-
-        # CPU wait for send_data to be ready
-        send_data_events[partner].synchronize()
-
-        # Start P2P (send_data is ready)
-        with torch.cuda.stream(comm_stream):
-            p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffer, partner, group=cp_group),
-                dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
-            ]
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            all_reqs.extend(reqs)
-
-        # Parallel with current P2P: compute next round data on default_stream
-        if round_idx + 1 < len(partners):
-            next_partner = partners[round_idx + 1]
-            send_data_dict[next_partner] = torch.matmul(
-                hidden_states, weight_per_partner[next_partner].t()
-            )
-            send_data_events[next_partner] = torch.cuda.Event()
-            send_data_events[next_partner].record(default_stream)
-        else:
-            # Last round: compute local QKV (parallel with last P2P)
-            qkv_local = torch.matmul(hidden_states, weight_local.t())
-
-    # Wait for all P2P to complete
-    for req in all_reqs:
-        req.wait()
-
-    # Handle no partners case (cp_size=1)
-    if len(partners) == 0:
-        qkv_local = torch.matmul(hidden_states, weight_local.t())
-
-    # =========================================================================
-    # Assemble result: write local data to corresponding position
-    # =========================================================================
-    local_seq_start = my_rank * seq_local
-    qkv_full[local_seq_start:local_seq_start + seq_local] = qkv_local
-
-    # Separate Q, K, V
-    qkv_full = qkv_full.view(seq_full, batch_size, groups_per_rank, group_size)
-    q_size = q_per_group * head_dim
-    q, k, v = torch.split(qkv_full, [q_size, head_dim, head_dim], dim=-1)
-    q = q.reshape(seq_full, batch_size, heads_local, head_dim)
-    # k, v: [seq_full, B, kv_heads_local, head_dim]
-
-    return q, k, v
-
-
-def _hp2sp_output_proj_multicard_impl(
-    attn_output: torch.Tensor,
-    weight_proj: torch.Tensor,
-    bias_proj: Optional[torch.Tensor],
-    cp_group: dist.ProcessGroup,
-    overlap_ctx: MultiCardOverlapContext,
-    save_for_backward: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """hp2sp + output projection multi-card P2P overlap implementation (no gradient tracking)
-
-    Multi-card extension: use Round-Robin scheduling, each round exchange raw attn data with one peer
-
-    Core idea (pipeline overlap):
-    - Round 0: Start P2P_0, parallel compute local partial
-    - Round i (i > 0): Wait for P2P_{i-1}, start P2P_i, parallel compute recv_{i-1}'s partial
-    - Final: Wait for last P2P, compute last partial
-
-    This way each round's partial computation overlaps with the next round's P2P!
-
-    hp2sp + projection semantics:
-    - Input: attn_output [seq_full, B, heads_local, head_dim] - full sequence, local heads
-    - Output: [seq_local, B, hidden] - local sequence, full hidden
-
-    Args:
-        attn_output: [seq_full, B, heads_local, head_dim]
-        weight_proj: [hidden, total_heads * head_dim]
-        bias_proj: [hidden] or None
-        cp_group: Context Parallel process group
-        overlap_ctx: multi-card overlap context
-        save_for_backward: If True, also return attn_input_full for backward
-
-    Returns:
-        output: [seq_local, B, hidden]
-        attn_input_full: [seq_local, B, all_heads * head_dim] if save_for_backward else None
-    """
-    cp_size = cp_group.size()
-    my_rank = cp_group.rank()
-    device = attn_output.device
-    dtype = attn_output.dtype
-
-    if cp_size == 1:
-        attn_flat = attn_output.view(attn_output.shape[0], attn_output.shape[1], -1)
-        output = torch.matmul(attn_flat, weight_proj.t())
-        if bias_proj is not None:
-            output = output + bias_proj
-        attn_input_full = attn_flat if save_for_backward else None
-        return output, attn_input_full
-
-    seq_full, batch_size, heads_local, head_dim = attn_output.shape
-    seq_local = seq_full // cp_size
-    hidden_size = weight_proj.shape[0]
-    input_dim_per_rank = heads_local * head_dim
-    num_rounds = cp_size - 1
-
-    default_stream = torch.cuda.current_stream(device)
-    comm_stream = overlap_ctx.get_stream()
-
-    # Local sequence start position
-    local_seq_start = my_rank * seq_local
-
-    # Weight for local heads
-    weight_local_start = my_rank * input_dim_per_rank
-    weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
-
-    # =========================================================================
-    # Prepare all data to send and receive buffers
-    # =========================================================================
-    send_data_dict = {}
-    recv_buffers = {}
-    weight_per_partner = {}
-    partners = []
-
-    for round_idx in range(num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner == -1:
-            continue
-        partners.append(partner)
-
-        # Prepare send data: attn_output at peer's sequence position (my heads data)
-        partner_seq_start = partner * seq_local
-        send_data_dict[partner] = attn_output[partner_seq_start:partner_seq_start + seq_local].contiguous()
-
-        # Prepare receive buffer
-        recv_buffers[partner] = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
-
-        # Cache partner's weight
-        partner_weight_start = partner * input_dim_per_rank
-        weight_per_partner[partner] = weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank]
-
-    # =========================================================================
-    # Pipeline overlap: each round's partial computation overlaps with next P2P
-    # =========================================================================
-    # Initialize output
-    attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
-    attn_local_flat = attn_local_seq.view(seq_local, batch_size, -1)
-
-    prev_reqs = None
-    prev_partner = None
-
-    for round_idx, partner in enumerate(partners):
-        # Start current round's P2P communication
-        with torch.cuda.stream(comm_stream):
-            p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffers[partner], partner, group=cp_group),
-                dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
-            ]
-            curr_reqs = dist.batch_isend_irecv(p2p_ops)
-
-        # Parallel with P2P: compute previous round's received data's partial (or first round compute local partial)
-        if round_idx == 0:
-            # First round: compute local partial (parallel with P2P_0)
-            output = torch.matmul(attn_local_flat, weight_local.t())
-        else:
-            # Wait for previous round P2P to complete
-            for req in prev_reqs:
-                req.wait()
-            # Compute previous round's received data's partial (parallel with current P2P)
-            recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
-            output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
-
-        prev_reqs = curr_reqs
-        prev_partner = partner
-
-    # Wait for last P2P to complete, compute last partial
-    if prev_reqs is not None:
-        for req in prev_reqs:
-            req.wait()
-        recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
-        output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
-
-    if bias_proj is not None:
-        output = output + bias_proj
-
-    # Collect attn_input_full for backward if needed
-    attn_input_full = None
-    if save_for_backward:
-        # Collect all heads' data at my_seq position
-        attn_parts = {my_rank: attn_local_flat}
-        for partner in partners:
-            attn_parts[partner] = recv_buffers[partner].view(seq_local, batch_size, -1)
-        # Concatenate in rank order
-        attn_input_full = torch.cat([attn_parts[r] for r in range(cp_size)], dim=-1)
-
-    return output, attn_input_full
-
-
-# =============================================================================
-# Public API with MultiCardOverlapContext
-# =============================================================================
-
-def qkv_sp2hp_multicard_overlap(
-    hidden_states: torch.Tensor,
-    weight_qkv: torch.Tensor,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    cp_group: dist.ProcessGroup,
-    overlap_ctx: MultiCardOverlapContext,
-    layer_id: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """QKV computation + sp2hp multi-card P2P overlap
-
-    Multi-card version of qkv_sp2hp_heads_split, supports any number of GPUs.
-
-    Args:
-        hidden_states: [seq_local, B, hidden]
-        weight_qkv: [total_proj, hidden] full QKV weight
-        num_heads: total Q heads
-        num_kv_heads: total K/V heads (groups)
-        head_dim: dimension per head
-        cp_group: Context Parallel process group
-        overlap_ctx: multi-card overlap context
-        layer_id: layer ID (for dW task registration)
-
-    Returns:
-        q, k, v: [seq_full, B, heads_local, head_dim]
-    """
-    if hidden_states.requires_grad:
-        return _QKVSp2HpMultiCardFunction.apply(
-            hidden_states, weight_qkv, num_heads, num_kv_heads, head_dim,
-            cp_group, overlap_ctx, layer_id
-        )
-    else:
-        return _qkv_sp2hp_multicard_impl(
-            hidden_states, weight_qkv, num_heads, num_kv_heads, head_dim,
-            cp_group, overlap_ctx
-        )
-
-
-def hp2sp_output_proj_multicard_overlap(
-    attn_output: torch.Tensor,
-    weight_proj: torch.Tensor,
-    bias_proj: Optional[torch.Tensor],
-    cp_group: dist.ProcessGroup,
-    overlap_ctx: MultiCardOverlapContext,
-) -> torch.Tensor:
-    """hp2sp + output projection multi-card P2P overlap
-
-    Multi-card version of hp2sp_output_proj_overlap, supports any number of GPUs.
-
-    Args:
-        attn_output: [seq_full, B, heads_local, head_dim]
-        weight_proj: [hidden, total_heads * head_dim]
-        bias_proj: [hidden] or None
-        cp_group: Context Parallel process group
-        overlap_ctx: multi-card overlap context
-
-    Returns:
-        output: [seq_local, B, hidden]
-    """
-    if attn_output.requires_grad:
-        return _HP2SpOutputProjMultiCardFunction.apply(
-            attn_output, weight_proj, bias_proj, cp_group, overlap_ctx
-        )
-    else:
-        output, _ = _hp2sp_output_proj_multicard_impl(
-            attn_output, weight_proj, bias_proj, cp_group, overlap_ctx,
-            save_for_backward=False
-        )
-        return output
-
-
-# =============================================================================
-# Autograd Functions for MultiCardOverlapContext
+# Autograd Functions (with integrated implementation)
 # =============================================================================
 
 class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
-    """QKV sp2hp multi-card P2P overlap autograd wrapper"""
+    """QKV sp2hp multi-card P2P overlap autograd function
+
+    Forward: QKV computation + sp2hp with P2P overlap
+    Backward: standard AllToAll + dW scheduling
+    """
 
     @staticmethod
     def forward(ctx, hidden_states, weight_qkv, num_heads, num_kv_heads, head_dim,
                 cp_group, overlap_ctx, layer_id):
+        # Check if backward is needed (skip saving for inference)
+        needs_grad = hidden_states.requires_grad
+        ctx.needs_grad = needs_grad
+
         ctx.cp_group = cp_group
         ctx.num_heads = num_heads
         ctx.num_kv_heads = num_kv_heads
         ctx.head_dim = head_dim
         ctx.layer_id = layer_id
 
-        ctx.save_for_backward(hidden_states, weight_qkv)
+        if needs_grad:
+            ctx.save_for_backward(hidden_states, weight_qkv)
 
-        # Don't use torch.no_grad(), let PyTorch wrap return values correctly
-        q, k, v = _qkv_sp2hp_multicard_impl(
-            hidden_states, weight_qkv, num_heads, num_kv_heads, head_dim,
-            cp_group, overlap_ctx
-        )
+        # =====================================================================
+        # QKV sp2hp multi-card P2P overlap implementation
+        # =====================================================================
+        cp_size = cp_group.size()
+        my_rank = cp_group.rank()
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        seq_local, batch_size, hidden_size = hidden_states.shape
+
+        if cp_size == 1:
+            # Single card: compute directly
+            qkv = torch.matmul(hidden_states, weight_qkv.t())
+            qkv = qkv.view(seq_local, batch_size, num_kv_heads, -1)
+            q_per_group = num_heads // num_kv_heads
+            q_size = q_per_group * head_dim
+            q, k, v = torch.split(qkv, [q_size, head_dim, head_dim], dim=-1)
+            q = q.reshape(seq_local, batch_size, num_heads, head_dim)
+            return q, k, v
+
+        # Multi-card setup
+        num_rounds = cp_size - 1
+        seq_full = seq_local * cp_size
+        q_per_group = num_heads // num_kv_heads
+        groups_per_rank = num_kv_heads // cp_size
+        heads_local = groups_per_rank * q_per_group
+        group_size = (q_per_group + 2) * head_dim
+        proj_per_rank = groups_per_rank * group_size
+
+        default_stream = torch.cuda.current_stream(device)
+        comm_stream = overlap_ctx.get_stream()
+
+        # Split weight by group: [num_groups, group_size, hidden]
+        weight_grouped = weight_qkv.view(num_kv_heads, group_size, hidden_size)
+
+        # Weight for local groups
+        local_group_start = my_rank * groups_per_rank
+        weight_local = weight_grouped[local_group_start:local_group_start + groups_per_rank]
+        weight_local = weight_local.reshape(-1, hidden_size)  # [proj_per_rank, hidden]
+
+        # Pre-prepare weight for each peer
+        weight_per_partner = {}
+        partners = []
+        for round_idx in range(num_rounds):
+            partner = overlap_ctx.get_partner(my_rank, round_idx)
+            if partner == -1:
+                continue
+            partners.append(partner)
+            r_group_start = partner * groups_per_rank
+            weight_r = weight_grouped[r_group_start:r_group_start + groups_per_rank]
+            weight_per_partner[partner] = weight_r.reshape(-1, hidden_size)
+
+        # =====================================================================
+        # Pipeline overlap: each remote matmul parallel with previous P2P
+        # =====================================================================
+        qkv_full = torch.empty(seq_full, batch_size, proj_per_rank, dtype=dtype, device=device)
+        send_data_dict = {}
+        send_data_events = {}
+
+        # Round -1: Pre-compute first round's send_data
+        if len(partners) > 0:
+            first_partner = partners[0]
+            send_data_dict[first_partner] = torch.matmul(
+                hidden_states, weight_per_partner[first_partner].t()
+            )
+            send_data_events[first_partner] = torch.cuda.Event()
+            send_data_events[first_partner].record(default_stream)
+
+        # Pipeline loop
+        all_reqs = []
+        for round_idx, partner in enumerate(partners):
+            # Receive buffer
+            partner_seq_start = partner * seq_local
+            recv_buffer = qkv_full[partner_seq_start:partner_seq_start + seq_local]
+
+            # CPU wait for send_data to be ready
+            send_data_events[partner].synchronize()
+
+            # Start P2P (send_data is ready)
+            with torch.cuda.stream(comm_stream):
+                p2p_ops = [
+                    dist.P2POp(dist.irecv, recv_buffer, partner, group=cp_group),
+                    dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
+                ]
+                reqs = dist.batch_isend_irecv(p2p_ops)
+                all_reqs.extend(reqs)
+
+            # Parallel with current P2P: compute next round data on default_stream
+            if round_idx + 1 < len(partners):
+                next_partner = partners[round_idx + 1]
+                send_data_dict[next_partner] = torch.matmul(
+                    hidden_states, weight_per_partner[next_partner].t()
+                )
+                send_data_events[next_partner] = torch.cuda.Event()
+                send_data_events[next_partner].record(default_stream)
+            else:
+                # Last round: compute local QKV (parallel with last P2P)
+                qkv_local = torch.matmul(hidden_states, weight_local.t())
+
+        # Wait for all P2P to complete
+        for req in all_reqs:
+            req.wait()
+
+        # Handle no partners case (cp_size=1)
+        if len(partners) == 0:
+            qkv_local = torch.matmul(hidden_states, weight_local.t())
+
+        # Assemble result: write local data to corresponding position
+        local_seq_start = my_rank * seq_local
+        qkv_full[local_seq_start:local_seq_start + seq_local] = qkv_local
+
+        # Separate Q, K, V
+        qkv_full = qkv_full.view(seq_full, batch_size, groups_per_rank, group_size)
+        q_size = q_per_group * head_dim
+        q, k, v = torch.split(qkv_full, [q_size, head_dim, head_dim], dim=-1)
+        q = q.reshape(seq_full, batch_size, heads_local, head_dim)
+        # k, v: [seq_full, B, kv_heads_local, head_dim]
 
         return q, k, v
 
@@ -470,15 +199,11 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
         seq_full = grad_q.shape[0]
 
         # Merge grad_q, grad_k, grad_v into interleaved format
-        # grad_q: [seq_full, batch, heads_local, head_dim]
-        # grad_k, grad_v: [seq_full, batch, kv_heads_local, head_dim]
         grad_q_grouped = grad_q.view(seq_full, batch_size, groups_per_rank, q_per_group * head_dim)
         grad_qkv = torch.cat([grad_q_grouped, grad_k, grad_v], dim=-1)
-        # grad_qkv: [seq_full, batch, groups_per_rank, group_size]
 
         # hp2sp AllToAll: change seq dimension from full to local
-        # Need to reshape to format expected by AllToAll
-        grad_qkv_flat = grad_qkv.view(seq_full, batch_size, -1)  # [seq_full, B, groups_local * group_size]
+        grad_qkv_flat = grad_qkv.view(seq_full, batch_size, -1)
 
         # AllToAll: seq_full -> seq_local, collect all ranks' groups
         grad_qkv_parts = []
@@ -487,7 +212,7 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
             grad_qkv_parts.append(grad_qkv_flat[r_seq_start:r_seq_start + seq_local])
 
         # Use AllToAll to exchange
-        grad_qkv_send = torch.stack(grad_qkv_parts, dim=0)  # [cp_size, seq_local, B, groups_local * group_size]
+        grad_qkv_send = torch.stack(grad_qkv_parts, dim=0)
         grad_qkv_recv = torch.empty_like(grad_qkv_send)
 
         dist.all_to_all_single(
@@ -572,42 +297,142 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
 
 
 class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
-    """hp2sp + output projection multi-card P2P overlap autograd wrapper
+    """hp2sp + output projection multi-card P2P overlap autograd function
 
-    前向：每个 rank 通过 P2P 收集 my_seq 位置的所有头数据，计算 output
-    反向：使用前向保存的 attn_input_full 计算完整的 grad_weight
+    Forward: each rank collects all heads data at my_seq position via P2P, computes output
+    Backward: uses forward-saved attn_input_full to compute grad_weight
     """
 
     @staticmethod
     def forward(ctx, attn_output, weight_proj, bias_proj, cp_group, overlap_ctx):
+        # Check if backward is needed (skip saving for inference)
+        needs_grad = attn_output.requires_grad
+        ctx.needs_grad = needs_grad
+
         ctx.cp_group = cp_group
         ctx.has_bias = bias_proj is not None
 
+        # =====================================================================
+        # hp2sp + output projection multi-card P2P overlap implementation
+        # =====================================================================
+        cp_size = cp_group.size()
+        my_rank = cp_group.rank()
+        device = attn_output.device
+        dtype = attn_output.dtype
+
+        if cp_size == 1:
+            attn_flat = attn_output.view(attn_output.shape[0], attn_output.shape[1], -1)
+            output = torch.matmul(attn_flat, weight_proj.t())
+            if bias_proj is not None:
+                output = output + bias_proj
+            if needs_grad:
+                ctx.save_for_backward(attn_flat, weight_proj)
+                ctx.seq_full = attn_output.shape[0]
+                ctx.heads_local = attn_output.shape[2]
+                ctx.head_dim = attn_output.shape[3]
+            return output
+
         seq_full, batch_size, heads_local, head_dim = attn_output.shape
+        seq_local = seq_full // cp_size
+        hidden_size = weight_proj.shape[0]
+        input_dim_per_rank = heads_local * head_dim
+        num_rounds = cp_size - 1
 
-        # 前向计算，同时收集用于反向的 attn_input_full
-        output, attn_input_full = _hp2sp_output_proj_multicard_impl(
-            attn_output, weight_proj, bias_proj, cp_group, overlap_ctx,
-            save_for_backward=True
-        )
+        default_stream = torch.cuda.current_stream(device)
+        comm_stream = overlap_ctx.get_stream()
 
-        ctx.save_for_backward(attn_input_full, weight_proj)
-        ctx.seq_full = seq_full
-        ctx.heads_local = heads_local
-        ctx.head_dim = head_dim
+        # Local sequence start position
+        local_seq_start = my_rank * seq_local
+
+        # Weight for local heads
+        weight_local_start = my_rank * input_dim_per_rank
+        weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
+
+        # Prepare all data to send and receive buffers
+        send_data_dict = {}
+        recv_buffers = {}
+        weight_per_partner = {}
+        partners = []
+
+        for round_idx in range(num_rounds):
+            partner = overlap_ctx.get_partner(my_rank, round_idx)
+            if partner == -1:
+                continue
+            partners.append(partner)
+
+            # Prepare send data: attn_output at peer's sequence position (my heads data)
+            partner_seq_start = partner * seq_local
+            send_data_dict[partner] = attn_output[partner_seq_start:partner_seq_start + seq_local].contiguous()
+
+            # Prepare receive buffer
+            recv_buffers[partner] = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
+
+            # Cache partner's weight
+            partner_weight_start = partner * input_dim_per_rank
+            weight_per_partner[partner] = weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank]
+
+        # =====================================================================
+        # Pipeline overlap: each round's partial computation overlaps with next P2P
+        # =====================================================================
+        attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
+        attn_local_flat = attn_local_seq.view(seq_local, batch_size, -1)
+
+        prev_reqs = None
+        prev_partner = None
+
+        for round_idx, partner in enumerate(partners):
+            # Start current round's P2P communication
+            with torch.cuda.stream(comm_stream):
+                p2p_ops = [
+                    dist.P2POp(dist.irecv, recv_buffers[partner], partner, group=cp_group),
+                    dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
+                ]
+                curr_reqs = dist.batch_isend_irecv(p2p_ops)
+
+            # Parallel with P2P: compute previous round's received data's partial
+            if round_idx == 0:
+                # First round: compute local partial (parallel with P2P_0)
+                output = torch.matmul(attn_local_flat, weight_local.t())
+            else:
+                # Wait for previous round P2P to complete
+                for req in prev_reqs:
+                    req.wait()
+                # Compute previous round's received data's partial (parallel with current P2P)
+                recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
+                output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
+
+            prev_reqs = curr_reqs
+            prev_partner = partner
+
+        # Wait for last P2P to complete, compute last partial
+        if prev_reqs is not None:
+            for req in prev_reqs:
+                req.wait()
+            recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
+            output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
+
+        if bias_proj is not None:
+            output = output + bias_proj
+
+        # Save for backward if needed
+        if needs_grad:
+            # Collect all heads' data at my_seq position
+            attn_parts = {my_rank: attn_local_flat}
+            for partner in partners:
+                attn_parts[partner] = recv_buffers[partner].view(seq_local, batch_size, -1)
+            # Concatenate in rank order
+            attn_input_full = torch.cat([attn_parts[r] for r in range(cp_size)], dim=-1)
+
+            ctx.save_for_backward(attn_input_full, weight_proj)
+            ctx.seq_full = seq_full
+            ctx.heads_local = heads_local
+            ctx.head_dim = head_dim
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward: dX + sp2hp AllToAll，可选 chunked 实现
-
-        正确的 backward 流程：
-        1. dX: grad_attn = grad_output @ weight_proj  (计算对 attention output 的梯度)
-        2. sp2hp AllToAll: [seq_local, B, all_heads*head_dim] → [seq_full, B, heads_local, head_dim]
-
-        这种结构允许 dX 与 AllToAll 的流水线重叠（chunked backward）
-        """
+        """Backward: dX + sp2hp AllToAll, optional chunked implementation"""
         import os
         attn_input_full, weight_proj = ctx.saved_tensors
         cp_group = ctx.cp_group
@@ -634,9 +459,9 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
         use_chunked = os.environ.get('FLUID_USE_CHUNKED_BACKWARD', '0') == '1'
         num_chunks = int(os.environ.get('FLUID_CHUNKED_NUM_CHUNKS', '4'))
 
-        # =========================================================================
-        # Step 1: Compute dX + sp2hp AllToAll (可选 chunked 实现)
-        # =========================================================================
+        # =====================================================================
+        # Step 1: Compute dX + sp2hp AllToAll (optional chunked implementation)
+        # =====================================================================
         if use_chunked and scheduler.is_enabled() and cp_size > 1:
             # Use chunked backward: dX computation overlaps with sp2hp AllToAll
             from fluid.attention.chunked_backward import backward_output_proj_chunked
@@ -651,9 +476,7 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
             )
         else:
             # Standard path: compute full dX then AllToAll
-            # dX: [seq_local, B, hidden] @ [hidden, total_heads * head_dim] → [seq_local, B, total_heads * head_dim]
             grad_attn_flat = torch.matmul(grad_output, weight_proj)
-            # Reshape: [seq_local, B, total_heads, head_dim]
             grad_attn_sp = grad_attn_flat.view(seq_local, batch_size, total_heads, head_dim)
 
             if cp_size > 1:
@@ -674,9 +497,9 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
             else:
                 grad_attn_output = grad_attn_sp
 
-        # =========================================================================
-        # Step 2: 注册 dW 任务（使用前向保存的 attn_input_full）
-        # =========================================================================
+        # =====================================================================
+        # Step 2: Register dW task (using forward-saved attn_input_full)
+        # =====================================================================
         if scheduler.is_enabled():
             attn_full_flat_saved = attn_input_full.reshape(seq_local * batch_size, -1).detach()
             grad_output_flat_saved = grad_output.reshape(seq_local * batch_size, hidden_size).detach()
@@ -696,7 +519,7 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
             )
             grad_weight = None
         else:
-            # 直接计算完整的 grad_weight
+            # Compute full grad_weight directly
             attn_full_flat = attn_input_full.view(seq_local * batch_size, -1)
             grad_output_flat = grad_output.reshape(seq_local * batch_size, hidden_size)
 
@@ -712,12 +535,72 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
         return (grad_attn_output, grad_weight, grad_bias, None, None)
 
 
+# =============================================================================
+# Public API
+# =============================================================================
+
+def qkv_sp2hp_multicard_overlap(
+    hidden_states: torch.Tensor,
+    weight_qkv: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    cp_group: dist.ProcessGroup,
+    overlap_ctx: MultiCardOverlapContext,
+    layer_id: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """QKV computation + sp2hp multi-card P2P overlap
+
+    Multi-card version of qkv_sp2hp_heads_split, supports any number of GPUs.
+
+    Args:
+        hidden_states: [seq_local, B, hidden]
+        weight_qkv: [total_proj, hidden] full QKV weight
+        num_heads: total Q heads
+        num_kv_heads: total K/V heads (groups)
+        head_dim: dimension per head
+        cp_group: Context Parallel process group
+        overlap_ctx: multi-card overlap context
+        layer_id: layer ID (for dW task registration)
+
+    Returns:
+        q, k, v: [seq_full, B, heads_local, head_dim]
+    """
+    return _QKVSp2HpMultiCardFunction.apply(
+        hidden_states, weight_qkv, num_heads, num_kv_heads, head_dim,
+        cp_group, overlap_ctx, layer_id
+    )
+
+
+def hp2sp_output_proj_multicard_overlap(
+    attn_output: torch.Tensor,
+    weight_proj: torch.Tensor,
+    bias_proj: Optional[torch.Tensor],
+    cp_group: dist.ProcessGroup,
+    overlap_ctx: MultiCardOverlapContext,
+) -> torch.Tensor:
+    """hp2sp + output projection multi-card P2P overlap
+
+    Multi-card version of hp2sp_output_proj_overlap, supports any number of GPUs.
+
+    Args:
+        attn_output: [seq_full, B, heads_local, head_dim]
+        weight_proj: [hidden, total_heads * head_dim]
+        bias_proj: [hidden] or None
+        cp_group: Context Parallel process group
+        overlap_ctx: multi-card overlap context
+
+    Returns:
+        output: [seq_local, B, hidden]
+    """
+    return _HP2SpOutputProjMultiCardFunction.apply(
+        attn_output, weight_proj, bias_proj, cp_group, overlap_ctx
+    )
+
+
 __all__ = [
     # Context
     'AttentionMultiCardOverlapContext',
-    # Internal implementations (no gradient tracking)
-    '_qkv_sp2hp_multicard_impl',
-    '_hp2sp_output_proj_multicard_impl',
     # Public API with gradient support
     'qkv_sp2hp_multicard_overlap',
     'hp2sp_output_proj_multicard_overlap',

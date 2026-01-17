@@ -418,8 +418,11 @@ def benchmark(model, x_template, mode='inference', warmup=20, iters=30, use_sche
         scheduler.disable()
 
     def create_input():
+        # 每次都 clone，根据模式设置 requires_grad
+        # inference: requires_grad=False，跳过保存中间结果
+        # forward/training: requires_grad=True
         if mode == 'inference':
-            return x_template.detach()
+            return x_template.detach().clone()
         else:
             return x_template.detach().clone().requires_grad_(True)
 
@@ -509,15 +512,6 @@ def main():
     cp_group = ep_group = dist.group.WORLD
     seq_per_rank = config.seq_len // world_size
 
-    # 使用 MultiCardOverlapContext (带真正流水线重叠的实现需要此类型)
-    overlap_ctx = MultiCardOverlapContext(device, ep_size, sp_size)
-
-    x = torch.randn(config.batch_size, seq_per_rank, config.hidden_size,
-                    dtype=config.dtype, device=device)
-
-    baseline = BaselineTransformer(config, cp_group, ep_group, device)
-    overlap = OverlapTransformer(config, cp_group, ep_group, device, overlap_ctx)
-
     if rank == 0:
         print("\n" + "=" * 60)
         print("FluidMoE Transformer Speedup Test")
@@ -530,17 +524,75 @@ def main():
 
     dist.barrier()
 
+    # =========================================================================
+    # 全局预热：先运行所有模式一次，让 CUDA kernel 编译完成
+    # =========================================================================
+    if rank == 0:
+        print("\nGlobal warmup (compiling CUDA kernels)...")
+
+    overlap_ctx = MultiCardOverlapContext(device, ep_size, sp_size)
+    x = torch.randn(config.batch_size, seq_per_rank, config.hidden_size,
+                    dtype=config.dtype, device=device)
+    baseline = BaselineTransformer(config, cp_group, ep_group, device)
+    overlap = OverlapTransformer(config, cp_group, ep_group, device, overlap_ctx)
+
+    scheduler = get_backward_scheduler()
+
+    for warmup_mode in ['inference', 'forward', 'training']:
+        for model in [baseline, overlap]:
+            for _ in range(3):  # 每种模式预热 3 次
+                if warmup_mode == 'inference':
+                    with torch.no_grad():
+                        _ = model(x.detach())
+                elif warmup_mode == 'forward':
+                    _ = model(x.detach().clone().requires_grad_(True))
+                else:
+                    scheduler.enable()
+                    model.zero_grad()
+                    out = model(x.detach().clone().requires_grad_(True))
+                    out.sum().backward()
+                    scheduler.finish_batch()
+                    scheduler.clear_iteration()
+                    scheduler.disable()
+
+    del baseline, overlap, overlap_ctx, x
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    if rank == 0:
+        print("Global warmup done.\n")
+
+    # =========================================================================
+    # 正式测试
+    # =========================================================================
     results = {}
 
-    for mode in ['inference', 'forward', 'training']:  # Test training mode
+    for mode in ['inference', 'forward', 'training']:
         if rank == 0:
-            print(f"\nBenchmarking {mode}...")
+            print(f"Benchmarking {mode}...")
+
+        # 每种模式重新创建模型
+        torch.cuda.empty_cache()
+
+        overlap_ctx = MultiCardOverlapContext(device, ep_size, sp_size)
+        x = torch.randn(config.batch_size, seq_per_rank, config.hidden_size,
+                        dtype=config.dtype, device=device)
+
+        baseline = BaselineTransformer(config, cp_group, ep_group, device)
+        overlap = OverlapTransformer(config, cp_group, ep_group, device, overlap_ctx)
+
+        dist.barrier()
 
         # Baseline never uses scheduler (it doesn't do any overlap)
         # Overlap uses scheduler only in training mode
         base_time = benchmark(baseline, x, mode, use_scheduler=False)
         ovlp_time = benchmark(overlap, x, mode, use_scheduler=(mode == 'training'))
         results[mode] = (base_time, ovlp_time)
+
+        # 清理模型释放显存
+        del baseline, overlap, overlap_ctx, x
+        torch.cuda.empty_cache()
 
     dist.barrier()
 

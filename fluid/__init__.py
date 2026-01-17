@@ -87,8 +87,6 @@ from .attention import (
     # Chunked backward
     backward_output_proj_chunked,
     # P2P overlap
-    _qkv_sp2hp_multicard_impl,
-    _hp2sp_output_proj_multicard_impl,
     qkv_sp2hp_multicard_overlap,
     hp2sp_output_proj_multicard_overlap,
     _QKVSp2HpMultiCardFunction,
@@ -161,8 +159,6 @@ __all__ = [
     # Attention - Chunked backward
     "backward_output_proj_chunked",
     # Attention - P2P overlap
-    "_qkv_sp2hp_multicard_impl",
-    "_hp2sp_output_proj_multicard_impl",
     "qkv_sp2hp_multicard_overlap",
     "hp2sp_output_proj_multicard_overlap",
     "_QKVSp2HpMultiCardFunction",

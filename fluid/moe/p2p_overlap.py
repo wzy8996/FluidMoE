@@ -674,20 +674,25 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
             else:
                 all_fc1 = local_fc1_saved if local_fc1_saved is not None else torch.empty(0, ffn_hidden, dtype=dtype, device=device)
 
-        # 优化: 预计算 backward sort indices (与 Combine P2P req.wait() 重叠)
-        if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
-            _precompute_backward_sort_indices(ctx, num_local_experts, ep_size,
-                                              num_global_tokens_per_local_expert, device)
+        # 只在需要 backward 时才保存中间结果（inference 时跳过）
+        needs_grad = tokens.requires_grad
+        ctx.needs_grad = needs_grad
 
-        # 优化: ctx 赋值移到 req.wait() 前 (与 Combine P2P 通信重叠)
-        ctx._all_expert_tokens = all_expert_tokens
-        ctx._weight1 = weight1_detached
-        ctx._weight2 = weight2_detached
-        ctx._orig_weight1 = orig_weight1
-        ctx._orig_weight2 = orig_weight2
-        ctx._all_fc1 = all_fc1
-        ctx.all_tokens_per_expert = all_tokens_per_expert
-        ctx.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert
+        if needs_grad:
+            # 优化: 预计算 backward sort indices (与 Combine P2P req.wait() 重叠)
+            if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+                _precompute_backward_sort_indices(ctx, num_local_experts, ep_size,
+                                                  num_global_tokens_per_local_expert, device)
+
+            # 优化: ctx 赋值移到 req.wait() 前 (与 Combine P2P 通信重叠)
+            ctx._all_expert_tokens = all_expert_tokens
+            ctx._weight1 = weight1_detached
+            ctx._weight2 = weight2_detached
+            ctx._orig_weight1 = orig_weight1
+            ctx._orig_weight2 = orig_weight2
+            ctx._all_fc1 = all_fc1
+            ctx.all_tokens_per_expert = all_tokens_per_expert
+            ctx.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert
 
         # Wait for all Combine P2P to complete
         for req in all_combine_reqs:
@@ -734,9 +739,8 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
             t_start = time.perf_counter()
 
         from fluid.core.utils import _compute_activation_grad, _compute_activation_derivative
-        from fluid.core.alltoall import _all_to_all
+        from fluid.core.alltoall import _all_to_all, _sort_chunks_by_idxs
         from fluid.core.scheduler import get_backward_scheduler
-        from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
         all_expert_tokens = ctx._all_expert_tokens
         weight1 = ctx._weight1
@@ -809,11 +813,10 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
 
         # Convert layout: rank-major -> expert-major using precomputed indices
         if hasattr(ctx, 'split_sizes_rank_major'):
-            grad_all_fc2, _ = sort_chunks_by_idxs(
+            grad_all_fc2 = _sort_chunks_by_idxs(
                 grad_combined,
                 ctx.split_sizes_rank_major,
                 ctx.sorted_idxs_rank_to_exp,
-                fused=True  # Use Transformer Engine fused kernel
             )
         else:
             grad_all_fc2 = grad_combined
@@ -953,11 +956,10 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
         # Skip this when using chunked backward (it does sort internally)
         if not use_chunked:
             if hasattr(ctx, 'split_sizes_exp_major'):
-                grad_dispatched, _ = sort_chunks_by_idxs(
+                grad_dispatched = _sort_chunks_by_idxs(
                     grad_all_tokens,
                     ctx.split_sizes_exp_major,
                     ctx.sorted_idxs_exp_to_rank,
-                    fused=True  # Use Transformer Engine fused kernel
                 )
             else:
                 grad_dispatched = grad_all_tokens
@@ -1026,230 +1028,6 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
         return (grad_tokens, None, None, grad_w1, grad_w2, None, None, None, None,
                 None, None, None)
 
-
-# =============================================================================
-# Internal Implementation (No Gradient Tracking)
-# =============================================================================
-
-def _moe_multicard_p2p_impl(
-    tokens: torch.Tensor,
-    input_splits: torch.Tensor,
-    output_splits: torch.Tensor,
-    weight1: torch.Tensor,
-    weight2: torch.Tensor,
-    ep_group: dist.ProcessGroup,
-    activation_func,
-    overlap_ctx: MultiCardOverlapContext,
-    layer_id: int = 0,
-    num_local_experts: int = 1,
-    tokens_per_expert: torch.Tensor = None,
-    num_global_tokens_per_local_expert: torch.Tensor = None,
-) -> torch.Tensor:
-    """MoE Multi-card P2P Overlap Internal Implementation (No Gradient Tracking)
-
-    Key: Computation and Communication Overlap!
-    - Dispatch P2P parallel with local FC1+Act
-    - Combine P2P parallel with local FC2
-    """
-    my_rank = ep_group.rank()
-    ep_size = ep_group.size()
-    device = tokens.device
-    hidden_size = tokens.shape[-1]
-    dtype = tokens.dtype
-
-    total_ffn_hidden = weight1.shape[-1]
-    ffn_hidden = total_ffn_hidden // num_local_experts
-
-    w1 = weight1.view(num_local_experts, hidden_size, ffn_hidden)
-    w2 = weight2.view(num_local_experts, ffn_hidden, hidden_size)
-
-    input_splits_list = input_splits.tolist() if torch.is_tensor(input_splits) else list(input_splits)
-    output_splits_list = output_splits.tolist() if torch.is_tensor(output_splits) else list(output_splits)
-
-    input_offsets = [0]
-    for s in input_splits_list:
-        input_offsets.append(input_offsets[-1] + s)
-
-    default_stream = torch.cuda.current_stream(device)
-    comm_stream = overlap_ctx.get_stream()
-    num_rounds = overlap_ctx.num_rounds
-
-    local_count = input_splits_list[my_rank]
-    local_start = input_offsets[my_rank]
-
-    local_tokens_per_expert = None
-    if num_global_tokens_per_local_expert is not None:
-        local_tokens_per_expert = [
-            num_global_tokens_per_local_expert[0, my_rank, exp_idx].item()
-            for exp_idx in range(num_local_experts)
-        ]
-
-    # =========================================================================
-    # Dispatch Phase: Start communication first, local computation parallel!
-    # =========================================================================
-
-    # Record data ready event
-    overlap_ctx.data_ready_event.record(default_stream)
-    comm_stream.wait_event(overlap_ctx.data_ready_event)
-
-    # Prepare all dispatch send data and receive buffers
-    dispatch_send_data = {}
-    dispatch_recv_data = {}
-
-    for round_idx in range(num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner == -1:
-            continue
-
-        send_count = input_splits_list[partner]
-        recv_count = output_splits_list[partner]
-
-        if send_count > 0:
-            send_start = input_offsets[partner]
-            send_tokens = tokens[send_start:send_start + send_count].contiguous()
-        else:
-            send_tokens = torch.empty(0, hidden_size, dtype=dtype, device=device)
-
-        recv_tokens = torch.empty(recv_count, hidden_size, dtype=dtype, device=device) if recv_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
-
-        dispatch_send_data[round_idx] = (send_tokens, send_count, partner)
-        dispatch_recv_data[round_idx] = (recv_tokens, recv_count, partner)
-
-    # Start all dispatch P2P communication (on comm_stream)
-    dispatch_reqs = []
-    with torch.cuda.stream(comm_stream):
-        for round_idx in range(num_rounds):
-            if round_idx not in dispatch_send_data:
-                continue
-            send_tokens, send_count, partner = dispatch_send_data[round_idx]
-            recv_tokens, recv_count, _ = dispatch_recv_data[round_idx]
-
-            p2p_ops = []
-            if recv_count > 0:
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_tokens, partner, group=ep_group))
-            if send_count > 0:
-                p2p_ops.append(dist.P2POp(dist.isend, send_tokens, partner, group=ep_group))
-
-            if p2p_ops:
-                reqs = dist.batch_isend_irecv(p2p_ops)
-                dispatch_reqs.extend(reqs)
-
-    # Record dispatch done event
-    dispatch_done_event = torch.cuda.Event()
-    dispatch_done_event.record(comm_stream)
-
-    # Local FC1 + Act (parallel with dispatch, on default_stream!)
-    local_tokens = tokens[local_start:local_start + local_count].clone() if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
-
-    if local_count > 0 and local_tokens_per_expert is not None:
-        local_act = torch.zeros(local_count, ffn_hidden, dtype=dtype, device=device)
-        start = 0
-        for exp_idx in range(num_local_experts):
-            n_tok = local_tokens_per_expert[exp_idx]
-            if n_tok > 0:
-                exp_tokens = local_tokens[start:start + n_tok]
-                exp_fc1 = torch.matmul(exp_tokens, w1[exp_idx])
-                local_act[start:start + n_tok] = activation_func(exp_fc1)
-                start += n_tok
-    elif local_count > 0:
-        local_fc1 = torch.matmul(local_tokens, w1[0])
-        local_act = activation_func(local_fc1)
-    else:
-        local_act = torch.empty(0, ffn_hidden, dtype=dtype, device=device)
-
-    # Wait for dispatch P2P to complete
-    default_stream.wait_event(dispatch_done_event)
-    for req in dispatch_reqs:
-        req.wait()
-
-    # =========================================================================
-    # Process remote data: FC1 + Act + FC2
-    # =========================================================================
-    round_fc2_results = {}
-    for round_idx in range(num_rounds):
-        if round_idx not in dispatch_recv_data:
-            continue
-        recv_tokens, recv_count, partner = dispatch_recv_data[round_idx]
-        if recv_count > 0:
-            peer_fc2 = _compute_expert_forward_per_source(
-                recv_tokens, w1, w2, activation_func,
-                num_local_experts, num_global_tokens_per_local_expert,
-                partner, my_rank
-            )
-            round_fc2_results[round_idx] = (peer_fc2, partner, recv_count)
-
-    # =========================================================================
-    # Combine Phase: Start communication first, local FC2 parallel!
-    # =========================================================================
-    total_output = sum(input_splits_list)
-    combined_output = torch.empty(total_output, hidden_size, dtype=dtype, device=device)
-
-    # Record combine ready event
-    overlap_ctx.data_ready_event.record(default_stream)
-    comm_stream.wait_event(overlap_ctx.data_ready_event)
-
-    # Prepare all combine send data and receive buffers
-    combine_recv_info = {}
-    combine_reqs = []
-
-    with torch.cuda.stream(comm_stream):
-        for round_idx in range(num_rounds):
-            partner = overlap_ctx.get_partner(my_rank, round_idx)
-            if partner == -1:
-                continue
-
-            if round_idx in round_fc2_results:
-                send_fc2, _, send_count = round_fc2_results[round_idx]
-            else:
-                send_fc2 = torch.empty(0, hidden_size, dtype=dtype, device=device)
-                send_count = 0
-
-            recv_count = input_splits_list[partner]
-            recv_start = input_offsets[partner]
-            recv_buffer = combined_output[recv_start:recv_start + recv_count] if recv_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
-            combine_recv_info[round_idx] = (recv_buffer, recv_count, recv_start)
-
-            p2p_ops = []
-            if recv_count > 0:
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_buffer, partner, group=ep_group))
-            if send_count > 0 and send_fc2.numel() > 0:
-                p2p_ops.append(dist.P2POp(dist.isend, send_fc2.contiguous(), partner, group=ep_group))
-
-            if p2p_ops:
-                reqs = dist.batch_isend_irecv(p2p_ops)
-                combine_reqs.extend(reqs)
-
-    # Record combine done event
-    combine_done_event = torch.cuda.Event()
-    combine_done_event.record(comm_stream)
-
-    # Local FC2 (parallel with combine, on default_stream!)
-    if local_count > 0 and local_tokens_per_expert is not None:
-        local_fc2 = torch.zeros(local_count, hidden_size, dtype=dtype, device=device)
-        start = 0
-        for exp_idx in range(num_local_experts):
-            n_tok = local_tokens_per_expert[exp_idx]
-            if n_tok > 0:
-                exp_act = local_act[start:start + n_tok]
-                local_fc2[start:start + n_tok] = torch.matmul(exp_act, w2[exp_idx])
-                start += n_tok
-    elif local_count > 0:
-        local_fc2 = torch.matmul(local_act, w2[0])
-    else:
-        local_fc2 = None
-
-    # Write local result
-    if local_fc2 is not None:
-        combined_output[local_start:local_start + local_count] = local_fc2
-
-    # Wait for combine P2P to complete
-    default_stream.wait_event(combine_done_event)
-    for req in combine_reqs:
-        req.wait()
-
-    return combined_output
-
-
 # =============================================================================
 # Public API
 # =============================================================================
@@ -1291,19 +1069,11 @@ def moe_multicard_p2p_overlap_forward(
     Returns:
         output: [num_tokens, hidden]
     """
-    if tokens.requires_grad:
-        return _MoEMultiCardP2POverlapFunction.apply(
-            tokens, input_splits, output_splits, weight1, weight2,
-            ep_group, activation_func, overlap_ctx, layer_id,
-            num_local_experts, tokens_per_expert, num_global_tokens_per_local_expert
-        )
-    else:
-        # Inference mode: directly call simplified implementation
-        return _moe_multicard_p2p_impl(
-            tokens, input_splits, output_splits, weight1, weight2,
-            ep_group, activation_func, overlap_ctx, layer_id,
-            num_local_experts, tokens_per_expert, num_global_tokens_per_local_expert
-        )
+    return _MoEMultiCardP2POverlapFunction.apply(
+        tokens, input_splits, output_splits, weight1, weight2,
+        ep_group, activation_func, overlap_ctx, layer_id,
+        num_local_experts, tokens_per_expert, num_global_tokens_per_local_expert
+    )
 
 
 __all__ = [
