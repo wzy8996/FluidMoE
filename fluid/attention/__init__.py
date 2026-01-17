@@ -9,10 +9,8 @@ Contains:
 
 from .baseline import (
     AttentionBaseline,
-    _QKVProjectionFunction,
-    _OutputProjectionFunction,
-    _SP2HPFunction,
-    _HP2SPFunction,
+    _QKVWithSP2HPFunction,
+    _HP2SPWithOutputFunction,
     scaled_dot_product_attention,
 )
 from .chunked_backward import backward_output_proj_chunked
@@ -27,10 +25,8 @@ from .p2p_overlap import (
 __all__ = [
     # Baseline
     'AttentionBaseline',
-    '_QKVProjectionFunction',
-    '_OutputProjectionFunction',
-    '_SP2HPFunction',
-    '_HP2SPFunction',
+    '_QKVWithSP2HPFunction',
+    '_HP2SPWithOutputFunction',
     'scaled_dot_product_attention',
     # Chunked backward
     'backward_output_proj_chunked',

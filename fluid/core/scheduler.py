@@ -80,6 +80,20 @@ class BackwardScheduler:
         self.dw_queue: deque[DWTask] = deque()  # Pending dW tasks
         self.active_dw_task: Optional[DWTask] = None  # Currently running dW task
 
+        # ============================================================
+        # Reusable CUDA Event (avoid repeated creation overhead)
+        # ============================================================
+        # Single reusable event for AllToAll completion tracking
+        # Only one AllToAll runs at a time during backward, so one event is sufficient
+        self._reusable_event = torch.cuda.Event()
+
+        # Reusable timing events (for dW task timing, if DEBUG enabled)
+        self._timing_event_start: Optional[torch.cuda.Event] = None
+        self._timing_event_end: Optional[torch.cuda.Event] = None
+        if _DEBUG_SCHEDULER:
+            self._timing_event_start = torch.cuda.Event(enable_timing=True)
+            self._timing_event_end = torch.cuda.Event(enable_timing=True)
+
         # Communication tracking
         self.comm_in_progress = False
         self.alltoall_start_event: Optional[torch.cuda.Event] = None  # AlltoAll start marker
@@ -243,6 +257,19 @@ class BackwardScheduler:
 
         self.comm_in_progress = False
 
+    def get_reusable_event(self) -> torch.cuda.Event:
+        """
+        Get the reusable CUDA event.
+
+        This avoids the overhead of creating new events for each AllToAll.
+        Since only one AllToAll runs at a time during backward, a single
+        reusable event is sufficient.
+
+        Returns:
+            The reusable CUDA event
+        """
+        return self._reusable_event
+
     def set_alltoall_end_event(self, event: torch.cuda.Event):
         """
         Set the AlltoAll completion event (called by wrapper after AlltoAll finishes)
@@ -251,6 +278,24 @@ class BackwardScheduler:
             event: CUDA event recorded after AlltoAll completes on comm_stream
         """
         self.alltoall_end_event = event
+
+    def record_alltoall_end(self, stream: torch.cuda.Stream) -> torch.cuda.Event:
+        """
+        Record AllToAll completion using a reusable event.
+
+        This is a convenience method that combines get_reusable_event(),
+        record(), and set_alltoall_end_event() into one call.
+
+        Args:
+            stream: The CUDA stream where AllToAll is running
+
+        Returns:
+            The recorded event (for chaining if needed)
+        """
+        event = self.get_reusable_event()
+        event.record(stream)
+        self.alltoall_end_event = event
+        return event
 
     def on_alltoall_end(self):
         """
@@ -312,11 +357,10 @@ class BackwardScheduler:
             task = self.dw_queue.popleft()
             self.active_dw_task = task
 
-            # Execute dW computation on default_stream (same as dX)
-            task_start_event = torch.cuda.Event(enable_timing=True)
-            task_end_event = torch.cuda.Event(enable_timing=True)
+            # Optional timing (only when DEBUG enabled, uses reusable events)
+            if _DEBUG_SCHEDULER and self._timing_event_start is not None:
+                self._timing_event_start.record(self.default_stream)
 
-            task_start_event.record(self.default_stream)
             try:
                 # Execute dW computation - returns gradient tensor
                 grad_weight = task.compute_fn()
@@ -339,10 +383,12 @@ class BackwardScheduler:
                     print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
                 continue
 
-            task_end_event.record(self.default_stream)
+            # Optional timing end (only when DEBUG enabled)
+            if _DEBUG_SCHEDULER and self._timing_event_end is not None:
+                self._timing_event_end.record(self.default_stream)
+                task.event = self._timing_event_end
 
             task.completed = True
-            task.event = task_end_event
             self.completed_dw_tasks += 1
             self.overlap_completed_dw_tasks += 1  # Count as overlap completion
             tasks_executed += 1

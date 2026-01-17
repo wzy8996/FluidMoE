@@ -8,6 +8,7 @@ Key features:
 - Ulysses SP: sp2hp AllToAll before attention, hp2sp AllToAll after
 - dW tasks registered for overlap during backward
 - Compatible with scheduler-based backward optimization
+- Merged autograd functions (2 boundaries) for fair comparison with Overlap
 
 Note: This is a standalone implementation for testing/benchmarking.
 For production use with Megatron-LM, see attention_module.py.
@@ -22,191 +23,309 @@ from fluid.core import _all_to_all_sp2hp_forward, _all_to_all_hp2sp_forward
 from fluid.core.scheduler import get_backward_scheduler
 
 
-class _QKVProjectionFunction(torch.autograd.Function):
+class _QKVWithSP2HPFunction(torch.autograd.Function):
     """
-    QKV projection autograd function with dW scheduling.
+    Combined QKV projection + sp2hp AllToAll autograd function.
 
-    Forward: x @ weight (where weight may be transposed from original)
-    Backward: dX = grad @ weight.T, register dW for overlap
+    Forward:
+        1. QKV projection: tokens @ weight_qkv.T -> qkv
+        2. sp2hp AllToAll: exchange sequence for heads
+        3. Split into Q, K, V
 
-    Supports two weight layouts:
-    - Standard: weight [hidden, out_dim], orig_weight same
-    - Interleaved: weight [hidden, out_dim] (transposed), orig_weight [out_dim, hidden]
+    Backward:
+        1. hp2sp AllToAll (with scheduler dW overlap)
+        2. Compute dX for QKV projection
+        3. Register dW task
     """
 
     @staticmethod
-    def forward(ctx, input, weight, layer_name="attn_qkv", layer_id=0, orig_weight=None):
-        # [seq, batch, hidden] @ [hidden, out_dim] -> [seq, batch, out_dim]
-        output = torch.matmul(input, weight)
+    def forward(ctx, tokens, weight_qkv, cp_group, layer_id, num_heads, num_kv_heads, head_dim):
+        """
+        Args:
+            tokens: [seq_local, batch, hidden]
+            weight_qkv: [total_proj, hidden] - interleaved layout
+            cp_group: context parallel group
+            layer_id: layer ID for dW task naming
+            num_heads: total Q heads
+            num_kv_heads: total K/V heads (groups)
+            head_dim: dimension per head
 
-        ctx.save_for_backward(input, weight)
-        ctx.layer_name = layer_name
+        Returns:
+            q, k, v: [seq_full, batch, heads_local, head_dim]
+        """
+        seq_local, batch, hidden_size = tokens.shape
+        cp_size = cp_group.size()
+
+        q_per_group = num_heads // num_kv_heads
+        group_size = (q_per_group + 2) * head_dim
+        total_proj = num_kv_heads * group_size
+
+        # 1. QKV Projection
+        # tokens: [seq_local, batch, hidden] @ weight_qkv.T: [hidden, total_proj] -> [seq_local, batch, total_proj]
+        qkv = torch.matmul(tokens, weight_qkv.t())
+
+        # Extract Q, K, V from interleaved layout
+        qkv = qkv.view(seq_local, batch, num_kv_heads, group_size)
+
+        q_dim = q_per_group * head_dim
+        q = qkv[:, :, :, :q_dim]
+        k = qkv[:, :, :, q_dim:q_dim + head_dim]
+        v = qkv[:, :, :, q_dim + head_dim:]
+
+        # Reshape Q to [seq_local, batch, num_heads, head_dim]
+        q = q.reshape(seq_local, batch, num_heads, head_dim)
+
+        # For GQA, expand K/V; for MHA they're already correct
+        if q_per_group > 1:
+            k = k.repeat_interleave(q_per_group, dim=2)
+            v = v.repeat_interleave(q_per_group, dim=2)
+        else:
+            k = k.view(seq_local, batch, num_heads, head_dim)
+            v = v.view(seq_local, batch, num_heads, head_dim)
+
+        # 2. sp2hp AllToAll (merge Q, K, V for single communication)
+        if cp_size > 1:
+            qkv_merged = torch.cat([q, k, v], dim=-1)  # [seq_local, batch, num_heads, 3*head_dim]
+            qkv_merged = _all_to_all_sp2hp_forward(qkv_merged, cp_group)
+            # Split: [seq_full, batch, heads_local, 3*head_dim] -> 3 x [seq_full, batch, heads_local, head_dim]
+            q, k, v = torch.split(qkv_merged, head_dim, dim=-1)
+
+        # Save for backward
+        needs_grad = tokens.requires_grad
+        ctx.needs_grad = needs_grad
+        if needs_grad:
+            ctx.save_for_backward(tokens, weight_qkv)
+        ctx.cp_group = cp_group
         ctx.layer_id = layer_id
-        # Use orig_weight if provided (for transposed case), otherwise use weight
-        ctx._orig_weight = orig_weight if orig_weight is not None else weight
-        ctx._transposed = orig_weight is not None
+        ctx.num_heads = num_heads
+        ctx.num_kv_heads = num_kv_heads
+        ctx.head_dim = head_dim
+
+        return q, k, v
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k, grad_v):
+        """Backward with hp2sp AllToAll and dW overlap."""
+        if not ctx.needs_grad:
+            return None, None, None, None, None, None, None
+
+        tokens, weight_qkv = ctx.saved_tensors
+        cp_group = ctx.cp_group
+        layer_id = ctx.layer_id
+        num_heads = ctx.num_heads
+        num_kv_heads = ctx.num_kv_heads
+        head_dim = ctx.head_dim
+
+        cp_size = cp_group.size()
+        seq_local, batch, hidden_size = tokens.shape
+
+        q_per_group = num_heads // num_kv_heads
+        group_size = (q_per_group + 2) * head_dim
+        heads_local = num_heads // cp_size
+
+        scheduler = get_backward_scheduler()
+
+        # 1. hp2sp AllToAll for gradients (with scheduler dW overlap)
+        if cp_size > 1:
+            # Merge grad_q, grad_k, grad_v
+            grad_qkv_merged = torch.cat([grad_q, grad_k, grad_v], dim=-1)
+
+            if scheduler.is_enabled():
+                comm_stream = scheduler.comm_stream
+                default_stream = torch.cuda.current_stream()
+
+                with torch.cuda.stream(comm_stream):
+                    comm_stream.wait_stream(default_stream)
+                    grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
+                    scheduler.record_alltoall_end(comm_stream)  # Reusable event
+
+                scheduler.on_alltoall_start(comm_type=f"baseline_qkv_hp2sp_L{layer_id}")
+                default_stream.wait_stream(comm_stream)
+            else:
+                grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
+
+            # Split back: [seq_local, batch, num_heads, 3*head_dim] -> grad_q, grad_k, grad_v
+            grad_q_sp, grad_k_sp, grad_v_sp = torch.split(grad_qkv_sp, head_dim, dim=-1)
+        else:
+            grad_q_sp = grad_q
+            grad_k_sp = grad_k
+            grad_v_sp = grad_v
+
+        # 2. Handle GQA: sum K/V gradients back to kv_heads
+        if q_per_group > 1:
+            # grad_k_sp, grad_v_sp: [seq_local, batch, num_heads, head_dim]
+            # Need to reduce to [seq_local, batch, num_kv_heads, head_dim]
+            grad_k_sp = grad_k_sp.view(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
+            grad_v_sp = grad_v_sp.view(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
+
+        # 3. Reassemble to interleaved grad_qkv format
+        # grad_q_sp: [seq_local, batch, num_heads, head_dim] -> [seq_local, batch, num_kv_heads, q_per_group * head_dim]
+        grad_q_grouped = grad_q_sp.view(seq_local, batch, num_kv_heads, q_per_group * head_dim)
+        # grad_k_sp, grad_v_sp: [seq_local, batch, num_kv_heads, head_dim]
+        grad_qkv = torch.cat([grad_q_grouped, grad_k_sp, grad_v_sp], dim=-1)
+        # grad_qkv: [seq_local, batch, num_kv_heads, group_size] -> [seq_local, batch, total_proj]
+        grad_qkv = grad_qkv.view(seq_local, batch, -1)
+
+        # 4. Compute dX: grad_qkv @ weight_qkv
+        grad_tokens = torch.matmul(grad_qkv, weight_qkv)
+
+        # 5. Register dW task
+        if scheduler.is_enabled():
+            tokens_saved = tokens.detach()
+            grad_qkv_saved = grad_qkv.detach()
+            weight_qkv_saved = weight_qkv
+
+            def compute_dw():
+                # dW = grad_qkv.T @ tokens
+                # [total_proj, seq*batch] @ [seq*batch, hidden] -> [total_proj, hidden]
+                grad_flat = grad_qkv_saved.reshape(-1, grad_qkv_saved.shape[-1])
+                tokens_flat = tokens_saved.reshape(-1, tokens_saved.shape[-1])
+                return torch.matmul(grad_flat.t(), tokens_flat)
+
+            scheduler.register_dw_task(
+                layer_name=f"baseline_qkv_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_dw,
+                priority=100,
+                weight_param=weight_qkv_saved,
+            )
+            grad_weight = None
+        else:
+            grad_flat = grad_qkv.reshape(-1, grad_qkv.shape[-1])
+            tokens_flat = tokens.reshape(-1, tokens.shape[-1])
+            grad_weight = torch.matmul(grad_flat.t(), tokens_flat)
+
+        return grad_tokens, grad_weight, None, None, None, None, None
+
+
+class _HP2SPWithOutputFunction(torch.autograd.Function):
+    """
+    Combined hp2sp AllToAll + output projection autograd function.
+
+    Forward:
+        1. hp2sp AllToAll: exchange heads for sequence
+        2. Output projection: attn_out @ weight_proj
+
+    Backward:
+        1. Compute dX for output projection
+        2. sp2hp AllToAll (with scheduler dW overlap)
+        3. Register dW task
+    """
+
+    @staticmethod
+    def forward(ctx, attn_out, weight_proj, cp_group, layer_id, num_heads, head_dim):
+        """
+        Args:
+            attn_out: [seq_full, batch, heads_local, head_dim]
+            weight_proj: [hidden, num_heads * head_dim]
+            cp_group: context parallel group
+            layer_id: layer ID for dW task naming
+            num_heads: total heads
+            head_dim: dimension per head
+
+        Returns:
+            output: [seq_local, batch, hidden]
+        """
+        cp_size = cp_group.size()
+        seq_full = attn_out.shape[0]
+        batch = attn_out.shape[1]
+        hidden_size = weight_proj.shape[0]
+        seq_local = seq_full // cp_size
+
+        # 1. hp2sp AllToAll
+        if cp_size > 1:
+            attn_sp = _all_to_all_hp2sp_forward(attn_out, cp_group)
+        else:
+            attn_sp = attn_out
+
+        # Reshape: [seq_local, batch, num_heads, head_dim] -> [seq_local, batch, num_heads * head_dim]
+        attn_flat = attn_sp.reshape(seq_local, batch, -1)
+
+        # 2. Output projection
+        output = torch.matmul(attn_flat, weight_proj.t())
+
+        # Save for backward
+        needs_grad = attn_out.requires_grad
+        ctx.needs_grad = needs_grad
+        if needs_grad:
+            ctx.save_for_backward(attn_flat, weight_proj)
+        ctx.cp_group = cp_group
+        ctx.layer_id = layer_id
+        ctx.num_heads = num_heads
+        ctx.head_dim = head_dim
+        ctx.seq_full = seq_full
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_saved, weight = ctx.saved_tensors
-        layer_name = ctx.layer_name
-        layer_id = ctx.layer_id
-        orig_weight = ctx._orig_weight
-        transposed = ctx._transposed
+        """Backward with sp2hp AllToAll and dW overlap."""
+        if not ctx.needs_grad:
+            return None, None, None, None, None, None
 
-        scheduler = get_backward_scheduler()
-
-        # CRITICAL PATH: Compute dX immediately
-        grad_input = torch.matmul(grad_output, weight.t())
-
-        # LAZY REGISTRATION: Register dW for overlap
-        grad_output_saved = grad_output.detach()
-        input_for_dw = input_saved.detach()
-
-        def compute_dw():
-            # dW = input.T @ grad_output
-            # [hidden, seq*batch] @ [seq*batch, out_dim] -> [hidden, out_dim]
-            inp_flat = input_for_dw.reshape(-1, input_for_dw.shape[-1])
-            grad_flat = grad_output_saved.reshape(-1, grad_output_saved.shape[-1])
-            grad_w = torch.matmul(inp_flat.t(), grad_flat)
-            if transposed:
-                # Original weight was [out_dim, hidden], grad_w is [hidden, out_dim]
-                return grad_w.t()
-            return grad_w
-
-        scheduler.register_dw_task(
-            layer_name=layer_name,
-            layer_id=layer_id,
-            compute_fn=compute_dw,
-            priority=10,  # QKV weight priority
-            weight_param=orig_weight,
-        )
-
-        return grad_input, None, None, None, None
-
-
-class _OutputProjectionFunction(torch.autograd.Function):
-    """
-    Output projection autograd function with dW scheduling.
-
-    Forward: x @ weight_proj
-    Backward: dX = grad @ weight.T, register dW for overlap
-    """
-
-    @staticmethod
-    def forward(ctx, input, weight, layer_name="attn_proj", layer_id=0, orig_weight=None):
-        # [seq, batch, hidden] @ [hidden, hidden] -> [seq, batch, hidden]
-        output = torch.matmul(input, weight)
-
-        ctx.save_for_backward(input, weight)
-        ctx.layer_name = layer_name
-        ctx.layer_id = layer_id
-        # Use orig_weight if provided (for detached case), otherwise use weight
-        ctx._orig_weight = orig_weight if orig_weight is not None else weight
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input_saved, weight = ctx.saved_tensors
-        layer_name = ctx.layer_name
-        layer_id = ctx.layer_id
-        orig_weight = ctx._orig_weight
-
-        scheduler = get_backward_scheduler()
-
-        # CRITICAL PATH: Compute dX immediately
-        grad_input = torch.matmul(grad_output, weight.t())
-
-        # LAZY REGISTRATION: Register dW for overlap
-        grad_output_saved = grad_output.detach()
-        input_for_dw = input_saved.detach()
-
-        def compute_dw():
-            # dW = input.T @ grad_output
-            inp_flat = input_for_dw.reshape(-1, input_for_dw.shape[-1])
-            grad_flat = grad_output_saved.reshape(-1, grad_output_saved.shape[-1])
-            return torch.matmul(inp_flat.t(), grad_flat)
-
-        scheduler.register_dw_task(
-            layer_name=layer_name,
-            layer_id=layer_id,
-            compute_fn=compute_dw,
-            priority=5,  # Output projection priority (lower = earlier)
-            weight_param=orig_weight,
-        )
-
-        return grad_input, None, None, None, None
-
-
-class _SP2HPFunction(torch.autograd.Function):
-    """AllToAll sp2hp forward / hp2sp backward."""
-
-    @staticmethod
-    def forward(ctx, input, cp_group, layer_id=0):
-        ctx.cp_group = cp_group
-        ctx.layer_id = layer_id
-        return _all_to_all_sp2hp_forward(input, cp_group)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        scheduler = get_backward_scheduler()
+        attn_flat, weight_proj = ctx.saved_tensors
         cp_group = ctx.cp_group
         layer_id = ctx.layer_id
+        num_heads = ctx.num_heads
+        head_dim = ctx.head_dim
+        seq_full = ctx.seq_full
 
-        if scheduler.is_enabled():
-            comm_stream = scheduler.comm_stream
-            default_stream = torch.cuda.current_stream()
+        cp_size = cp_group.size()
+        seq_local, batch, hidden_size = grad_output.shape
 
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_stream(default_stream)
-                grad_input = _all_to_all_hp2sp_forward(grad_output, cp_group)
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
-
-            scheduler.on_alltoall_start(comm_type=f"attn_hp2sp_L{layer_id}")
-            default_stream.wait_stream(comm_stream)
-        else:
-            grad_input = _all_to_all_hp2sp_forward(grad_output, cp_group)
-
-        return grad_input, None, None
-
-
-class _HP2SPFunction(torch.autograd.Function):
-    """AllToAll hp2sp forward / sp2hp backward."""
-
-    @staticmethod
-    def forward(ctx, input, cp_group, layer_id=0):
-        ctx.cp_group = cp_group
-        ctx.layer_id = layer_id
-        return _all_to_all_hp2sp_forward(input, cp_group)
-
-    @staticmethod
-    def backward(ctx, grad_output):
         scheduler = get_backward_scheduler()
-        cp_group = ctx.cp_group
-        layer_id = ctx.layer_id
 
-        if scheduler.is_enabled():
-            comm_stream = scheduler.comm_stream
-            default_stream = torch.cuda.current_stream()
+        # 1. Compute dX for output projection
+        # grad_output: [seq_local, batch, hidden] @ weight_proj: [hidden, num_heads * head_dim]
+        grad_attn_flat = torch.matmul(grad_output, weight_proj)
+        # Reshape: [seq_local, batch, num_heads * head_dim] -> [seq_local, batch, num_heads, head_dim]
+        grad_attn_sp = grad_attn_flat.view(seq_local, batch, num_heads, head_dim)
 
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_stream(default_stream)
-                grad_input = _all_to_all_sp2hp_forward(grad_output, cp_group)
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
+        # 2. sp2hp AllToAll (with scheduler dW overlap)
+        if cp_size > 1:
+            if scheduler.is_enabled():
+                comm_stream = scheduler.comm_stream
+                default_stream = torch.cuda.current_stream()
 
-            scheduler.on_alltoall_start(comm_type=f"attn_sp2hp_L{layer_id}")
-            default_stream.wait_stream(comm_stream)
+                with torch.cuda.stream(comm_stream):
+                    comm_stream.wait_stream(default_stream)
+                    grad_attn_out = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
+                    scheduler.record_alltoall_end(comm_stream)  # Reusable event
+
+                scheduler.on_alltoall_start(comm_type=f"baseline_proj_sp2hp_L{layer_id}")
+                default_stream.wait_stream(comm_stream)
+            else:
+                grad_attn_out = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
         else:
-            grad_input = _all_to_all_sp2hp_forward(grad_output, cp_group)
+            grad_attn_out = grad_attn_sp
 
-        return grad_input, None, None
+        # 3. Register dW task
+        if scheduler.is_enabled():
+            attn_flat_saved = attn_flat.detach()
+            grad_output_saved = grad_output.detach()
+            weight_proj_saved = weight_proj
+
+            def compute_dw():
+                # dW = grad_output.T @ attn_flat
+                # [hidden, seq*batch] @ [seq*batch, num_heads*head_dim] -> [hidden, num_heads*head_dim]
+                grad_flat = grad_output_saved.reshape(-1, grad_output_saved.shape[-1])
+                attn_flat_2d = attn_flat_saved.reshape(-1, attn_flat_saved.shape[-1])
+                return torch.matmul(grad_flat.t(), attn_flat_2d)
+
+            scheduler.register_dw_task(
+                layer_name=f"baseline_proj_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_dw,
+                priority=99,
+                weight_param=weight_proj_saved,
+            )
+            grad_weight = None
+        else:
+            grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+            attn_flat_2d = attn_flat.reshape(-1, attn_flat.shape[-1])
+            grad_weight = torch.matmul(grad_flat.t(), attn_flat_2d)
+
+        return grad_attn_out, grad_weight, None, None, None, None
 
 
 def scaled_dot_product_attention(query, key, value, scale=None):
@@ -252,14 +371,13 @@ class AttentionBaseline:
     Baseline Attention layer with Ulysses-style sequence parallel.
 
     Uses scheduler-based dW overlap in backward pass.
+    Merged autograd functions (2 boundaries) for fair comparison with Overlap.
 
     Communication pattern:
         Forward:
-            1. QKV projection
-            2. sp2hp AllToAll: [seq/CP, B, heads, dim] -> [seq, B, heads/CP, dim]
-            3. Attention computation
-            4. hp2sp AllToAll: [seq, B, heads/CP, dim] -> [seq/CP, B, heads, dim]
-            5. Output projection
+            1. [_QKVWithSP2HPFunction] QKV projection + sp2hp AllToAll
+            2. Attention computation
+            3. [_HP2SPWithOutputFunction] hp2sp AllToAll + Output projection
 
         Backward:
             Same pattern in reverse with dW overlap
@@ -300,8 +418,6 @@ class AttentionBaseline:
             - total_proj = num_heads * 3 * head_dim = 3 * hidden
         """
         # QKV projection weight: [total_proj, hidden] interleaved layout
-        # NOTE: Create tensor first, then multiply by scale, then set requires_grad
-        # to ensure the weight is a leaf tensor (non-leaf tensors cause graph retention issues)
         self.weight_qkv = (torch.randn(
             self.total_proj, self.hidden_size,
             dtype=self.dtype, device=self.device,
@@ -326,52 +442,17 @@ class AttentionBaseline:
         """
         seq_local, batch, hidden = tokens.shape
 
-        # 1. QKV Projection with interleaved weight layout
-        # weight_qkv: [total_proj, hidden], input: [seq, batch, hidden]
-        # output: [seq, batch, total_proj]
-        # Detach + contiguous to avoid retaining computation graph across iterations
-        # (we compute dW manually in backward, so no need for autograd to track weight)
-        qkv = _QKVProjectionFunction.apply(
-            tokens, self.weight_qkv.t().detach().contiguous(),  # Transpose for matmul: [hidden, total_proj]
-            f"attn_qkv_L{self.layer_id}", self.layer_id,
-            self.weight_qkv  # Pass original weight for gradient
+        # 1. QKV Projection + sp2hp AllToAll (merged)
+        q, k, v = _QKVWithSP2HPFunction.apply(
+            tokens, self.weight_qkv,
+            self.cp_group, self.layer_id,
+            self.num_heads, self.num_kv_heads, self.head_dim
         )
-
-        # Extract Q, K, V from interleaved layout
-        # qkv: [seq, batch, total_proj] = [seq, batch, num_kv_heads * group_size]
-        # Each group: [Q0..Qn, K, V] where group_size = (q_per_group + 2) * head_dim
-        qkv = qkv.view(seq_local, batch, self.num_kv_heads, self.group_size)
-
-        q_dim = self.q_per_group * self.head_dim
-        k_dim = self.head_dim
-        v_dim = self.head_dim
-
-        # Split each group into Q, K, V
-        q = qkv[:, :, :, :q_dim]  # [seq, batch, num_kv_heads, q_per_group * head_dim]
-        k = qkv[:, :, :, q_dim:q_dim + k_dim]  # [seq, batch, num_kv_heads, head_dim]
-        v = qkv[:, :, :, q_dim + k_dim:]  # [seq, batch, num_kv_heads, head_dim]
-
-        # Reshape Q to [seq, batch, num_heads, head_dim]
-        q = q.view(seq_local, batch, self.num_heads, self.head_dim)
-        # For GQA, K/V need to be expanded; for MHA (q_per_group=1), they're already correct
-        if self.q_per_group > 1:
-            # Expand K/V for GQA: [seq, batch, num_kv_heads, head_dim] -> [seq, batch, num_heads, head_dim]
-            k = k.repeat_interleave(self.q_per_group, dim=2)
-            v = v.repeat_interleave(self.q_per_group, dim=2)
-        else:
-            k = k.view(seq_local, batch, self.num_heads, self.head_dim)
-            v = v.view(seq_local, batch, self.num_heads, self.head_dim)
-
-        # 2. sp2hp AllToAll
-        if self.cp_size > 1:
-            q = _SP2HPFunction.apply(q, self.cp_group, self.layer_id)
-            k = _SP2HPFunction.apply(k, self.cp_group, self.layer_id)
-            v = _SP2HPFunction.apply(v, self.cp_group, self.layer_id)
 
         # After sp2hp: [seq_full, batch, heads_local, head_dim]
         seq_full = seq_local * self.cp_size
 
-        # 3. Core Attention
+        # 2. Core Attention
         # Reshape for attention: [batch, heads_local, seq_full, head_dim]
         q = q.permute(1, 2, 0, 3)
         k = k.permute(1, 2, 0, 3)
@@ -382,20 +463,11 @@ class AttentionBaseline:
         # Reshape back: [seq_full, batch, heads_local, head_dim]
         attn_out = attn_out.permute(2, 0, 1, 3)
 
-        # 4. hp2sp AllToAll
-        if self.cp_size > 1:
-            attn_out = _HP2SPFunction.apply(attn_out, self.cp_group, self.layer_id)
-
-        # After hp2sp: [seq_local, batch, heads, head_dim]
-        # Reshape to [seq_local, batch, hidden]
-        attn_out = attn_out.reshape(seq_local, batch, self.hidden_size)
-
-        # 5. Output Projection
-        # Detach weight to avoid retaining computation graph across iterations
-        output = _OutputProjectionFunction.apply(
-            attn_out, self.weight_proj.detach(),
-            f"attn_proj_L{self.layer_id}", self.layer_id,
-            self.weight_proj  # Pass original weight for gradient
+        # 3. hp2sp AllToAll + Output Projection (merged)
+        output = _HP2SPWithOutputFunction.apply(
+            attn_out, self.weight_proj,
+            self.cp_group, self.layer_id,
+            self.num_heads, self.head_dim
         )
 
         if do_backward:

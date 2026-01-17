@@ -133,13 +133,16 @@ class _MoEBaselineFunction(torch.autograd.Function):
             group=ep_group
         )
 
-        # Save for backward
-        ctx.save_for_backward(recv_tokens_expert_major, weight1.detach(), weight2.detach(), all_fc1,
-                              reorder_indices_tensor, inverse_indices)
-        # Use original 2D weights for gradient if provided, otherwise use 3D weights
-        ctx._orig_weight1 = orig_weight1_2d if orig_weight1_2d is not None else weight1
-        ctx._orig_weight2 = orig_weight2_2d if orig_weight2_2d is not None else weight2
-        ctx._use_2d_layout = orig_weight1_2d is not None
+        # Save for backward (only if needed)
+        needs_grad = permuted_tokens.requires_grad
+        ctx.needs_grad = needs_grad
+        if needs_grad:
+            ctx.save_for_backward(recv_tokens_expert_major, weight1.detach(), weight2.detach(), all_fc1,
+                                  reorder_indices_tensor, inverse_indices)
+            # Use original 2D weights for gradient if provided, otherwise use 3D weights
+            ctx._orig_weight1 = orig_weight1_2d if orig_weight1_2d is not None else weight1
+            ctx._orig_weight2 = orig_weight2_2d if orig_weight2_2d is not None else weight2
+            ctx._use_2d_layout = orig_weight1_2d is not None
         ctx.ep_group = ep_group
         ctx.activation_func = activation_func
         ctx.input_splits_list = input_splits_list
@@ -154,6 +157,9 @@ class _MoEBaselineFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if not ctx.needs_grad:
+            return (None,) * 12
+
         recv_tokens_expert_major, weight1, weight2, all_fc1, \
             reorder_indices_tensor, inverse_indices = ctx.saved_tensors
 
@@ -187,9 +193,7 @@ class _MoEBaselineFunction(torch.autograd.Function):
                     input_split_sizes=input_splits_list,
                     group=ep_group
                 )
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
+                scheduler.record_alltoall_end(comm_stream)
             scheduler.on_alltoall_start(comm_type=f"moe_combine_L{layer_id}")
             default_stream.wait_stream(comm_stream)
         else:
@@ -299,9 +303,7 @@ class _MoEBaselineFunction(torch.autograd.Function):
                     input_split_sizes=output_splits_list,
                     group=ep_group
                 )
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
+                scheduler.record_alltoall_end(comm_stream)
             scheduler.on_alltoall_start(comm_type=f"moe_dispatch_L{layer_id}")
             default_stream.wait_stream(comm_stream)
         else:

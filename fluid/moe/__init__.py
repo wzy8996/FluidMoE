@@ -16,7 +16,6 @@ from .p2p_overlap import (
     _MoEMultiCardP2POverlapFunction,
     _compute_fc1_act_per_source,
     _compute_fc2_per_source,
-    _compute_expert_forward_per_source,
     _merge_tokens_and_fc1_expert_major,
     _precompute_backward_sort_indices,
 )
@@ -35,7 +34,6 @@ __all__ = [
     '_MoEMultiCardP2POverlapFunction',
     '_compute_fc1_act_per_source',
     '_compute_fc2_per_source',
-    '_compute_expert_forward_per_source',
     '_merge_tokens_and_fc1_expert_major',
     '_precompute_backward_sort_indices',
 ]

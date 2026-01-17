@@ -178,8 +178,12 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_q, grad_k, grad_v):
-        """Backward uses standard AllToAll"""
+        """Backward uses AllToAll with scheduler dW overlap"""
+        if not ctx.needs_grad:
+            return None, None, None, None, None, None, None, None
+
         from fluid.core.alltoall import _all_to_all_hp2sp_forward
+        from fluid.core.scheduler import get_backward_scheduler
 
         hidden_states, weight_qkv = ctx.saved_tensors
         cp_group = ctx.cp_group
@@ -198,6 +202,9 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
         heads_local = groups_per_rank * q_per_group
         seq_full = grad_q.shape[0]
 
+        # Get scheduler for dW overlap
+        scheduler = get_backward_scheduler()
+
         # Merge grad_q, grad_k, grad_v into interleaved format
         grad_q_grouped = grad_q.view(seq_full, batch_size, groups_per_rank, q_per_group * head_dim)
         grad_qkv = torch.cat([grad_q_grouped, grad_k, grad_v], dim=-1)
@@ -211,15 +218,32 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
             r_seq_start = r * seq_local
             grad_qkv_parts.append(grad_qkv_flat[r_seq_start:r_seq_start + seq_local])
 
-        # Use AllToAll to exchange
+        # Use AllToAll to exchange (with scheduler dW overlap when enabled)
         grad_qkv_send = torch.stack(grad_qkv_parts, dim=0)
         grad_qkv_recv = torch.empty_like(grad_qkv_send)
 
-        dist.all_to_all_single(
-            grad_qkv_recv.view(cp_size, -1),
-            grad_qkv_send.view(cp_size, -1),
-            group=cp_group
-        )
+        if scheduler.is_enabled() and cp_size > 1:
+            # Run AllToAll on comm_stream with dW overlap
+            comm_stream = scheduler.comm_stream
+            default_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_stream(default_stream)
+                dist.all_to_all_single(
+                    grad_qkv_recv.view(cp_size, -1),
+                    grad_qkv_send.view(cp_size, -1),
+                    group=cp_group
+                )
+                scheduler.record_alltoall_end(comm_stream)  # Reusable event
+            # Execute dW tasks during AllToAll communication
+            scheduler.on_alltoall_start(comm_type=f"qkv_hp2sp_L{ctx.layer_id}")
+            default_stream.wait_stream(comm_stream)
+        else:
+            # Synchronous AllToAll (no scheduler or single GPU)
+            dist.all_to_all_single(
+                grad_qkv_recv.view(cp_size, -1),
+                grad_qkv_send.view(cp_size, -1),
+                group=cp_group
+            )
 
         # Reassemble to [seq_local, B, total_groups * group_size]
         grad_qkv_recv = grad_qkv_recv.permute(1, 2, 0, 3).contiguous()
@@ -240,10 +264,7 @@ class _QKVSp2HpMultiCardFunction(torch.autograd.Function):
 
             grad_hidden += torch.matmul(grad_rank, weight_rank)
 
-        # Register dW task
-        from fluid.core.scheduler import get_backward_scheduler
-        scheduler = get_backward_scheduler()
-
+        # Register dW task (scheduler already obtained at function start)
         if scheduler.is_enabled():
             hidden_flat_saved = hidden_states.view(-1, hidden_size).detach()
             grad_qkv_sp_saved = grad_qkv_sp.view(-1, grad_qkv_sp.shape[-1]).detach()
@@ -433,6 +454,9 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward: dX + sp2hp AllToAll, optional chunked implementation"""
+        if not ctx.needs_grad:
+            return None, None, None, None, None
+
         import os
         attn_input_full, weight_proj = ctx.saved_tensors
         cp_group = ctx.cp_group
@@ -487,9 +511,7 @@ class _HP2SpOutputProjMultiCardFunction(torch.autograd.Function):
                     with torch.cuda.stream(comm_stream):
                         comm_stream.wait_stream(default_stream)
                         grad_attn_output = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
-                        event = torch.cuda.Event()
-                        event.record(comm_stream)
-                        scheduler.set_alltoall_end_event(event)
+                        scheduler.record_alltoall_end(comm_stream)  # Reusable event
                     scheduler.on_alltoall_start(comm_type="attn_proj_sp2hp")
                     default_stream.wait_stream(comm_stream)
                 else:

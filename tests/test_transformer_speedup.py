@@ -170,106 +170,27 @@ class SimpleAttention(nn.Module):
 
     def __init__(self, config, cp_group, device, layer_id=0):
         super().__init__()
-        self.cp_group = cp_group
-        self.cp_size = cp_group.size()
-        self.layer_id = layer_id
+        from fluid.attention.baseline import AttentionBaseline
 
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = getattr(config, 'num_kv_heads', config.num_attention_heads)
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.heads_per_rank = self.num_heads // self.cp_size
+        # 创建 AttentionBaseline 实例
+        attn_config = {
+            'hidden_size': config.hidden_size,
+            'num_heads': config.num_attention_heads,
+            'num_kv_heads': getattr(config, 'num_kv_heads', config.num_attention_heads),
+        }
+        self.attn = AttentionBaseline(attn_config, cp_group, device, config.dtype, layer_id)
+        self.attn.init_weights(requires_grad=True)
 
-        # GQA parameters
-        self.q_per_group = self.num_heads // self.num_kv_heads
-        self.group_size = (self.q_per_group + 2) * self.head_dim
-        self.total_proj = self.num_kv_heads * self.group_size
-
-        # QKV projection weight: [total_proj, hidden] interleaved layout (same as Overlap)
-        self.weight_qkv = nn.Parameter(torch.randn(
-            self.total_proj, config.hidden_size,
-            dtype=config.dtype, device=device) * 0.02)
-
-        # Output projection weight: [hidden, num_heads * head_dim]
-        self.weight_proj = nn.Parameter(torch.randn(
-            config.hidden_size, self.num_heads * self.head_dim,
-            dtype=config.dtype, device=device) * 0.02)
-
-        # 导入需要的函数
-        from fluid.attention.baseline import (
-            _QKVProjectionFunction, _OutputProjectionFunction,
-            _SP2HPFunction, _HP2SPFunction
-        )
-        self._QKVProjectionFunction = _QKVProjectionFunction
-        self._OutputProjectionFunction = _OutputProjectionFunction
-        self._SP2HPFunction = _SP2HPFunction
-        self._HP2SPFunction = _HP2SPFunction
+        # 将权重注册为 nn.Parameter 以便 nn.Module 管理
+        self.weight_qkv = nn.Parameter(self.attn.weight_qkv)
+        self.weight_proj = nn.Parameter(self.attn.weight_proj)
+        # 更新 attn 的引用
+        self.attn.weight_qkv = self.weight_qkv
+        self.attn.weight_proj = self.weight_proj
 
     def forward(self, x):
         # x: [seq_local, batch, hidden]
-        seq_local, batch, hidden = x.shape
-
-        # 1. QKV Projection with interleaved layout
-        # Detach + contiguous to avoid retaining computation graph across iterations
-        # (we compute dW manually in backward, so no need for autograd to track weight)
-        qkv = self._QKVProjectionFunction.apply(
-            x, self.weight_qkv.t().detach().contiguous(),  # Transpose for matmul
-            f"attn_qkv_L{self.layer_id}", self.layer_id,
-            self.weight_qkv  # Pass original weight for gradient
-        )
-
-        # Extract Q, K, V from interleaved layout
-        qkv = qkv.view(seq_local, batch, self.num_kv_heads, self.group_size)
-        q_dim = self.q_per_group * self.head_dim
-
-        q = qkv[:, :, :, :q_dim]
-        k = qkv[:, :, :, q_dim:q_dim + self.head_dim]
-        v = qkv[:, :, :, q_dim + self.head_dim:]
-
-        # Reshape Q to [seq, batch, num_heads, head_dim]
-        q = q.reshape(seq_local, batch, self.num_heads, self.head_dim)
-        if self.q_per_group > 1:
-            k = k.repeat_interleave(self.q_per_group, dim=2)
-            v = v.repeat_interleave(self.q_per_group, dim=2)
-        else:
-            k = k.view(seq_local, batch, self.num_heads, self.head_dim)
-            v = v.view(seq_local, batch, self.num_heads, self.head_dim)
-
-        # 2. sp2hp AllToAll
-        if self.cp_size > 1:
-            q = self._SP2HPFunction.apply(q, self.cp_group, self.layer_id)
-            k = self._SP2HPFunction.apply(k, self.cp_group, self.layer_id)
-            v = self._SP2HPFunction.apply(v, self.cp_group, self.layer_id)
-
-        # After sp2hp: [seq_full, batch, heads_local, head_dim]
-        seq_full = seq_local * self.cp_size
-
-        # 3. Core Attention
-        q = q.permute(1, 2, 0, 3)  # [batch, heads_local, seq_full, head_dim]
-        k = k.permute(1, 2, 0, 3)
-        v = v.permute(1, 2, 0, 3)
-
-        attn_out = scaled_dot_product_attention(q, k, v)
-
-        # Reshape back: [seq_full, batch, heads_local, head_dim]
-        attn_out = attn_out.permute(2, 0, 1, 3)
-
-        # 4. hp2sp AllToAll
-        if self.cp_size > 1:
-            attn_out = self._HP2SPFunction.apply(attn_out, self.cp_group, self.layer_id)
-
-        # After hp2sp: [seq_local, batch, heads, head_dim]
-        attn_out = attn_out.reshape(seq_local, batch, self.hidden_size)
-
-        # 5. Output Projection
-        # Detach weight to avoid retaining computation graph
-        output = self._OutputProjectionFunction.apply(
-            attn_out, self.weight_proj.detach(),
-            f"attn_proj_L{self.layer_id}", self.layer_id,
-            self.weight_proj  # Pass original weight for gradient
-        )
-
-        return output
+        return self.attn.forward(x)
 
 
 # =============================================================================
@@ -584,10 +505,11 @@ def main():
 
         dist.barrier()
 
-        # Baseline never uses scheduler (it doesn't do any overlap)
-        # Overlap uses scheduler only in training mode
-        base_time = benchmark(baseline, x, mode, use_scheduler=False)
-        ovlp_time = benchmark(overlap, x, mode, use_scheduler=(mode == 'training'))
+        # Both use scheduler in training mode for fair comparison
+        # (scheduler enables dW overlap during backward AllToAll)
+        use_sched = (mode == 'training')
+        base_time = benchmark(baseline, x, mode, use_scheduler=use_sched)
+        ovlp_time = benchmark(overlap, x, mode, use_scheduler=use_sched)
         results[mode] = (base_time, ovlp_time)
 
         # 清理模型释放显存

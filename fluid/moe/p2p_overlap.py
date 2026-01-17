@@ -124,45 +124,6 @@ def _compute_fc2_per_source(
         return torch.matmul(act, w2[0])
 
 
-def _compute_expert_forward_per_source(
-    tokens: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    activation_func,
-    num_local_experts: int,
-    num_global_tokens_per_local_expert: torch.Tensor,
-    source_rank: int,
-    my_rank: int,
-) -> torch.Tensor:
-    """
-    Compute full expert forward (FC1+Act+FC2) for tokens from a single source rank
-
-    Note: For compatibility with old code. New multi-card implementation should
-    separately call _compute_fc1_act_per_source and _compute_fc2_per_source
-
-    Args:
-        tokens: [num_tokens, hidden] tokens from source_rank
-        w1: [num_local_experts, hidden, ffn_hidden]
-        w2: [num_local_experts, ffn_hidden, hidden]
-        activation_func: activation function
-        num_local_experts: number of local experts
-        num_global_tokens_per_local_expert: [tp_size, ep_size, num_local_experts]
-        source_rank: source rank of data
-        my_rank: current rank
-
-    Returns:
-        fc2_output: [num_tokens, hidden]
-    """
-    act = _compute_fc1_act_per_source(
-        tokens, w1, activation_func, num_local_experts,
-        num_global_tokens_per_local_expert, source_rank
-    )
-    return _compute_fc2_per_source(
-        act, w2, num_local_experts,
-        num_global_tokens_per_local_expert, source_rank
-    )
-
-
 def _merge_tokens_and_fc1_expert_major(
     local_tokens: torch.Tensor,
     all_peer_tokens: torch.Tensor,
@@ -733,6 +694,9 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
         2. Call on_alltoall_start() to execute dW tasks during AllToAll
         3. Register current layer's dW tasks for execution during later AllToAll
         """
+        if not ctx.needs_grad:
+            return (None,) * 12
+
         DEBUG_TIMING = os.environ.get('FLUID_DEBUG_MoE_BACKWARD', '0') == '1'
         if DEBUG_TIMING:
             torch.cuda.synchronize()
@@ -791,9 +755,7 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
                     input_split_sizes=input_splits_list,
                     group=ep_group
                 )
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
+                scheduler.record_alltoall_end(comm_stream)
             # Execute dW tasks from queue while AllToAll is running
             scheduler.on_alltoall_start(comm_type=f"moe_combine_L{layer_id}")
             # Wait for AllToAll to complete
@@ -1002,9 +964,7 @@ class _MoEMultiCardP2POverlapFunction(torch.autograd.Function):
                     input_split_sizes=output_splits_list,
                     group=ep_group
                 )
-                event = torch.cuda.Event()
-                event.record(comm_stream)
-                scheduler.set_alltoall_end_event(event)
+                scheduler.record_alltoall_end(comm_stream)
             # Execute dW tasks from queue while AllToAll is running
             scheduler.on_alltoall_start(comm_type=f"moe_dispatch_L{layer_id}")
             # Wait for AllToAll to complete
@@ -1084,7 +1044,6 @@ __all__ = [
     # Helper functions
     '_compute_fc1_act_per_source',
     '_compute_fc2_per_source',
-    '_compute_expert_forward_per_source',
     '_merge_tokens_and_fc1_expert_major',
     '_precompute_backward_sort_indices',
 ]
