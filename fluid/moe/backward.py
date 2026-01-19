@@ -75,6 +75,10 @@ def register_moe_dw_tasks(
     """
     scheduler = get_backward_scheduler()
 
+    # Debug output
+    if os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1':
+        print(f"[DEBUG] register_moe_dw_tasks(L{layer_id}): scheduler.is_enabled()={scheduler.is_enabled()}", flush=True)
+
     # Get dimensions
     ffn_hidden = weight1.shape[-1]
     hidden_size = weight2.shape[-1]

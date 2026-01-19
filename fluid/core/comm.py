@@ -326,6 +326,9 @@ class MultiCardOverlapContext:
         # 复用单个Event，用于计算-通信同步
         self.data_ready_event = torch.cuda.Event()
 
+        # 复用ping-pong events，用于P2P pipeline同步（避免每次forward创建新event导致资源泄漏）
+        self.p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
+
         # 预计算调度表
         self.schedule = compute_round_robin_schedule(ep_size)
 
@@ -356,6 +359,9 @@ class AttentionMultiCardOverlapContext:
 
         # 复用单个Event，用于计算-通信同步
         self.data_ready_event = torch.cuda.Event()
+
+        # 复用ping-pong events，用于P2P pipeline同步（避免每次forward创建新event导致资源泄漏）
+        self.p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         # 预计算调度表
         self.schedule = compute_round_robin_schedule(cp_size)

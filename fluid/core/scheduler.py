@@ -208,6 +208,8 @@ class BackwardScheduler:
             weight_param: Weight parameter to accumulate gradient into
         """
         if not self.enabled:
+            if os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1':
+                print(f"[DEBUG] register_dw_task({layer_name}) skipped: scheduler not enabled", flush=True)
             return
 
         task = DWTask(

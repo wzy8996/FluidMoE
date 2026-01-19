@@ -507,8 +507,8 @@ def dispatch_fc1_p2p_forward(
     recv_act_results = {}
     local_act = None
 
-    # Ping-pong events for GPU stream sync
-    p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
+    # Reuse ping-pong events from context (avoid creating new events each forward call)
+    p2p_events = overlap_ctx.p2p_events
 
     for round_idx, partner in enumerate(partners):
         curr_event = p2p_events[round_idx % 2]

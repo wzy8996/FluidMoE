@@ -862,8 +862,12 @@ class FluidTransformer(nn.Module):
 # Benchmark
 # =============================================================================
 
-def run_single_iteration(model, x_template, mode, use_scheduler, scheduler):
+_debug_printed = False
+
+def run_single_iteration(model, x_template, mode, use_scheduler, scheduler, clear_stats=True):
     """Run a single iteration and return elapsed time in ms"""
+    global _debug_printed
+
     if mode == 'inference':
         x = x_template.detach().clone()
     else:
@@ -881,10 +885,29 @@ def run_single_iteration(model, x_template, mode, use_scheduler, scheduler):
     else:  # training
         model.zero_grad()
         out = model(x)
+
+        # Debug: print scheduler state before backward (only once)
+        if use_scheduler and scheduler and not _debug_printed:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                print(f"[DEBUG] Before backward: scheduler.is_enabled()={scheduler.is_enabled()}, "
+                      f"total_dw_tasks={scheduler.total_dw_tasks}", flush=True)
+            _debug_printed = True
+
         out.sum().backward()
+
+        # Debug: print scheduler state after backward (only once per run)
+        if use_scheduler and scheduler and os.environ.get('FLUID_DEBUG_BACKWARD', '0') == '1':
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                stats = scheduler.get_stats()
+                print(f"[DEBUG] After backward: total_dw_tasks={stats['total_dw_tasks']}, "
+                      f"completed={stats['completed_dw_tasks']}", flush=True)
+
         if use_scheduler and scheduler:
             scheduler.finish_batch()
-            scheduler.clear_iteration()
+            if clear_stats:
+                scheduler.clear_iteration()
     end.record()
 
     torch.cuda.synchronize()
@@ -892,8 +915,13 @@ def run_single_iteration(model, x_template, mode, use_scheduler, scheduler):
 
 
 def benchmark(model, x_template, mode='training', warmup=10, iters=20,
-              use_scheduler=False, scheduler=None):
-    """Benchmark model performance (internal warmup + measurement)"""
+              use_scheduler=False, scheduler=None, keep_last_stats=False):
+    """Benchmark model performance (internal warmup + measurement)
+
+    Args:
+        keep_last_stats: If True, don't clear stats after the last iteration
+                        (useful for debugging scheduler statistics)
+    """
 
     # Warmup (within same process)
     for _ in range(warmup):
@@ -905,7 +933,9 @@ def benchmark(model, x_template, mode='training', warmup=10, iters=20,
     # Benchmark
     times = []
     for i in range(iters):
-        time_ms = run_single_iteration(model, x_template, mode, use_scheduler, scheduler)
+        # Don't clear stats on the last iteration if keep_last_stats is True
+        clear_stats = not (keep_last_stats and i == iters - 1)
+        time_ms = run_single_iteration(model, x_template, mode, use_scheduler, scheduler, clear_stats)
         times.append(time_ms)
 
     return sum(times) / len(times)
@@ -1090,9 +1120,12 @@ def main(mode='training', batch_size=None, seq_len=None, num_chunks=None,
                                   use_scheduler=False)
 
         # Benchmark FluidMoE
+        # Keep stats on the last run for debugging
         scheduler.enable()
+        is_last_run = (run_idx == benchmark_runs - 1)
         fluid_time = benchmark(fluid, x, mode, warmup=warmup_iters, iters=benchmark_iters,
-                              use_scheduler=True, scheduler=scheduler)
+                              use_scheduler=True, scheduler=scheduler,
+                              keep_last_stats=is_last_run)
 
         baseline_times.append(baseline_time)
         fluid_times.append(fluid_time)
@@ -1123,12 +1156,16 @@ def main(mode='training', batch_size=None, seq_len=None, num_chunks=None,
         if mode == 'training':
             stats = scheduler.get_stats()
             print(f"\ndW Scheduling Stats (last run):")
+            print(f"  Scheduler enabled: {scheduler.is_enabled()}")
             print(f"  Total dW tasks:    {stats['total_dw_tasks']}")
             print(f"  Overlap completed: {stats['overlap_completed_dw_tasks']}")
             print(f"  Finish completed:  {stats['finish_batch_completed_dw_tasks']}")
             if stats['total_dw_tasks'] > 0:
                 ratio = stats['overlap_completed_dw_tasks'] / stats['total_dw_tasks'] * 100
                 print(f"  Overlap ratio:     {ratio:.1f}%")
+            elif stats['total_dw_tasks'] == 0:
+                print(f"\n  WARNING: No dW tasks registered!")
+                print(f"  This may indicate scheduler is not being used during backward.")
 
         if world_size == 2:
             print("\n" + "-" * 70)

@@ -409,6 +409,10 @@ def qkv_projection_backward(
 
     scheduler = get_backward_scheduler()
 
+    # Debug output
+    if os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1':
+        print(f"[DEBUG] qkv_projection_backward(L{layer_id}): scheduler.is_enabled()={scheduler.is_enabled()}", flush=True)
+
     # ============================================
     # Step 1: Handle GQA - sum K/V gradients back to kv_heads
     # ============================================
