@@ -252,8 +252,16 @@ class BackwardScheduler:
 
         self.comm_in_progress = True
 
+        queue_before = len(self.dw_queue)
+
         # Execute dW tasks incrementally with AlltoAll completion checking
         self._launch_dw_tasks_incremental()
+
+        queue_after = len(self.dw_queue)
+        tasks_executed = queue_before - queue_after
+
+        if _DEBUG_SCHEDULER and tasks_executed > 0:
+            print(f"[Scheduler] {comm_type}: executed {tasks_executed} dW tasks (queue: {queue_before} -> {queue_after})")
 
         self.comm_in_progress = False
 

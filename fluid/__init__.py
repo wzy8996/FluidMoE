@@ -15,9 +15,9 @@ Key Features:
 
 Modules:
 - core: AllToAll primitives, P2P scheduling, overlap context, scheduler
-- moe: Router, MoE baseline, chunked backward, P2P overlap
-- attention: Attention baseline, chunked backward, P2P overlap
-- layers: TransformerLayer, Megatron-LM integration
+- moe: MoE layer with P2P forward and chunked AllToAll backward
+- attention: Attention layer with P2P forward and chunked AllToAll backward
+- layers: Megatron-LM integration utilities
 """
 
 __version__ = "1.0.0"
@@ -55,48 +55,51 @@ from .core import (
 # MoE module
 # =============================================================================
 from .moe import (
-    # Router
-    _RouterFunction,
-    compute_routing,
-    # Baseline
-    MoEBaseline,
-    _MoEBaselineFunction,
-    # Chunked backward
-    backward_dispatch_chunked,
-    # P2P overlap
-    moe_multicard_p2p_overlap_forward,
-    _MoEMultiCardP2POverlapFunction,
-    _compute_fc1_act_per_source,
-    _compute_fc2_per_source,
-    _merge_tokens_and_fc1_expert_major,
-    _precompute_backward_sort_indices,
+    # Forward operations
+    router_forward,
+    compute_fc1_act_per_source,
+    compute_fc2_per_source,
+    merge_tokens_expert_major,
+    precompute_backward_sort_indices,
+    dispatch_fc1_p2p_forward,
+    fc2_combine_p2p_forward,
+    # Backward operations
+    recompute_fc1,
+    register_moe_dw_tasks,
+    combine_backward,
+    expert_backward,
+    dispatch_backward,
+    router_backward,
+    register_router_dw_task,
+    # Complete MoE layer
+    MoEP2PChunkedFunction,
+    moe_p2p_chunked,
+    MoELayer,
 )
 
 # =============================================================================
 # Attention module
 # =============================================================================
 from .attention import (
-    # Baseline
-    AttentionBaseline,
-    _QKVWithSP2HPFunction,
-    _HP2SPWithOutputFunction,
-    scaled_dot_product_attention,
-    # Chunked backward
-    backward_output_proj_chunked,
-    # P2P overlap
-    qkv_sp2hp_multicard_overlap,
-    hp2sp_output_proj_multicard_overlap,
-    _QKVSp2HpMultiCardFunction,
-    _HP2SpOutputProjMultiCardFunction,
+    # Forward operations
+    qkv_projection_p2p_forward,
+    scaled_dot_product_attention_forward,
+    output_projection_p2p_forward,
+    # Backward operations
+    output_projection_backward_chunked,
+    attention_backward_chunked,
+    qkv_projection_backward,
+    output_projection_register_dw,
+    # Complete attention layer
+    AttentionP2PChunkedFunction,
+    attention_p2p_chunked,
+    AttentionLayer,
 )
 
 # =============================================================================
-# Layers module
+# Layers module (Megatron integration)
 # =============================================================================
 from .layers import (
-    # Transformer layer
-    TransformerLayer,
-    # Megatron integration
     get_fluid_custom_layers,
     get_fluid_moe_layer_spec,  # Deprecated
     is_fluid_enabled,
@@ -129,37 +132,41 @@ __all__ = [
     "BackwardScheduler",
     "get_backward_scheduler",
 
-    # MoE - Router
-    "_RouterFunction",
-    "compute_routing",
-    # MoE - Baseline
-    "MoEBaseline",
-    "_MoEBaselineFunction",
-    # MoE - Chunked backward
-    "backward_dispatch_chunked",
-    # MoE - P2P overlap
-    "moe_multicard_p2p_overlap_forward",
-    "_MoEMultiCardP2POverlapFunction",
-    "_compute_fc1_act_per_source",
-    "_compute_fc2_per_source",
-    "_merge_tokens_and_fc1_expert_major",
-    "_precompute_backward_sort_indices",
+    # MoE - Forward operations
+    "router_forward",
+    "compute_fc1_act_per_source",
+    "compute_fc2_per_source",
+    "merge_tokens_expert_major",
+    "precompute_backward_sort_indices",
+    "dispatch_fc1_p2p_forward",
+    "fc2_combine_p2p_forward",
+    # MoE - Backward operations
+    "recompute_fc1",
+    "register_moe_dw_tasks",
+    "combine_backward",
+    "expert_backward",
+    "dispatch_backward",
+    "router_backward",
+    "register_router_dw_task",
+    # MoE - Complete layer
+    "MoEP2PChunkedFunction",
+    "moe_p2p_chunked",
+    "MoELayer",
 
-    # Attention - Baseline
-    "AttentionBaseline",
-    "_QKVWithSP2HPFunction",
-    "_HP2SPWithOutputFunction",
-    "scaled_dot_product_attention",
-    # Attention - Chunked backward
-    "backward_output_proj_chunked",
-    # Attention - P2P overlap
-    "qkv_sp2hp_multicard_overlap",
-    "hp2sp_output_proj_multicard_overlap",
-    "_QKVSp2HpMultiCardFunction",
-    "_HP2SpOutputProjMultiCardFunction",
+    # Attention - Forward operations
+    "qkv_projection_p2p_forward",
+    "scaled_dot_product_attention_forward",
+    "output_projection_p2p_forward",
+    # Attention - Backward operations
+    "output_projection_backward_chunked",
+    "attention_backward_chunked",
+    "qkv_projection_backward",
+    "output_projection_register_dw",
+    # Attention - Complete layer
+    "AttentionP2PChunkedFunction",
+    "attention_p2p_chunked",
+    "AttentionLayer",
 
-    # Layers
-    "TransformerLayer",
     # Megatron integration
     "get_fluid_custom_layers",
     "get_fluid_moe_layer_spec",
