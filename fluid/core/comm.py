@@ -1,11 +1,12 @@
 """
-Forward Communication Management - P2P Scheduling and Overlap Context
+Communication Primitives and P2P Overlap Management
 
-This module manages forward pass P2P communication for multi-card overlap:
-1. Round-Robin Tournament scheduling for P2P communication
-2. CUDA resources (streams, events) for communication overlap
+This module provides:
+1. AllToAll communication primitives (for MoE and Attention)
+2. Round-Robin Tournament scheduling for P2P communication
+3. CUDA resources (streams, events) for communication overlap
 
-Used by both MoE and Attention layers for forward P2P overlap.
+Used by both MoE and Attention layers for forward/backward communication.
 
 Round-Robin Tournament ensures:
 - Each rank communicates with exactly one peer per round
@@ -22,7 +23,154 @@ Example for 4 ranks:
 """
 
 import torch
-from typing import List, Tuple
+import torch.distributed as dist
+from typing import List, Tuple, Optional
+
+
+# =============================================================================
+# AllToAll Communication Primitives
+# =============================================================================
+
+def _all_to_all(
+    input: torch.Tensor,
+    output_split_sizes: Optional[List[int]],
+    input_split_sizes: Optional[List[int]],
+    group
+) -> torch.Tensor:
+    """
+    Direct call to PyTorch all_to_all_single (bypass Megatron wrapper)
+
+    Args:
+        input: Input tensor
+        output_split_sizes: Size of each output chunk (None for equal split)
+        input_split_sizes: Size of each input chunk (None for equal split)
+        group: Process group
+
+    Returns:
+        Output tensor after all-to-all
+    """
+    world_size = group.size()
+    if world_size == 1:
+        return input.clone()
+
+    input = input.contiguous()
+
+    if output_split_sizes is None:
+        # Equal split
+        output = torch.empty_like(input)
+    else:
+        # Unequal split (all2all-v)
+        output = input.new_empty(
+            size=[sum(output_split_sizes)] + list(input.size()[1:]),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+    dist.all_to_all_single(
+        output, input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group,
+    )
+    return output
+
+
+def _all_to_all_sp2hp_forward(input_: torch.Tensor, group) -> torch.Tensor:
+    """
+    Forward-only sp2hp AllToAll (no autograd).
+    Used in Attention for sequence parallel to head parallel conversion.
+
+    Shape: [seq/CP, batch, heads, dim] -> [seq, batch, heads/CP, dim]
+
+    Args:
+        input_: Input tensor [seq_local, batch, heads, dim]
+        group: Context parallel process group
+
+    Returns:
+        Output tensor [seq_full, batch, heads_local, dim]
+    """
+    cp = group.size()
+    seq_local, batch, heads, dim = input_.shape
+
+    # Rearrange: split heads, move CP to front, flatten (ensure contiguous)
+    x = input_.contiguous().view(seq_local, batch, cp, heads // cp, dim)
+    x = x.permute(2, 0, 1, 3, 4).contiguous()
+    x = x.view(seq_local * cp, -1)
+
+    # AllToAll communication (no grad)
+    output = torch.empty_like(x)
+    dist.all_to_all_single(
+        output, x,
+        output_split_sizes=[seq_local] * cp,
+        input_split_sizes=[seq_local] * cp,
+        group=group,
+    )
+
+    # Reshape to output format
+    return output.view(seq_local * cp, batch, heads // cp, dim)
+
+
+def _all_to_all_hp2sp_forward(input_: torch.Tensor, group) -> torch.Tensor:
+    """
+    Forward-only hp2sp AllToAll (no autograd).
+    Used in Attention for head parallel to sequence parallel conversion.
+
+    Shape: [seq, batch, heads/CP, dim] -> [seq/CP, batch, heads, dim]
+
+    Args:
+        input_: Input tensor [seq_full, batch, heads_local, dim]
+        group: Context parallel process group
+
+    Returns:
+        Output tensor [seq_local, batch, heads, dim]
+    """
+    cp = group.size()
+    seq, batch, heads_local, dim = input_.shape
+    seq_local = seq // cp
+
+    # Flatten to 2D (ensure contiguous for view)
+    x = input_.contiguous().view(seq, batch * heads_local * dim)
+
+    # AllToAll communication (no grad)
+    output = torch.empty_like(x)
+    dist.all_to_all_single(
+        output, x,
+        output_split_sizes=[seq_local] * cp,
+        input_split_sizes=[seq_local] * cp,
+        group=group,
+    )
+
+    # Rearrange: unflatten, permute, merge heads
+    output = output.view(cp, seq_local, batch, heads_local, dim)
+    output = output.permute(1, 2, 0, 3, 4).contiguous()
+    return output.view(seq_local, batch, heads_local * cp, dim)
+
+
+def _sort_chunks_by_idxs(input_tensor, split_sizes, sorted_idxs):
+    """
+    Sort chunks of input tensor by indices.
+    Used in MoE for reordering tokens between rank-major and expert-major layouts.
+
+    Args:
+        input_tensor: [total_tokens, hidden] tensor
+        split_sizes: list or tensor of chunk sizes (can contain zeros)
+        sorted_idxs: list or tensor of new order indices
+
+    Returns:
+        Reordered tensor
+    """
+    if input_tensor.numel() == 0:
+        return input_tensor
+
+    # Convert to list (avoid GPU sync)
+    if torch.is_tensor(split_sizes):
+        split_sizes = split_sizes.tolist()
+    if torch.is_tensor(sorted_idxs):
+        sorted_idxs = sorted_idxs.tolist()
+
+    # Direct split and cat (Megatron style, simple and efficient)
+    chunks = torch.split(input_tensor, split_sizes, dim=0)
+    return torch.cat([chunks[i] for i in sorted_idxs], dim=0)
 
 
 # =============================================================================
@@ -175,30 +323,8 @@ class MultiCardOverlapContext:
         # 通信流（MoE 和 Attention 共用）
         self.comm_stream = torch.cuda.Stream(device=device)
 
-        # =================================================================
-        # MoE 相关 events
-        # =================================================================
-        # 每轮的同步events
-        # round_events[r] 表示第r轮通信完成的event
-        self.round_events = [torch.cuda.Event() for _ in range(self.num_rounds)]
-
-        # 数据准备好的event（用于触发通信）
+        # 复用单个Event，用于计算-通信同步
         self.data_ready_event = torch.cuda.Event()
-
-        # MoE dispatch/combine events（兼容旧接口）
-        self.dispatch_event = torch.cuda.Event()
-        self.combine_event = torch.cuda.Event()
-
-        # =================================================================
-        # Attention 相关 events (Ulysses SP / Context Parallel)
-        # =================================================================
-        # QKV sp2hp 相关 events
-        self.qkv_ready_event = torch.cuda.Event()
-        self.qkv_comm_done_event = torch.cuda.Event()
-
-        # Output projection hp2sp 相关 events
-        self.proj_ready_event = torch.cuda.Event()
-        self.proj_comm_done_event = torch.cuda.Event()
 
         # 预计算调度表
         self.schedule = compute_round_robin_schedule(ep_size)
@@ -216,24 +342,6 @@ class MultiCardOverlapContext:
     def get_stream(self) -> torch.cuda.Stream:
         return self.comm_stream
 
-    def get_round_event(self, round_idx: int) -> torch.cuda.Event:
-        return self.round_events[round_idx]
-
-    # =================================================================
-    # 兼容 OverlapContext 的接口
-    # =================================================================
-    def get_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
-        """获取 MoE 相关 events（兼容旧接口）"""
-        return self.dispatch_event, self.combine_event
-
-    def get_qkv_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
-        """获取 QKV 相关 events"""
-        return self.qkv_ready_event, self.qkv_comm_done_event
-
-    def get_proj_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
-        """获取 output projection 相关 events"""
-        return self.proj_ready_event, self.proj_comm_done_event
-
 
 class AttentionMultiCardOverlapContext:
     """注意力层多卡P2P通信的上下文管理（轻量级，仅用于Attention）"""
@@ -246,16 +354,8 @@ class AttentionMultiCardOverlapContext:
         # 通信流
         self.comm_stream = torch.cuda.Stream(device=device)
 
-        # 每轮的同步events
-        self.round_events = [torch.cuda.Event() for _ in range(self.num_rounds)]
-
-        # QKV相关events
-        self.qkv_ready_event = torch.cuda.Event()
-        self.qkv_comm_done_event = torch.cuda.Event()
-
-        # 输出投影相关events
-        self.proj_ready_event = torch.cuda.Event()
-        self.proj_comm_done_event = torch.cuda.Event()
+        # 复用单个Event，用于计算-通信同步
+        self.data_ready_event = torch.cuda.Event()
 
         # 预计算调度表
         self.schedule = compute_round_robin_schedule(cp_size)
@@ -270,23 +370,19 @@ class AttentionMultiCardOverlapContext:
     def get_stream(self) -> torch.cuda.Stream:
         return self.comm_stream
 
-    def get_round_event(self, round_idx: int) -> torch.cuda.Event:
-        return self.round_events[round_idx]
-
-    def get_qkv_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
-        return self.qkv_ready_event, self.qkv_comm_done_event
-
-    def get_proj_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
-        return self.proj_ready_event, self.proj_comm_done_event
-
 
 __all__ = [
-    # Scheduling
+    # AllToAll primitives
+    '_all_to_all',
+    '_all_to_all_sp2hp_forward',
+    '_all_to_all_hp2sp_forward',
+    '_sort_chunks_by_idxs',
+    # P2P Scheduling
     'compute_round_robin_schedule',
     'get_partner_for_round',
     'get_all_partners_ordered',
     'get_num_rounds',
-    # Context
+    # Overlap Context
     'MultiCardOverlapContext',
     'AttentionMultiCardOverlapContext',
 ]

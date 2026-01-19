@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Tuple, Optional
 
-from fluid.core.forward_comm import MultiCardOverlapContext
+from fluid.core.comm import MultiCardOverlapContext
 
 
 def qkv_projection_p2p_forward(
@@ -118,7 +118,9 @@ def qkv_projection_p2p_forward(
     # Pipeline overlap implementation
     qkv_full = torch.empty(seq_full, batch, proj_per_rank, dtype=dtype, device=device)
     send_data_dict = {}
-    send_data_events = {}
+
+    # Reuse single Event from context to reduce overhead
+    send_data_event = overlap_ctx.data_ready_event
 
     # Pre-compute first round's send_data (before pipeline starts)
     if len(partners) > 0:
@@ -126,10 +128,10 @@ def qkv_projection_p2p_forward(
         send_data_dict[first_partner] = torch.matmul(
             tokens, weight_per_partner[first_partner].t()
         )
-        send_data_events[first_partner] = torch.cuda.Event()
-        send_data_events[first_partner].record(default_stream)
+        send_data_event.record(default_stream)
 
     # Pipeline loop: each round's computation overlaps with previous P2P
+    # GPU sync version: comm_stream waits for computation, no CPU blocking
     all_reqs = []
     qkv_local = None
 
@@ -138,11 +140,10 @@ def qkv_projection_p2p_forward(
         partner_seq_start = partner * seq_local
         recv_buffer = qkv_full[partner_seq_start:partner_seq_start + seq_local]
 
-        # CPU wait for send_data to be ready
-        send_data_events[partner].synchronize()
-
-        # Start P2P communication (send_data is ready)
+        # Start P2P communication
+        # GPU sync: comm_stream waits for send_data to be ready
         with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(send_data_event)  # GPU sync instead of CPU sync
             p2p_ops = [
                 dist.P2POp(dist.irecv, recv_buffer, partner, group=cp_group),
                 dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
@@ -156,13 +157,12 @@ def qkv_projection_p2p_forward(
             send_data_dict[next_partner] = torch.matmul(
                 tokens, weight_per_partner[next_partner].t()
             )
-            send_data_events[next_partner] = torch.cuda.Event()
-            send_data_events[next_partner].record(default_stream)
+            send_data_event.record(default_stream)
         else:
             # Last round: compute local QKV (parallel with last P2P)
             qkv_local = torch.matmul(tokens, weight_local.t())
 
-    # Wait for all P2P to complete
+    # Wait for all P2P to complete (release NCCL resources)
     for req in all_reqs:
         req.wait()
 
@@ -320,15 +320,21 @@ def output_projection_p2p_forward(
         partner_weight_start = partner * input_dim_per_rank
         weight_per_partner[partner] = weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank]
 
-    # Pipeline overlap
+    # Pipeline overlap (GPU sync with ping-pong events)
     attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
     attn_local_flat = attn_local_seq.reshape(seq_local, batch_size, -1)
 
-    prev_reqs = None
     prev_partner = None
     output = None
+    all_reqs = []
+
+    # Ping-pong events for GPU stream sync
+    p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     for round_idx, partner in enumerate(partners):
+        curr_event = p2p_events[round_idx % 2]
+        prev_event = p2p_events[(round_idx - 1) % 2]
+
         # Start current round's P2P communication
         with torch.cuda.stream(comm_stream):
             p2p_ops = [
@@ -336,28 +342,32 @@ def output_projection_p2p_forward(
                 dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
             ]
             curr_reqs = dist.batch_isend_irecv(p2p_ops)
+            all_reqs.extend(curr_reqs)
+            curr_event.record(comm_stream)
 
         # Parallel with P2P: compute partial output
         if round_idx == 0:
-            # First round: compute local partial
+            # First round: compute local partial (parallel with P2P_0)
             output = torch.matmul(attn_local_flat, weight_local.t())
         else:
-            # Wait for previous round P2P to complete
-            for req in prev_reqs:
-                req.wait()
+            # GPU sync: default_stream waits for PREVIOUS round P2P
+            default_stream.wait_event(prev_event)
             # Compute previous round's partial
             recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
             output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
 
-        prev_reqs = curr_reqs
         prev_partner = partner
 
     # Wait for last P2P and compute last partial
-    if prev_reqs is not None:
-        for req in prev_reqs:
-            req.wait()
+    if len(partners) > 0:
+        last_event = p2p_events[(len(partners) - 1) % 2]
+        default_stream.wait_event(last_event)
         recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
         output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
+
+    # Final: wait for all P2P (release NCCL resources)
+    for req in all_reqs:
+        req.wait()
 
     if bias_proj is not None:
         output = output + bias_proj

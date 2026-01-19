@@ -1,23 +1,24 @@
 """
-FluidMoE: Standalone MoE/Attention Implementation with Communication-Computation Overlap
+FluidMoE: MoE/Attention with Communication-Computation Overlap
 
-This package provides standalone implementations of:
-- MoE (Mixture of Experts) with Expert Parallel
-- Attention with Ulysses-style Context Parallel
-- Scheduler for dW overlap during backward AllToAll
-- P2P communication overlap for forward pass (Round-Robin Tournament)
+This package provides standalone MoE/Attention layers with optimized scheduling.
 
-Key Features:
-- dW tasks registered during backward, executed during AllToAll communication
-- Chunked dX computation pipelined with AllToAll
-- Multi-card P2P overlap for both MoE dispatch/combine and Attention sp2hp/hp2sp
-- No external dependencies (Megatron-free)
+Key Scheduling Innovations:
+1. Forward: P2P Round-Robin Tournament for dispatch/combine overlap
+2. Backward: dW tasks deferred and executed during AllToAll communication
 
 Modules:
-- core: AllToAll primitives, P2P scheduling, overlap context, scheduler
-- moe: MoE layer with P2P forward and chunked AllToAll backward
-- attention: Attention layer with P2P forward and chunked AllToAll backward
-- layers: Megatron-LM integration utilities
+- core: AllToAll primitives, P2P scheduling, BackwardScheduler
+- moe: Standalone MoE layer with P2P forward and chunked backward
+- attention: Standalone Attention layer with P2P forward and chunked backward
+- distributed: Lightweight SP + EP parallel context
+
+Quick Start:
+    from fluid.distributed import init_parallel
+    from fluid import MoELayer, AttentionLayer
+
+    ctx = init_parallel(ep_size=8)
+    moe = MoELayer(hidden_size=2048, num_experts=8, parallel_ctx=ctx)
 """
 
 __version__ = "1.0.0"
@@ -33,11 +34,6 @@ from .core import (
     _all_to_all_sp2hp_forward,
     _all_to_all_hp2sp_forward,
     _sort_chunks_by_idxs,
-    # Utility functions
-    _gelu_grad_exact,
-    _compute_activation_derivative,
-    _compute_activation_grad,
-    get_optimal_num_chunks,
     # P2P scheduling
     compute_round_robin_schedule,
     get_partner_for_round,
@@ -97,14 +93,12 @@ from .attention import (
 )
 
 # =============================================================================
-# Layers module (Megatron integration)
+# Distributed module (SP + EP parallel)
 # =============================================================================
-from .layers import (
-    get_fluid_custom_layers,
-    get_fluid_moe_layer_spec,  # Deprecated
-    is_fluid_enabled,
-    print_fluid_layer_info,
-)
+def _lazy_import_distributed():
+    """Lazy import distributed module."""
+    from . import distributed
+    return distributed
 
 # =============================================================================
 # Public API
@@ -115,11 +109,6 @@ __all__ = [
     "_all_to_all_sp2hp_forward",
     "_all_to_all_hp2sp_forward",
     "_sort_chunks_by_idxs",
-    # Core - Utility functions
-    "_gelu_grad_exact",
-    "_compute_activation_derivative",
-    "_compute_activation_grad",
-    "get_optimal_num_chunks",
     # Core - P2P scheduling
     "compute_round_robin_schedule",
     "get_partner_for_round",
@@ -167,11 +156,9 @@ __all__ = [
     "attention_p2p_chunked",
     "AttentionLayer",
 
-    # Megatron integration
-    "get_fluid_custom_layers",
-    "get_fluid_moe_layer_spec",
-    "is_fluid_enabled",
-    "print_fluid_layer_info",
+    # Optimizer wrapper
+    "wrap_optimizer",
+    "FluidOptimizerWrapper",
 ]
 
 
@@ -198,3 +185,102 @@ def print_status():
             print(f"  Overlap ratio: {overlap_ratio:.2f}%")
 
     print("=" * 60)
+
+
+# =============================================================================
+# Optimizer Wrapper
+# =============================================================================
+
+class FluidOptimizerWrapper:
+    """
+    Wrapper for optimizers that enables FluidMoE's dW-AllToAll overlap.
+
+    This wrapper:
+    1. Enables the BackwardScheduler before backward pass
+    2. Calls finish_batch() before optimizer.step() to complete pending dW tasks
+    3. Clears scheduler state after each step
+
+    Usage:
+        optimizer = get_megatron_optimizer(config, model)
+        optimizer = FluidOptimizerWrapper(optimizer)
+
+        # Training loop
+        loss.backward()
+        optimizer.step()  # Automatically handles dW completion
+    """
+
+    def __init__(self, optimizer):
+        """
+        Args:
+            optimizer: The underlying optimizer to wrap
+        """
+        self._optimizer = optimizer
+        self._scheduler = get_backward_scheduler()
+        self._scheduler.enable()
+        print(f"[FluidMoE] Optimizer wrapped, BackwardScheduler enabled")
+
+    def step(self, *args, **kwargs):
+        """
+        Optimizer step with automatic dW completion.
+
+        Calls finish_batch() to complete any pending dW tasks before
+        the underlying optimizer updates weights.
+        """
+        # Complete pending dW tasks
+        self._scheduler.finish_batch()
+
+        # Call underlying optimizer step
+        result = self._optimizer.step(*args, **kwargs)
+
+        # Clear scheduler state for next iteration
+        self._scheduler.clear_iteration()
+
+        return result
+
+    def zero_grad(self, *args, **kwargs):
+        """Forward to underlying optimizer."""
+        return self._optimizer.zero_grad(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Forward attribute access to underlying optimizer."""
+        return getattr(self._optimizer, name)
+
+    def __setattr__(self, name, value):
+        """Handle attribute setting."""
+        if name.startswith('_'):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._optimizer, name, value)
+
+    @property
+    def scheduler(self):
+        """Access to BackwardScheduler for advanced usage."""
+        return self._scheduler
+
+
+def wrap_optimizer(optimizer):
+    """
+    Wrap an optimizer to enable FluidMoE's dW-AllToAll overlap.
+
+    This is the recommended way to enable FluidMoE scheduling with
+    any training framework (Megatron, DeepSpeed, etc.)
+
+    Args:
+        optimizer: The optimizer to wrap
+
+    Returns:
+        FluidOptimizerWrapper: Wrapped optimizer with dW overlap enabled
+
+    Example:
+        from fluid import wrap_optimizer
+
+        optimizer = get_megatron_optimizer(config, model)
+        optimizer = wrap_optimizer(optimizer)
+
+        # Training loop
+        for batch in dataloader:
+            loss = model(batch)
+            loss.backward()
+            optimizer.step()  # dW tasks completed automatically
+    """
+    return FluidOptimizerWrapper(optimizer)

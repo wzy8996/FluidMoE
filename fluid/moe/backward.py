@@ -30,7 +30,6 @@ import torch
 from typing import List, Tuple, Optional, Dict
 
 from fluid.core import _all_to_all, _sort_chunks_by_idxs
-from fluid.core.utils import _compute_activation_grad, _compute_activation_derivative
 from fluid.core.scheduler import get_backward_scheduler
 
 
@@ -528,49 +527,41 @@ def dispatch_backward(
 
     # =========================================================================
     # Chunked path (num_chunks > 1)
+    # Using alternating pattern (like Forward P2P) to ensure proper overlap
     # =========================================================================
     chunk_size = hidden_size // num_chunks
 
-    # Pre-create Events
-    compute_events = [torch.cuda.Event() for _ in range(num_chunks)]
+    # Reuse pre-created Event from scheduler to reduce overhead
+    compute_event = scheduler.get_compute_sync_event()
 
     # Storage for AllToAll results
     output_chunks = []
 
-    for chunk_idx in range(num_chunks):
-        h_start = chunk_idx * chunk_size
-        h_end = (chunk_idx + 1) * chunk_size
-
-        # ============================================
-        # Step 1: Compute dX for current chunk (on default_stream)
-        # ============================================
+    # Helper function to compute one chunk
+    def compute_chunk(h_start, h_end):
         grad_chunk = torch.zeros(total_recv, chunk_size, dtype=dtype, device=device)
-
         start = 0
         for exp_idx in range(num_local_experts):
             n_tok = all_tokens_per_expert[exp_idx]
             if n_tok > 0:
-                # weight1[exp_idx, h_start:h_end, :].t(): [ffn_hidden, chunk_size]
                 grad_chunk[start:start + n_tok] = torch.matmul(
                     grad_all_fc1[start:start + n_tok],
                     weight1[exp_idx, h_start:h_end, :].t()
                 )
                 start += n_tok
+        return _sort_chunks_by_idxs(grad_chunk, split_sizes_exp_major, sorted_idxs_exp_to_rank)
 
-        # ============================================
-        # Step 2: Reorder expert-major → rank-major
-        # ============================================
-        grad_chunk_reordered = _sort_chunks_by_idxs(
-            grad_chunk, split_sizes_exp_major, sorted_idxs_exp_to_rank
-        )
+    # Pre-compute first chunk (like Forward pre-computes first round)
+    grad_chunk_reordered = compute_chunk(0, chunk_size)
+    compute_event.record(default_stream)
 
+    # Pipeline loop: submit AllToAll, then compute next chunk (alternating)
+    for chunk_idx in range(num_chunks):
         # ============================================
-        # Step 3: Submit AllToAll to comm_stream
+        # Step 1: Submit current chunk's AllToAll (wait for current data)
         # ============================================
-        compute_events[chunk_idx].record(default_stream)
-
         with torch.cuda.stream(comm_stream):
-            comm_stream.wait_event(compute_events[chunk_idx])
+            comm_stream.wait_event(compute_event)  # Wait for current chunk
 
             output_chunk = _all_to_all(
                 grad_chunk_reordered,
@@ -584,14 +575,23 @@ def dispatch_backward(
             if chunk_idx == num_chunks - 1:
                 scheduler.record_alltoall_end(comm_stream)
 
+        # ============================================
+        # Step 2: Compute next chunk (parallel with current AllToAll)
+        # ============================================
+        if chunk_idx + 1 < num_chunks:
+            next_h_start = (chunk_idx + 1) * chunk_size
+            next_h_end = (chunk_idx + 2) * chunk_size
+            grad_chunk_reordered = compute_chunk(next_h_start, next_h_end)
+            compute_event.record(default_stream)  # Record AFTER wait, so no overwrite issue
+
     # ============================================
-    # Step 4: Execute dW tasks while AllToAll is in progress
+    # Step 3: Execute dW tasks while AllToAll is in progress
     # ============================================
     if scheduler.is_enabled():
         scheduler.on_alltoall_start(comm_type=f"moe_dispatch_chunked_L{layer_id}")
 
     # ============================================
-    # Step 5: Wait for all AllToAll and concatenate
+    # Step 4: Wait for all AllToAll and concatenate
     # ============================================
     default_stream.wait_stream(comm_stream)
 

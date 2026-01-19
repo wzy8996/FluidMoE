@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from fluid.core.forward_comm import MultiCardOverlapContext
+from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.scheduler import get_backward_scheduler
 from fluid.core import _all_to_all
 from fluid.moe.layer import moe_p2p_chunked
@@ -862,31 +862,42 @@ class FluidTransformer(nn.Module):
 # Benchmark
 # =============================================================================
 
+def run_single_iteration(model, x_template, mode, use_scheduler, scheduler):
+    """Run a single iteration and return elapsed time in ms"""
+    if mode == 'inference':
+        x = x_template.detach().clone()
+    else:
+        x = x_template.detach().clone().requires_grad_(True)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    if mode == 'inference':
+        with torch.no_grad():
+            _ = model(x)
+    elif mode == 'forward':
+        _ = model(x)
+    else:  # training
+        model.zero_grad()
+        out = model(x)
+        out.sum().backward()
+        if use_scheduler and scheduler:
+            scheduler.finish_batch()
+            scheduler.clear_iteration()
+    end.record()
+
+    torch.cuda.synchronize()
+    return start.elapsed_time(end)
+
+
 def benchmark(model, x_template, mode='training', warmup=10, iters=20,
               use_scheduler=False, scheduler=None):
-    """Benchmark model performance"""
+    """Benchmark model performance (internal warmup + measurement)"""
 
-    def create_input():
-        if mode == 'inference':
-            return x_template.detach().clone()
-        else:
-            return x_template.detach().clone().requires_grad_(True)
-
-    # Warmup
+    # Warmup (within same process)
     for _ in range(warmup):
-        x = create_input()
-        if mode == 'inference':
-            with torch.no_grad():
-                _ = model(x)
-        elif mode == 'forward':
-            _ = model(x)
-        else:  # training
-            model.zero_grad()
-            out = model(x)
-            out.sum().backward()
-            if use_scheduler and scheduler:
-                scheduler.finish_batch()
-                scheduler.clear_iteration()
+        run_single_iteration(model, x_template, mode, use_scheduler, scheduler)
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -894,30 +905,8 @@ def benchmark(model, x_template, mode='training', warmup=10, iters=20,
     # Benchmark
     times = []
     for i in range(iters):
-        x = create_input()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-        if mode == 'inference':
-            with torch.no_grad():
-                _ = model(x)
-        elif mode == 'forward':
-            _ = model(x)
-        else:  # training
-            model.zero_grad()
-            out = model(x)
-            out.sum().backward()
-            if use_scheduler and scheduler:
-                scheduler.finish_batch()
-                # Don't clear on last iteration so we can see stats
-                if i < iters - 1:
-                    scheduler.clear_iteration()
-        end.record()
-
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+        time_ms = run_single_iteration(model, x_template, mode, use_scheduler, scheduler)
+        times.append(time_ms)
 
     return sum(times) / len(times)
 
@@ -977,7 +966,21 @@ def verify_correctness(config, cp_group, ep_group, device, rank):
     return True
 
 
-def main(mode='training', batch_size=None, seq_len=None, num_chunks=None):
+def main(mode='training', batch_size=None, seq_len=None, num_chunks=None,
+         warmup_runs=3, benchmark_runs=3, warmup_iters=10, benchmark_iters=20):
+    """
+    Main benchmark function.
+
+    Args:
+        mode: 'training', 'forward', or 'inference'
+        batch_size: batch size (default: 4)
+        seq_len: sequence length (default: 4096)
+        num_chunks: number of chunks for backward overlap (default: 1)
+        warmup_runs: number of warmup runs (entire benchmark cycles, default: 3)
+        benchmark_runs: number of benchmark runs to average (default: 3)
+        warmup_iters: iterations per warmup within benchmark() (default: 10)
+        benchmark_iters: iterations per benchmark within benchmark() (default: 20)
+    """
     rank, world_size, device = setup_distributed()
 
     # Configuration
@@ -1017,7 +1020,8 @@ def main(mode='training', batch_size=None, seq_len=None, num_chunks=None):
         print(f"Hidden: {config.hidden_size}, Heads: {config.num_attention_heads}")
         print(f"FFN: {config.ffn_hidden_size}, Experts: {config.num_experts} ({config.num_experts // ep_size}/rank)")
         print(f"Seq: {config.seq_len} ({seq_per_rank}/rank), Batch: {config.batch_size}, Layers: {config.num_layers}")
-        print(f"Test mode: {mode}")
+        print(f"Test mode: {mode}, Chunks: {config.num_chunks}")
+        print(f"Warmup: {warmup_runs} runs, Benchmark: {benchmark_runs} runs")
         print("-" * 70)
         print("Megatron Baseline: Synchronous AllToAll (MoEAlltoAllTokenDispatcher style)")
         print("FluidMoE: P2P Round-Robin overlap + dW scheduling")
@@ -1049,32 +1053,76 @@ def main(mode='training', batch_size=None, seq_len=None, num_chunks=None):
 
     dist.barrier()
 
+    # ========================================================================
+    # Warmup phase (within same process, results discarded)
+    # ========================================================================
     if rank == 0:
-        print(f"\nBenchmarking {mode}...")
+        print(f"\n[Warmup] Running {warmup_runs} warmup runs...")
 
-    # Benchmark Megatron baseline
-    scheduler.disable()
-    baseline_time = benchmark(baseline, x, mode, use_scheduler=False)
+    for w in range(warmup_runs):
+        scheduler.disable()
+        _ = benchmark(baseline, x, mode, warmup=warmup_iters, iters=benchmark_iters,
+                     use_scheduler=False)
+        scheduler.enable()
+        _ = benchmark(fluid, x, mode, warmup=warmup_iters, iters=benchmark_iters,
+                     use_scheduler=True, scheduler=scheduler)
+        if rank == 0:
+            print(f"  Warmup {w+1}/{warmup_runs} done")
 
-    # Benchmark FluidMoE
-    scheduler.enable()
-    fluid_time = benchmark(fluid, x, mode, use_scheduler=True, scheduler=scheduler)
+    dist.barrier()
+    if rank == 0:
+        print("[Warmup] Complete\n")
+
+    # ========================================================================
+    # Benchmark phase (multiple runs, compute average)
+    # ========================================================================
+    if rank == 0:
+        print(f"[Benchmark] Running {benchmark_runs} benchmark runs...")
+        print("-" * 70)
+
+    baseline_times = []
+    fluid_times = []
+
+    for run_idx in range(benchmark_runs):
+        # Benchmark Megatron baseline
+        scheduler.disable()
+        baseline_time = benchmark(baseline, x, mode, warmup=warmup_iters, iters=benchmark_iters,
+                                  use_scheduler=False)
+
+        # Benchmark FluidMoE
+        scheduler.enable()
+        fluid_time = benchmark(fluid, x, mode, warmup=warmup_iters, iters=benchmark_iters,
+                              use_scheduler=True, scheduler=scheduler)
+
+        baseline_times.append(baseline_time)
+        fluid_times.append(fluid_time)
+
+        if rank == 0:
+            speedup = baseline_time / fluid_time
+            print(f"  Run {run_idx+1}/{benchmark_runs}: Baseline={baseline_time:.2f}ms, "
+                  f"FluidMoE={fluid_time:.2f}ms, Speedup={speedup:.2f}x")
 
     dist.barrier()
 
+    # ========================================================================
+    # Results summary
+    # ========================================================================
     if rank == 0:
-        speedup = baseline_time / fluid_time
+        avg_baseline = sum(baseline_times) / len(baseline_times)
+        avg_fluid = sum(fluid_times) / len(fluid_times)
+        avg_speedup = avg_baseline / avg_fluid
+
         print("\n" + "=" * 70)
-        print("Results")
+        print("Results Summary")
         print("=" * 70)
-        print(f"\n{mode.title()} Performance:")
-        print(f"  Megatron Baseline: {baseline_time:.2f} ms")
-        print(f"  FluidMoE:          {fluid_time:.2f} ms")
-        print(f"  Speedup:           {speedup:.2f}x ({(speedup-1)*100:+.1f}%)")
+        print(f"\n{mode.title()} Performance (averaged over {benchmark_runs} runs):")
+        print(f"  Megatron Baseline: {avg_baseline:.2f} ms")
+        print(f"  FluidMoE:          {avg_fluid:.2f} ms")
+        print(f"  Speedup:           {avg_speedup:.2f}x ({(avg_speedup-1)*100:+.1f}%)")
 
         if mode == 'training':
             stats = scheduler.get_stats()
-            print(f"\ndW Scheduling Stats:")
+            print(f"\ndW Scheduling Stats (last run):")
             print(f"  Total dW tasks:    {stats['total_dw_tasks']}")
             print(f"  Overlap completed: {stats['overlap_completed_dw_tasks']}")
             print(f"  Finish completed:  {stats['finish_batch_completed_dw_tasks']}")
@@ -1106,11 +1154,17 @@ if __name__ == '__main__':
                         choices=['inference', 'forward', 'training'],
                         help='Test mode (default: training)')
     parser.add_argument('--batch-size', '-b', type=int, default=None,
-                        help='Batch size (default: 2)')
+                        help='Batch size (default: 4)')
     parser.add_argument('--seq-len', '-s', type=int, default=None,
                         help='Sequence length (default: 4096)')
     parser.add_argument('--num-chunks', '-c', type=int, default=None,
                         help='Number of chunks for backward overlap (default: 1, no chunking)')
+    parser.add_argument('--warmup-runs', '-w', type=int, default=3,
+                        help='Number of warmup runs (default: 3)')
+    parser.add_argument('--benchmark-runs', '-r', type=int, default=3,
+                        help='Number of benchmark runs to average (default: 3)')
 
     args = parser.parse_args()
-    main(mode=args.mode, batch_size=args.batch_size, seq_len=args.seq_len, num_chunks=args.num_chunks)
+    main(mode=args.mode, batch_size=args.batch_size, seq_len=args.seq_len,
+         num_chunks=args.num_chunks, warmup_runs=args.warmup_runs,
+         benchmark_runs=args.benchmark_runs)

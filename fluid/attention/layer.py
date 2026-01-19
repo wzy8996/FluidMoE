@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from typing import Optional, Tuple
 
-from fluid.core.forward_comm import AttentionMultiCardOverlapContext, MultiCardOverlapContext
+from fluid.core.comm import AttentionMultiCardOverlapContext, MultiCardOverlapContext
 from fluid.attention.forward import (
     qkv_projection_p2p_forward,
     scaled_dot_product_attention_forward,

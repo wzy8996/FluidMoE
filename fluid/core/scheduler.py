@@ -81,11 +81,15 @@ class BackwardScheduler:
         self.active_dw_task: Optional[DWTask] = None  # Currently running dW task
 
         # ============================================================
-        # Reusable CUDA Event (avoid repeated creation overhead)
+        # Reusable CUDA Events (avoid repeated creation overhead)
         # ============================================================
         # Single reusable event for AllToAll completion tracking
         # Only one AllToAll runs at a time during backward, so one event is sufficient
         self._reusable_event = torch.cuda.Event()
+
+        # Reusable event for compute-to-comm synchronization in chunked backward
+        # Used by dispatch_backward, output_projection_backward_chunked, attention_backward_chunked
+        self._compute_sync_event = torch.cuda.Event()
 
         # Reusable timing events (for dW task timing, if DEBUG enabled)
         self._timing_event_start: Optional[torch.cuda.Event] = None
@@ -267,7 +271,7 @@ class BackwardScheduler:
 
     def get_reusable_event(self) -> torch.cuda.Event:
         """
-        Get the reusable CUDA event.
+        Get the reusable CUDA event for AllToAll completion tracking.
 
         This avoids the overhead of creating new events for each AllToAll.
         Since only one AllToAll runs at a time during backward, a single
@@ -277,6 +281,19 @@ class BackwardScheduler:
             The reusable CUDA event
         """
         return self._reusable_event
+
+    def get_compute_sync_event(self) -> torch.cuda.Event:
+        """
+        Get the reusable CUDA event for compute-to-comm synchronization.
+
+        This is used by chunked backward functions (dispatch_backward,
+        output_projection_backward_chunked, attention_backward_chunked) to
+        synchronize compute completion before submitting communication.
+
+        Returns:
+            The compute sync CUDA event
+        """
+        return self._compute_sync_event
 
     def set_alltoall_end_event(self, event: torch.cuda.Event):
         """

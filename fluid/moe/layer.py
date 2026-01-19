@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Optional, Tuple, List
 
-from fluid.core.forward_comm import MultiCardOverlapContext
+from fluid.core.comm import MultiCardOverlapContext
 from fluid.core import _sort_chunks_by_idxs
 from fluid.core.scheduler import get_backward_scheduler
 

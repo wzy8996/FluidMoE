@@ -39,7 +39,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
-from fluid.core.forward_comm import MultiCardOverlapContext
+from fluid.core.comm import MultiCardOverlapContext
 
 
 # =============================================================================
@@ -500,15 +500,21 @@ def dispatch_fc1_p2p_forward(
             offset += output_splits[i]
 
     # =========================================================================
-    # Dispatch Phase Pipeline
+    # Dispatch Phase Pipeline (GPU sync with ping-pong events)
     # =========================================================================
-    prev_reqs = None
+    all_dispatch_reqs = []
     prev_partner = None
     recv_act_results = {}
     local_act = None
 
+    # Ping-pong events for GPU stream sync
+    p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
+
     for round_idx, partner in enumerate(partners):
-        # Start current round P2P
+        curr_event = p2p_events[round_idx % 2]
+        prev_event = p2p_events[(round_idx - 1) % 2]
+
+        # Start current round P2P on comm_stream
         with torch.cuda.stream(comm_stream):
             p2p_ops = []
             if partner in recv_buffers:
@@ -516,8 +522,10 @@ def dispatch_fc1_p2p_forward(
             if partner in send_chunks:
                 p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], partner, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
+            all_dispatch_reqs.extend(curr_reqs)
+            curr_event.record(comm_stream)
 
-        # Parallel with P2P: compute FC1 + Act (FC1 not saved - will be recomputed in backward)
+        # Parallel with P2P: compute FC1 + Act
         if round_idx == 0:
             # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0 and local_tokens_per_expert is not None:
@@ -534,10 +542,10 @@ def dispatch_fc1_p2p_forward(
                 exp_fc1 = torch.matmul(local_tokens, w1[0])
                 local_act = activation_func(exp_fc1)
         else:
-            # Wait for previous round P2P
-            for req in prev_reqs:
-                req.wait()
-            # Compute previous round received data FC1 + Act (FC1 not saved)
+            # GPU sync: default_stream waits for PREVIOUS round P2P
+            default_stream.wait_event(prev_event)
+
+            # Compute previous round received data FC1 + Act
             if prev_partner in recv_buffers:
                 recv_data = recv_buffers[prev_partner]
                 recv_count = recv_data.shape[0]
@@ -557,13 +565,13 @@ def dispatch_fc1_p2p_forward(
                     recv_act.copy_(activation_func(exp_fc1))
                 recv_act_results[prev_partner] = recv_act
 
-        prev_reqs = curr_reqs
         prev_partner = partner
 
-    # Wait for last round P2P, compute last FC1 + Act (FC1 not saved)
-    if prev_reqs is not None:
-        for req in prev_reqs:
-            req.wait()
+    # Process last round: GPU sync wait for last P2P
+    if len(partners) > 0:
+        last_event = p2p_events[(len(partners) - 1) % 2]
+        default_stream.wait_event(last_event)
+
         if prev_partner in recv_buffers:
             recv_data = recv_buffers[prev_partner]
             recv_count = recv_data.shape[0]
@@ -582,6 +590,10 @@ def dispatch_fc1_p2p_forward(
                 exp_fc1 = torch.matmul(recv_data, w1[0])
                 recv_act.copy_(activation_func(exp_fc1))
             recv_act_results[prev_partner] = recv_act
+
+    # Final: wait for all P2P (release NCCL resources)
+    for req in all_dispatch_reqs:
+        req.wait()
 
     return (local_tokens, local_act, recv_act_results, recv_buffers, partners, recv_offsets)
 
@@ -680,8 +692,11 @@ def fc2_combine_p2p_forward(
     combined_output = torch.empty(total_output, hidden_size, dtype=dtype, device=device)
 
     peer_fc2_results = {}
-    fc2_events = {}
     local_fc2 = None
+
+    # Reuse single event from context to reduce overhead
+    fc2_event = overlap_ctx.data_ready_event
+    has_pending_fc2 = False
 
     # Round -1: Pre-compute first peer's FC2
     if len(partners) > 0:
@@ -700,18 +715,20 @@ def fc2_combine_p2p_forward(
             else:
                 peer_fc2 = torch.matmul(recv_act, w2[0])
             peer_fc2_results[first_partner] = peer_fc2
-            fc2_events[first_partner] = torch.cuda.Event()
-            fc2_events[first_partner].record(default_stream)
+            # Record event on default_stream: FC2 computation done
+            fc2_event.record(default_stream)
+            has_pending_fc2 = True
 
     # Pipeline loop
     all_combine_reqs = []
     for round_idx, partner in enumerate(partners):
-        # CPU wait for FC2 computation done
-        if partner in fc2_events:
-            fc2_events[partner].synchronize()
-
         # Start P2P (send FC2 result to partner, receive from partner)
+        # GPU sync: comm_stream waits for FC2 computation to complete before sending
         with torch.cuda.stream(comm_stream):
+            # Key: comm_stream waits for default_stream's FC2 to complete
+            if has_pending_fc2:
+                comm_stream.wait_event(fc2_event)
+
             p2p_ops = []
             # Receive: FC2 result from partner
             recv_size = input_splits[partner]
@@ -725,6 +742,7 @@ def fc2_combine_p2p_forward(
             all_combine_reqs.extend(reqs)
 
         # Parallel with current P2P: compute next round FC2 or local FC2
+        has_pending_fc2 = False  # Reset for next iteration
         if round_idx + 1 < len(partners):
             next_partner = partners[round_idx + 1]
             if next_partner in recv_act_results:
@@ -741,8 +759,8 @@ def fc2_combine_p2p_forward(
                 else:
                     peer_fc2 = torch.matmul(recv_act, w2[0])
                 peer_fc2_results[next_partner] = peer_fc2
-                fc2_events[next_partner] = torch.cuda.Event()
-                fc2_events[next_partner].record(default_stream)
+                fc2_event.record(default_stream)
+                has_pending_fc2 = True
         else:
             # Last round: compute local FC2 (parallel with last P2P)
             if local_act is not None and local_tokens_per_expert is not None:
