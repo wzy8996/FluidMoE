@@ -107,8 +107,8 @@ def router_forward(
     expanded_probs = top_probs.reshape(-1)
     expanded_expert_indices = top_indices.reshape(-1)
 
-    # Step 5: Sort by expert index
-    sorted_indices = torch.argsort(expanded_expert_indices)
+    # Step 5: Sort by expert index (stable sort to ensure determinism)
+    sorted_indices = torch.argsort(expanded_expert_indices, stable=True)
     permuted_tokens = expanded_tokens[sorted_indices]
     permuted_probs = expanded_probs[sorted_indices]
     sorted_expert_indices = expanded_expert_indices[sorted_indices]
@@ -183,12 +183,15 @@ def compute_fc1_act_per_source(
                 torch.empty(0, ffn_hidden, dtype=dtype, device=device))
 
     if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+        # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+        tokens_cpu = num_global_tokens_per_local_expert[0, source_rank].cpu().tolist()
+
         act_output = torch.zeros(tokens.shape[0], ffn_hidden, dtype=dtype, device=device)
         fc1_output = torch.zeros(tokens.shape[0], ffn_hidden, dtype=dtype, device=device)
 
         offset = 0
         for exp_idx in range(num_local_experts):
-            n_tok = num_global_tokens_per_local_expert[0, source_rank, exp_idx].item()
+            n_tok = tokens_cpu[exp_idx]
             if n_tok > 0:
                 exp_tokens = tokens[offset:offset + n_tok]
                 exp_fc1 = torch.matmul(exp_tokens, w1[exp_idx])
@@ -229,11 +232,14 @@ def compute_fc2_per_source(
         return torch.empty(0, hidden_size, dtype=act.dtype, device=device)
 
     if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+        # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+        tokens_cpu = num_global_tokens_per_local_expert[0, source_rank].cpu().tolist()
+
         fc2_output = torch.zeros(act.shape[0], hidden_size, dtype=act.dtype, device=device)
 
         offset = 0
         for exp_idx in range(num_local_experts):
-            n_tok = num_global_tokens_per_local_expert[0, source_rank, exp_idx].item()
+            n_tok = tokens_cpu[exp_idx]
             if n_tok > 0:
                 exp_act = act[offset:offset + n_tok]
                 fc2_output[offset:offset + n_tok] = torch.matmul(exp_act, w2[exp_idx])
@@ -272,12 +278,13 @@ def merge_tokens_expert_major(
     hidden_size = local_tokens.shape[-1] if local_tokens.numel() > 0 else all_peer_tokens.shape[-1]
     dtype = local_tokens.dtype if local_tokens.numel() > 0 else all_peer_tokens.dtype
 
+    # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+    tokens_cpu = num_global_tokens_per_local_expert[0].cpu().tolist()  # [ep_size, num_local_experts]
+
     # Compute total token count per expert
     all_tokens_per_expert = []
     for exp_idx in range(num_local_experts):
-        total = 0
-        for rank in range(ep_size):
-            total += num_global_tokens_per_local_expert[0, rank, exp_idx].item()
+        total = sum(tokens_cpu[rank][exp_idx] for rank in range(ep_size))
         all_tokens_per_expert.append(total)
 
     total_tokens = sum(all_tokens_per_expert)
@@ -296,31 +303,25 @@ def merge_tokens_expert_major(
             continue
         peer_rank_offsets[rank] = offset
         for exp_idx in range(num_local_experts):
-            offset += num_global_tokens_per_local_expert[0, rank, exp_idx].item()
+            offset += tokens_cpu[rank][exp_idx]
 
     # Fill in expert-major order
     write_offset = 0
     for exp_idx in range(num_local_experts):
         for rank in range(ep_size):
-            n_tok = num_global_tokens_per_local_expert[0, rank, exp_idx].item()
+            n_tok = tokens_cpu[rank][exp_idx]
             if n_tok == 0:
                 continue
 
             if rank == my_rank:
                 # Extract from local (local is in expert order)
-                local_exp_offset = sum(
-                    num_global_tokens_per_local_expert[0, my_rank, e].item()
-                    for e in range(exp_idx)
-                )
+                local_exp_offset = sum(tokens_cpu[my_rank][e] for e in range(exp_idx))
                 all_expert_tokens[write_offset:write_offset + n_tok] = \
                     local_tokens[local_exp_offset:local_exp_offset + n_tok]
             else:
                 # Extract from peer (peer is cat in rank order, each rank in expert order)
                 peer_base = peer_rank_offsets[rank]
-                peer_exp_offset = sum(
-                    num_global_tokens_per_local_expert[0, rank, e].item()
-                    for e in range(exp_idx)
-                )
+                peer_exp_offset = sum(tokens_cpu[rank][e] for e in range(exp_idx))
                 src_offset = peer_base + peer_exp_offset
                 all_expert_tokens[write_offset:write_offset + n_tok] = \
                     all_peer_tokens[src_offset:src_offset + n_tok]
@@ -352,11 +353,14 @@ def precompute_backward_sort_indices(
         - split_sizes_exp_major: chunk sizes in expert-major order
         - sorted_idxs_exp_to_rank: indices for expert-major -> rank-major
     """
+    # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+    tokens_cpu = num_global_tokens_per_local_expert[0].cpu().tolist()  # [ep_size, num_local_experts]
+
     # rank-major chunk sizes: [R0_E0, R0_E1, R1_E0, R1_E1, ...]
     split_sizes_rank_major = []
     for rank in range(ep_size):
         for exp_idx in range(num_local_experts):
-            split_sizes_rank_major.append(num_global_tokens_per_local_expert[0, rank, exp_idx].item())
+            split_sizes_rank_major.append(tokens_cpu[rank][exp_idx])
 
     # rank-major -> expert-major indices
     sorted_idxs_rank_to_exp = []
@@ -368,7 +372,7 @@ def precompute_backward_sort_indices(
     split_sizes_exp_major = []
     for exp_idx in range(num_local_experts):
         for rank in range(ep_size):
-            split_sizes_exp_major.append(num_global_tokens_per_local_expert[0, rank, exp_idx].item())
+            split_sizes_exp_major.append(tokens_cpu[rank][exp_idx])
 
     # expert-major -> rank-major indices
     sorted_idxs_exp_to_rank = []
@@ -438,12 +442,9 @@ def dispatch_fc1_p2p_forward(
     dtype = tokens.dtype
     hidden_size = tokens.shape[-1]
 
-    # Weight dimensions
-    total_ffn_hidden = weight1.shape[-1]
-    ffn_hidden = total_ffn_hidden // num_local_experts
-
-    # weight1: [hidden, ffn * E] -> view to [hidden, ffn, E] -> permute to [E, hidden, ffn]
-    w1 = weight1.view(hidden_size, ffn_hidden, num_local_experts).permute(2, 0, 1).contiguous()
+    # Weight dimensions - weight1 is already 3D: [num_local_experts, hidden, ffn_hidden]
+    ffn_hidden = weight1.shape[-1]
+    w1 = weight1  # No permute needed - already in correct shape
 
     # Compute offsets
     input_offsets = [0]
@@ -456,13 +457,15 @@ def dispatch_fc1_p2p_forward(
     local_count = input_splits[my_rank]
     local_start = input_offsets[my_rank]
 
+    # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+    tokens_cpu = None
+    if num_global_tokens_per_local_expert is not None:
+        tokens_cpu = num_global_tokens_per_local_expert[0].cpu().tolist()  # [ep_size, num_local_experts]
+
     # Compute local token count per expert
     local_tokens_per_expert = None
-    if num_global_tokens_per_local_expert is not None:
-        local_tokens_per_expert = [
-            num_global_tokens_per_local_expert[0, my_rank, exp_idx].item()
-            for exp_idx in range(num_local_experts)
-        ]
+    if tokens_cpu is not None:
+        local_tokens_per_expert = [tokens_cpu[my_rank][exp_idx] for exp_idx in range(num_local_experts)]
 
     # Get Round-Robin scheduled partners
     partners = []
@@ -471,14 +474,15 @@ def dispatch_fc1_p2p_forward(
         if partner != -1:
             partners.append(partner)
 
-    # Extract local tokens
-    local_tokens = tokens[local_start:local_start + local_count].clone() if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
+    # Extract local tokens (no clone needed - data will be copied in merge_tokens_expert_major anyway)
+    local_tokens = tokens[local_start:local_start + local_count] if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
 
     # Prepare send data (token slices)
     send_chunks = {}
     for partner in partners:
         if input_splits[partner] > 0:
-            send_chunks[partner] = tokens[input_offsets[partner]:input_offsets[partner+1]].contiguous()
+            # Slice along dim 0 of contiguous tensor is already contiguous - no need for .contiguous()
+            send_chunks[partner] = tokens[input_offsets[partner]:input_offsets[partner+1]]
 
     # Prepare receive buffers (by partner order)
     recv_buffers = {}
@@ -500,32 +504,33 @@ def dispatch_fc1_p2p_forward(
             offset += output_splits[i]
 
     # =========================================================================
-    # Dispatch Phase Pipeline (GPU sync with ping-pong events)
+    # Dispatch Phase Pipeline with delayed req.wait()
+    # Key insight: Start P2P_i first, then wait for P2P_{i-1} to complete
+    # This ensures P2P_i runs in background while we process P2P_{i-1}'s data
     # =========================================================================
-    all_dispatch_reqs = []
     prev_partner = None
+    prev_reqs = []
     recv_act_results = {}
     local_act = None
 
-    # Reuse ping-pong events from context (avoid creating new events each forward call)
-    p2p_events = overlap_ctx.p2p_events
-
     for round_idx, partner in enumerate(partners):
-        curr_event = p2p_events[round_idx % 2]
-        prev_event = p2p_events[(round_idx - 1) % 2]
-
-        # Start current round P2P on comm_stream
+        # 1. Start current round P2P (async, returns immediately)
         with torch.cuda.stream(comm_stream):
+            if round_idx == 0:
+                comm_stream.wait_stream(default_stream)  # Wait for send_chunks preparation
             p2p_ops = []
             if partner in recv_buffers:
                 p2p_ops.append(dist.P2POp(dist.irecv, recv_buffers[partner], partner, group=ep_group))
             if partner in send_chunks:
                 p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], partner, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
-            all_dispatch_reqs.extend(curr_reqs)
-            curr_event.record(comm_stream)
 
-        # Parallel with P2P: compute FC1 + Act
+        # 2. Wait for PREVIOUS round's P2P to complete (current round runs in background)
+        if round_idx > 0:
+            for req in prev_reqs:
+                req.wait()
+
+        # 3. Compute FC1 + Act (overlaps with current round's P2P)
         if round_idx == 0:
             # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0 and local_tokens_per_expert is not None:
@@ -542,19 +547,16 @@ def dispatch_fc1_p2p_forward(
                 exp_fc1 = torch.matmul(local_tokens, w1[0])
                 local_act = activation_func(exp_fc1)
         else:
-            # GPU sync: default_stream waits for PREVIOUS round P2P
-            default_stream.wait_event(prev_event)
-
-            # Compute previous round received data FC1 + Act
+            # Use previous round's received data (now guaranteed complete)
             if prev_partner in recv_buffers:
                 recv_data = recv_buffers[prev_partner]
                 recv_count = recv_data.shape[0]
                 buf_offset = recv_offsets[prev_partner]
                 recv_act = all_recv_act_buffer[buf_offset:buf_offset + recv_count]
-                if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+                if num_local_experts > 1 and tokens_cpu is not None:
                     offset_inner = 0
                     for exp_idx in range(num_local_experts):
-                        n_tok = num_global_tokens_per_local_expert[0, prev_partner, exp_idx].item()
+                        n_tok = tokens_cpu[prev_partner][exp_idx]
                         if n_tok > 0:
                             exp_tokens = recv_data[offset_inner:offset_inner + n_tok]
                             exp_fc1 = torch.matmul(exp_tokens, w1[exp_idx])
@@ -566,21 +568,22 @@ def dispatch_fc1_p2p_forward(
                 recv_act_results[prev_partner] = recv_act
 
         prev_partner = partner
+        prev_reqs = curr_reqs
 
-    # Process last round: GPU sync wait for last P2P
+    # Process last round: wait for last P2P and compute
     if len(partners) > 0:
-        last_event = p2p_events[(len(partners) - 1) % 2]
-        default_stream.wait_event(last_event)
+        for req in prev_reqs:
+            req.wait()
 
         if prev_partner in recv_buffers:
             recv_data = recv_buffers[prev_partner]
             recv_count = recv_data.shape[0]
             buf_offset = recv_offsets[prev_partner]
             recv_act = all_recv_act_buffer[buf_offset:buf_offset + recv_count]
-            if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+            if num_local_experts > 1 and tokens_cpu is not None:
                 offset_inner = 0
                 for exp_idx in range(num_local_experts):
-                    n_tok = num_global_tokens_per_local_expert[0, prev_partner, exp_idx].item()
+                    n_tok = tokens_cpu[prev_partner][exp_idx]
                     if n_tok > 0:
                         exp_tokens = recv_data[offset_inner:offset_inner + n_tok]
                         exp_fc1 = torch.matmul(exp_tokens, w1[exp_idx])
@@ -590,10 +593,6 @@ def dispatch_fc1_p2p_forward(
                 exp_fc1 = torch.matmul(recv_data, w1[0])
                 recv_act.copy_(activation_func(exp_fc1))
             recv_act_results[prev_partner] = recv_act
-
-    # Final: wait for all P2P (release NCCL resources)
-    for req in all_dispatch_reqs:
-        req.wait()
 
     return (local_tokens, local_act, recv_act_results, recv_buffers, partners, recv_offsets)
 
@@ -659,12 +658,9 @@ def fc2_combine_p2p_forward(
     dtype = local_tokens.dtype
     hidden_size = weight2.shape[-1]
 
-    # Weight dimensions
-    total_ffn_hidden = weight2.shape[0]
-    ffn_hidden = total_ffn_hidden // num_local_experts
-
-    # weight2: [ffn * E, hidden] -> view to [ffn, hidden, E] -> permute to [E, ffn, hidden]
-    w2 = weight2.view(ffn_hidden, hidden_size, num_local_experts).permute(2, 0, 1).contiguous()
+    # Weight dimensions - weight2 is already 3D: [num_local_experts, ffn_hidden, hidden]
+    ffn_hidden = weight2.shape[1]
+    w2 = weight2  # No permute needed - already in correct shape
 
     # Compute offsets
     input_offsets = [0]
@@ -677,13 +673,15 @@ def fc2_combine_p2p_forward(
     local_count = input_splits[my_rank]
     local_start = input_offsets[my_rank]
 
+    # Convert to CPU list once to avoid multiple .item() calls causing CUDA sync
+    tokens_cpu = None
+    if num_global_tokens_per_local_expert is not None:
+        tokens_cpu = num_global_tokens_per_local_expert[0].cpu().tolist()  # [ep_size, num_local_experts]
+
     # Compute local token count per expert
     local_tokens_per_expert = None
-    if num_global_tokens_per_local_expert is not None:
-        local_tokens_per_expert = [
-            num_global_tokens_per_local_expert[0, my_rank, exp_idx].item()
-            for exp_idx in range(num_local_experts)
-        ]
+    if tokens_cpu is not None:
+        local_tokens_per_expert = [tokens_cpu[my_rank][exp_idx] for exp_idx in range(num_local_experts)]
 
     # =========================================================================
     # Combine Phase Pipeline
@@ -703,11 +701,11 @@ def fc2_combine_p2p_forward(
         first_partner = partners[0]
         if first_partner in recv_act_results:
             recv_act = recv_act_results[first_partner]
-            if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+            if num_local_experts > 1 and tokens_cpu is not None:
                 peer_fc2 = torch.zeros(recv_act.shape[0], hidden_size, dtype=dtype, device=device)
                 offset = 0
                 for exp_idx in range(num_local_experts):
-                    n_tok = num_global_tokens_per_local_expert[0, first_partner, exp_idx].item()
+                    n_tok = tokens_cpu[first_partner][exp_idx]
                     if n_tok > 0:
                         exp_act = recv_act[offset:offset + n_tok]
                         peer_fc2[offset:offset + n_tok] = torch.matmul(exp_act, w2[exp_idx])
@@ -747,11 +745,11 @@ def fc2_combine_p2p_forward(
             next_partner = partners[round_idx + 1]
             if next_partner in recv_act_results:
                 recv_act = recv_act_results[next_partner]
-                if num_local_experts > 1 and num_global_tokens_per_local_expert is not None:
+                if num_local_experts > 1 and tokens_cpu is not None:
                     peer_fc2 = torch.zeros(recv_act.shape[0], hidden_size, dtype=dtype, device=device)
                     offset = 0
                     for exp_idx in range(num_local_experts):
-                        n_tok = num_global_tokens_per_local_expert[0, next_partner, exp_idx].item()
+                        n_tok = tokens_cpu[next_partner][exp_idx]
                         if n_tok > 0:
                             exp_act = recv_act[offset:offset + n_tok]
                             peer_fc2[offset:offset + n_tok] = torch.matmul(exp_act, w2[exp_idx])

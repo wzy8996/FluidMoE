@@ -1,24 +1,27 @@
 """
 FluidMoE: MoE/Attention with Communication-Computation Overlap
 
-This package provides standalone MoE/Attention layers with optimized scheduling.
+This package provides unified Transformer layers with optimized scheduling.
 
 Key Scheduling Innovations:
 1. Forward: P2P Round-Robin Tournament for dispatch/combine overlap
 2. Backward: dW tasks deferred and executed during AllToAll communication
+3. Unified autograd.Function: Single Function for complete Transformer layer
 
 Modules:
 - core: AllToAll primitives, P2P scheduling, BackwardScheduler
-- moe: Standalone MoE layer with P2P forward and chunked backward
-- attention: Standalone Attention layer with P2P forward and chunked backward
+- moe: MoE forward/backward building blocks
+- attention: Attention forward/backward building blocks
+- layer: Unified Transformer layer with single autograd.Function
 - distributed: Lightweight SP + EP parallel context
 
 Quick Start:
     from fluid.distributed import init_parallel
-    from fluid import MoELayer, AttentionLayer
+    from fluid import TransformerLayer, TransformerModel
 
     ctx = init_parallel(ep_size=8)
-    moe = MoELayer(hidden_size=2048, num_experts=8, parallel_ctx=ctx)
+    layer = TransformerLayer(hidden_size=2048, num_experts=8, parallel_ctx=ctx)
+    model = TransformerModel(num_layers=24, ...)
 """
 
 __version__ = "1.0.0"
@@ -48,7 +51,7 @@ from .core import (
 )
 
 # =============================================================================
-# MoE module
+# MoE module (forward/backward building blocks)
 # =============================================================================
 from .moe import (
     # Forward operations
@@ -67,14 +70,10 @@ from .moe import (
     dispatch_backward,
     router_backward,
     register_router_dw_task,
-    # Complete MoE layer
-    MoEP2PChunkedFunction,
-    moe_p2p_chunked,
-    MoELayer,
 )
 
 # =============================================================================
-# Attention module
+# Attention module (forward/backward building blocks)
 # =============================================================================
 from .attention import (
     # Forward operations
@@ -86,10 +85,15 @@ from .attention import (
     attention_backward_chunked,
     qkv_projection_backward,
     output_projection_register_dw,
-    # Complete attention layer
-    AttentionP2PChunkedFunction,
-    attention_p2p_chunked,
-    AttentionLayer,
+)
+
+# =============================================================================
+# Layer module (unified Transformer autograd.Function)
+# =============================================================================
+from .layer import (
+    TransformerLayerFunction,
+    TransformerLayer,
+    TransformerModel,
 )
 
 # =============================================================================
@@ -137,10 +141,6 @@ __all__ = [
     "dispatch_backward",
     "router_backward",
     "register_router_dw_task",
-    # MoE - Complete layer
-    "MoEP2PChunkedFunction",
-    "moe_p2p_chunked",
-    "MoELayer",
 
     # Attention - Forward operations
     "qkv_projection_p2p_forward",
@@ -151,10 +151,11 @@ __all__ = [
     "attention_backward_chunked",
     "qkv_projection_backward",
     "output_projection_register_dw",
-    # Attention - Complete layer
-    "AttentionP2PChunkedFunction",
-    "attention_p2p_chunked",
-    "AttentionLayer",
+
+    # Layer - Unified Transformer (single autograd.Function)
+    "TransformerLayerFunction",
+    "TransformerLayer",
+    "TransformerModel",
 
     # Optimizer wrapper
     "wrap_optimizer",

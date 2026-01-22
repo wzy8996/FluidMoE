@@ -95,8 +95,8 @@ def register_moe_dw_tasks(
         hidden_size_saved = hidden_size
 
         def compute_dw_weight2():
-            # Compute gradients in 3D [E, ffn, hidden], then convert to 2D [ffn*E, hidden]
-            # 2D layout: [ffn, hidden, E] interleaved, so we permute(1, 2, 0) then reshape
+            # Compute gradients directly in 3D [E, ffn, hidden] - no permute needed
+            # Weight shape: [E, ffn, hidden], gradient same shape
             device = grad_all_fc2_saved.device
             dtype = grad_all_fc2_saved.dtype
             grad_w2_3d = torch.zeros(num_local_experts_saved, ffn_hidden_saved, hidden_size_saved,
@@ -110,13 +110,11 @@ def register_moe_dw_tasks(
                         grad_all_fc2_saved[start:start+n_tok]
                     )
                     start += n_tok
-            # Convert 3D [E, ffn, hidden] -> 2D [ffn*E, hidden]
-            # Permute to [ffn, hidden, E], then reshape to [ffn*E, hidden]
-            return grad_w2_3d.permute(1, 2, 0).reshape(ffn_hidden_saved * num_local_experts_saved, hidden_size_saved)
+            return grad_w2_3d  # Return 3D directly
 
         def compute_dw_weight1():
-            # Compute gradients in 3D [E, hidden, ffn], then convert to 2D [hidden, ffn*E]
-            # 2D layout: [hidden, ffn, E] interleaved, so we permute(1, 2, 0) then reshape
+            # Compute gradients directly in 3D [E, hidden, ffn] - no permute needed
+            # Weight shape: [E, hidden, ffn], gradient same shape
             device = grad_all_fc1_saved.device
             dtype = grad_all_fc1_saved.dtype
             grad_w1_3d = torch.zeros(num_local_experts_saved, hidden_size_saved, ffn_hidden_saved,
@@ -130,9 +128,7 @@ def register_moe_dw_tasks(
                         grad_all_fc1_saved[start:start+n_tok]
                     )
                     start += n_tok
-            # Convert 3D [E, hidden, ffn] -> 2D [hidden, ffn*E]
-            # Permute to [hidden, ffn, E], then reshape to [hidden, ffn*E]
-            return grad_w1_3d.permute(1, 2, 0).reshape(hidden_size_saved, ffn_hidden_saved * num_local_experts_saved)
+            return grad_w1_3d  # Return 3D directly
 
         scheduler.register_dw_task(
             layer_name=f"moe_weight2_L{layer_id}",
@@ -150,8 +146,7 @@ def register_moe_dw_tasks(
         )
         return None, None
     else:
-        # Scheduler disabled: compute dW directly
-        # Compute gradients in 3D, then convert to 2D layout
+        # Scheduler disabled: compute dW directly in 3D (no permute needed)
         device = grad_all_fc2.device
         dtype = grad_all_fc2.dtype
 
@@ -174,13 +169,8 @@ def register_moe_dw_tasks(
                 )
                 start += n_tok
 
-        # Convert 3D to 2D layout
-        # grad_w1: [E, hidden, ffn] -> permute to [hidden, ffn, E] -> reshape to [hidden, ffn*E]
-        # grad_w2: [E, ffn, hidden] -> permute to [ffn, hidden, E] -> reshape to [ffn*E, hidden]
-        grad_w1 = grad_w1_3d.permute(1, 2, 0).reshape(hidden_size, ffn_hidden * num_local_experts)
-        grad_w2 = grad_w2_3d.permute(1, 2, 0).reshape(ffn_hidden * num_local_experts, hidden_size)
-
-        return grad_w1, grad_w2
+        # Return 3D gradients directly (weights are now 3D)
+        return grad_w1_3d, grad_w2_3d
 
 
 # =============================================================================

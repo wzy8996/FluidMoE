@@ -12,9 +12,8 @@ File structure:
   - Attention backward: recompute + chunked grad_Q/K/V + hp2sp AllToAll + dW overlap
   - QKV projection backward: dX + dW
 
-- layer.py: Complete attention autograd functions
-  - AttentionP2PChunkedFunction: Full autograd with P2P forward + chunked AllToAll backward
-  - AttentionLayer: High-level nn.Module wrapper
+Note: Complete Attention layer (autograd.Function) has been moved to fluid.layer module
+      for unified Transformer layer implementation.
 
 Key design principles:
 - Forward uses P2P overlap for compute-communication overlap
@@ -34,11 +33,6 @@ from .backward import (
     qkv_projection_backward,
     output_projection_register_dw,
 )
-from .layer import (
-    AttentionP2PChunkedFunction,
-    attention_p2p_chunked,
-    AttentionLayer,
-)
 
 __all__ = [
     # Forward operations (P2P overlap)
@@ -50,8 +44,4 @@ __all__ = [
     'attention_backward_chunked',
     'qkv_projection_backward',
     'output_projection_register_dw',
-    # Complete attention layer
-    'AttentionP2PChunkedFunction',
-    'attention_p2p_chunked',
-    'AttentionLayer',
 ]

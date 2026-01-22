@@ -298,6 +298,7 @@ def output_projection_p2p_forward(
     # Prepare send data and receive buffers
     send_data_dict = {}
     recv_buffers = {}
+    recv_buffers_flat = {}  # Pre-computed flat views
     weight_per_partner = {}
     partners = []
 
@@ -308,74 +309,72 @@ def output_projection_p2p_forward(
         partners.append(partner)
 
         # Send data: attn_output at peer's sequence position
+        # Slice along dim 0 of contiguous tensor is already contiguous - no need for .contiguous()
         partner_seq_start = partner * seq_local
-        send_data_dict[partner] = attn_output[partner_seq_start:partner_seq_start + seq_local].contiguous()
+        send_data_dict[partner] = attn_output[partner_seq_start:partner_seq_start + seq_local]
 
-        # Receive buffer
-        recv_buffers[partner] = torch.empty(
+        # Receive buffer + pre-computed flat view
+        recv_buf = torch.empty(
             seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device
         )
+        recv_buffers[partner] = recv_buf
+        recv_buffers_flat[partner] = recv_buf.view(seq_local, batch_size, -1)
 
         # Cache partner's weight
         partner_weight_start = partner * input_dim_per_rank
         weight_per_partner[partner] = weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank]
 
-    # Pipeline overlap (GPU sync with ping-pong events)
+    # Pipeline overlap with delayed req.wait()
+    # Key insight: Start P2P_i first, then wait for P2P_{i-1} to complete
+    # This ensures P2P_i runs in background while we process P2P_{i-1}'s data
     attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
     attn_local_flat = attn_local_seq.reshape(seq_local, batch_size, -1)
 
     prev_partner = None
+    prev_reqs = []
     output = None
-    all_reqs = []
-
-    # Reuse ping-pong events from context (avoid creating new events each forward call)
-    p2p_events = overlap_ctx.p2p_events
 
     for round_idx, partner in enumerate(partners):
-        curr_event = p2p_events[round_idx % 2]
-        prev_event = p2p_events[(round_idx - 1) % 2]
-
-        # Start current round's P2P communication
+        # 1. Start current round's P2P (async, returns immediately)
+        # GPU sync: comm_stream waits for default_stream (send_data preparation)
         with torch.cuda.stream(comm_stream):
+            if round_idx == 0:
+                comm_stream.wait_stream(default_stream)  # Wait for send_data preparation
             p2p_ops = [
                 dist.P2POp(dist.irecv, recv_buffers[partner], partner, group=cp_group),
                 dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
             ]
             curr_reqs = dist.batch_isend_irecv(p2p_ops)
-            all_reqs.extend(curr_reqs)
-            curr_event.record(comm_stream)
 
-        # Parallel with P2P: compute partial output
+        # 2. Wait for PREVIOUS round's P2P to complete (current round runs in background)
+        if round_idx > 0:
+            for req in prev_reqs:
+                req.wait()
+
+        # 3. Compute (overlaps with current round's P2P)
         if round_idx == 0:
             # First round: compute local partial (parallel with P2P_0)
             output = torch.matmul(attn_local_flat, weight_local.t())
         else:
-            # GPU sync: default_stream waits for PREVIOUS round P2P
-            default_stream.wait_event(prev_event)
-            # Compute previous round's partial
-            recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
-            output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
+            # Use previous round's received data (now guaranteed complete)
+            output = output + torch.matmul(recv_buffers_flat[prev_partner], weight_per_partner[prev_partner].t())
 
         prev_partner = partner
+        prev_reqs = curr_reqs
 
-    # Wait for last P2P and compute last partial
+    # Process last round: wait for last P2P and compute
     if len(partners) > 0:
-        last_event = p2p_events[(len(partners) - 1) % 2]
-        default_stream.wait_event(last_event)
-        recv_flat = recv_buffers[prev_partner].view(seq_local, batch_size, -1)
-        output = output + torch.matmul(recv_flat, weight_per_partner[prev_partner].t())
-
-    # Final: wait for all P2P (release NCCL resources)
-    for req in all_reqs:
-        req.wait()
+        for req in prev_reqs:
+            req.wait()
+        output = output + torch.matmul(recv_buffers_flat[prev_partner], weight_per_partner[prev_partner].t())
 
     if bias_proj is not None:
         output = output + bias_proj
 
-    # Collect all heads' data at my_seq position for backward
+    # Collect all heads' data at my_seq position for backward (use pre-computed flat views)
     attn_parts = {my_rank: attn_local_flat}
     for partner in partners:
-        attn_parts[partner] = recv_buffers[partner].view(seq_local, batch_size, -1)
+        attn_parts[partner] = recv_buffers_flat[partner]
     attn_input_full = torch.cat([attn_parts[r] for r in range(cp_size)], dim=-1)
 
     return output, attn_input_full

@@ -17,13 +17,10 @@ File structure:
   - Router dW task registration
   - FC1 recomputation (Activation Recomputation optimization)
 
-- layer.py: Complete MoE autograd functions with integrated routing
-  - MoEP2PChunkedFunction: Full autograd with routing + P2P forward + chunked AllToAll backward
-  - moe_p2p_chunked: Main API function with integrated routing
-  - MoELayer: High-level nn.Module wrapper
+Note: Complete MoE layer (autograd.Function) has been moved to fluid.layer module
+      for unified Transformer layer implementation.
 
 Key design principles:
-- Router integrated into layer.py with dW scheduling
 - Forward uses P2P overlap for compute-communication overlap
 - Backward uses AllToAll with optional chunked compute overlap
 - FC1 Recomputation: FC1 is NOT saved in forward, recomputed during backward
@@ -49,11 +46,6 @@ from .backward import (
     router_backward,
     register_router_dw_task,
 )
-from .layer import (
-    MoEP2PChunkedFunction,
-    moe_p2p_chunked,
-    MoELayer,
-)
 
 __all__ = [
     # Router forward
@@ -74,8 +66,4 @@ __all__ = [
     # Router backward
     'router_backward',
     'register_router_dw_task',
-    # Complete MoE layer (with integrated routing)
-    'MoEP2PChunkedFunction',
-    'moe_p2p_chunked',
-    'MoELayer',
 ]
