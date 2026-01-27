@@ -2,28 +2,27 @@
 Attention Backward Operations with AllToAll + dX/dW Scheduling
 
 This module implements all backward operations for context-parallel attention:
-1. Output projection backward: chunked dX + sp2hp AllToAll + dW overlap
-2. Attention backward: recompute + chunked grad_Q/K/V + hp2sp AllToAll + dW overlap
+1. Output projection backward: chunked dX + sp2hp AllToAll + attention recompute overlap
+2. Attention backward: chunked grad_Q/K/V + hp2sp AllToAll + dW overlap
 3. QKV projection backward: dX + dW
 
 Key design principle:
 - Backward uses AllToAll (not P2P) for communication
 - dX computation is chunked and overlapped with AllToAll communication
+- Attention recomputation is overlapped with output projection AllToAll
 - dW tasks are registered and executed during AllToAll communication
 
-Timeline (Output Projection Backward - chunked):
-    default_stream: |dX_c0|--dX_c1--|--dX_c2--|--dX_c3--|wait|
+Timeline (Output Projection Backward with Attention Recompute):
+    default_stream: |dX_c0|--dX_c1--|--dX_c2--|--dX_c3--|attn_recompute|dW|wait|
                         ↓       ↓        ↓        ↓
-    comm_stream:        |A2A_c0-|A2A_c1--|A2A_c2--|A2A_c3--|
-                             overlap!
-    After last chunk: register dW task -> execute during remaining A2A
-
-Timeline (Attention Backward - chunked):
-    default_stream: |recompute|grad_QKV_c0|--c1--|--c2--|--c3--|wait|
-                                   ↓        ↓      ↓      ↓
-    comm_stream:                   |A2A_c0--|A2A_c1|A2A_c2|A2A_c3|
+    comm_stream:        |A2A_c0-|A2A_c1--|A2A_c2--|A2A_c3-----------------|
                                         overlap!
-    After last chunk: register dW tasks -> execute during remaining A2A
+
+Timeline (Attention Backward - uses precomputed attn_probs/grad_attn_scores):
+    default_stream: |grad_QKV_c0|--c1--|--c2--|--c3--|dW|wait|
+                          ↓        ↓      ↓      ↓
+    comm_stream:          |A2A_c0--|A2A_c1|A2A_c2|A2A_c3----|
+                                        overlap!
 """
 
 import os
@@ -44,12 +43,17 @@ def output_projection_backward_chunked(
     cp_group: dist.ProcessGroup,
     num_chunks: int = 4,
     comm_stream: Optional[torch.cuda.Stream] = None,
-) -> torch.Tensor:
+    # Attention recompute params (optional - for overlap with AllToAll)
+    query: Optional[torch.Tensor] = None,
+    key: Optional[torch.Tensor] = None,
+    value: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    Output projection backward with chunked dX + sp2hp AllToAll overlap.
+    Output projection backward with chunked dX + sp2hp AllToAll + attention recompute overlap.
 
     IMPORTANT: dX computation is chunked together with sp2hp AllToAll,
-    NOT computed all at once before AllToAll.
+    and attention recomputation is done during AllToAll communication.
 
     Args:
         grad_output: [seq_local, batch, hidden] - gradient w.r.t. output
@@ -59,15 +63,19 @@ def output_projection_backward_chunked(
         cp_group: context parallel process group
         num_chunks: number of chunks to split seq dimension
         comm_stream: CUDA stream for communication
+        query: [batch, heads_local, seq_full, head_dim] - Q for attention recompute (optional)
+        key: [batch, heads_local, seq_full, head_dim] - K for attention recompute (optional)
+        value: [batch, heads_local, seq_full, head_dim] - V for attention recompute (optional)
+        scale: attention scale factor (optional)
 
     Returns:
         grad_attn_output: [seq_full, batch, heads_local, head_dim] - gradient in HP format
+        attn_probs: [batch, heads_local, seq_full, seq_full] - recomputed attention probs (or None)
+        grad_attn_scores: [batch, heads_local, seq_full, seq_full] - gradient of attn scores (or None)
 
     Timeline:
-        Chunk 0: compute dX[0:S/4] -> submit sp2hp A2A
-        Chunk 1: compute dX[S/4:S/2] -> submit sp2hp A2A (while A2A_0 runs)
-        ...
-        After last chunk: register dW task -> execute during remaining A2A
+        Chunk 0-N: compute dX chunks -> submit sp2hp A2A
+        During A2A: attention recompute + dW tasks
         Wait for all A2A to complete, concatenate results
     """
     scheduler = get_backward_scheduler()
@@ -78,103 +86,120 @@ def output_projection_backward_chunked(
     cp_size = cp_group.size()
     heads_local = total_heads // cp_size
 
+    # Check if attention recompute is requested
+    do_attn_recompute = query is not None and key is not None and value is not None and scale is not None
+
     # Validate chunk size
     if seq_local % num_chunks != 0:
         num_chunks = 1
 
     # Debug output
     if os.environ.get('FLUID_DEBUG_CHUNKS'):
-        print(f"[output_projection_backward_chunked] num_chunks={num_chunks}, seq_local={seq_local}")
+        print(f"[output_projection_backward_chunked] num_chunks={num_chunks}, seq_local={seq_local}, attn_recompute={do_attn_recompute}")
+
+    # Helper function for attention recompute (overlaps with AllToAll)
+    def recompute_attention():
+        """Recompute attn_probs and grad_attn_scores during AllToAll."""
+        if not do_attn_recompute:
+            return None, None
+
+        seq_full = query.shape[2]
+
+        # Recompute attention scores and probs
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+
+        # Causal mask
+        causal_mask = torch.triu(
+            torch.ones(seq_full, seq_full, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        attn_probs = F.softmax(attn_scores, dim=-1)
+
+        return attn_probs, None  # grad_attn_scores computed later with grad_output
 
     if num_chunks == 1:
-        # Non-chunked path: compute full dX then AllToAll with dW overlap
-        # dX: [seq_local, B, hidden] @ [hidden, total_heads * head_dim]
-        #   -> [seq_local, B, total_heads * head_dim]
+        # Non-chunked path: compute full dX then AllToAll via comm thread
         grad_attn_flat = torch.matmul(grad_output, weight_proj)
         grad_attn_sp = grad_attn_flat.view(seq_local, batch_size, total_heads, head_dim)
 
-        # sp2hp AllToAll with dW overlap
-        if comm_stream is None:
-            comm_stream = scheduler.comm_stream
-        default_stream = torch.cuda.current_stream()
-
+        attn_probs = None
         if scheduler.is_enabled():
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_stream(default_stream)
-                grad_attn_output = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
-                scheduler.record_alltoall_end(comm_stream)
-            scheduler.on_alltoall_start(comm_type="attn_proj_sp2hp")
-            default_stream.wait_stream(comm_stream)
-            return grad_attn_output
+            result_holder = [None]
+            def do_alltoall():
+                result_holder[0] = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
+                return result_holder[0]
+
+            task_id = scheduler.submit_alltoall(do_alltoall)
+
+            # Attention recompute during AllToAll (overlaps with communication)
+            attn_probs, _ = recompute_attention()
+
+            # Execute dW tasks while AllToAll is running
+            scheduler.execute_dw_tasks()
+
+            # Wait for AllToAll
+            scheduler.wait_alltoall(task_id)
+            return result_holder[0], attn_probs, None
         else:
-            return _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
+            grad_attn_output = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
+            attn_probs, _ = recompute_attention()
+            return grad_attn_output, attn_probs, None
 
     # ========================================================================
-    # Chunked path: dX computation overlapped with sp2hp AllToAll
-    # Using alternating pattern (like Forward P2P) to ensure proper overlap
+    # Chunked path: dX computation overlapped with sp2hp AllToAll via comm thread
     # ========================================================================
     seq_chunk = seq_local // num_chunks
+    output_chunks = [None] * num_chunks
+    task_ids = []
 
-    if comm_stream is None:
-        comm_stream = scheduler.comm_stream
-    default_stream = torch.cuda.current_stream()
+    scheduler_enabled = scheduler.is_enabled()
 
-    # Reuse pre-created Event from scheduler to reduce overhead
-    compute_event = scheduler.get_compute_sync_event()
-
-    # Storage for AllToAll results
-    output_chunks = []
-
-    # Pre-compute first chunk (like Forward pre-computes first round)
-    s_start = 0
-    s_end = seq_chunk
-    grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
-    grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
-    compute_event.record(default_stream)
-
-    # Pipeline loop: submit AllToAll, then compute next chunk (alternating)
+    # Pipeline loop: compute dX, submit AllToAll (overlaps with next dX)
     for chunk_idx in range(num_chunks):
-        # ============================================
-        # Step 1: Submit current chunk's AllToAll (wait for current data)
-        # ============================================
-        with torch.cuda.stream(comm_stream):
-            comm_stream.wait_event(compute_event)  # Wait for current chunk's dX
+        s_start = chunk_idx * seq_chunk
+        s_end = s_start + seq_chunk
 
-            # sp2hp AllToAll: [seq_chunk, B, total_heads, D] -> [seq_chunk * cp_size, B, heads_local, D]
-            output_chunk = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
-            output_chunks.append(output_chunk)
+        grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
+        grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
 
-            # Record event after the last chunk's AllToAll
-            if chunk_idx == num_chunks - 1:
-                scheduler.record_alltoall_end(comm_stream)
+        if scheduler_enabled:
+            _chunk_idx = chunk_idx
+            _grad_chunk = grad_chunk.contiguous()
 
-        # ============================================
-        # Step 2: Compute next chunk's dX (parallel with current AllToAll)
-        # ============================================
-        if chunk_idx + 1 < num_chunks:
-            next_s_start = (chunk_idx + 1) * seq_chunk
-            next_s_end = (chunk_idx + 2) * seq_chunk
-            grad_chunk = torch.matmul(grad_output[next_s_start:next_s_end], weight_proj)
-            grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
-            compute_event.record(default_stream)  # Record AFTER wait, so no overwrite issue
+            def make_alltoall_fn(idx, data):
+                def do_alltoall():
+                    result = _all_to_all_sp2hp_forward(data, cp_group)
+                    output_chunks[idx] = result
+                    return result
+                return do_alltoall
+
+            task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _grad_chunk))
+            task_ids.append(task_id)
+        else:
+            output_chunks[chunk_idx] = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
 
     # ============================================
-    # Step 3: Execute dW tasks while AllToAll is in progress
+    # During AllToAll: attention recompute + dW tasks
     # ============================================
-    # dW task can now be executed since all dX chunks have been computed
-    if scheduler.is_enabled():
-        scheduler.on_alltoall_start(comm_type="attn_proj_sp2hp_chunked")
+    attn_probs = None
+    if scheduler_enabled:
+        # Attention recompute during AllToAll (overlaps with communication)
+        attn_probs, _ = recompute_attention()
 
-    # ============================================
-    # Step 4: Wait for all AllToAll and concatenate
-    # ============================================
-    default_stream.wait_stream(comm_stream)
+        # Execute dW tasks
+        scheduler.execute_dw_tasks()
 
-    # Concatenate chunks along seq dimension
-    # Each chunk: [seq_chunk * cp_size, B, heads_local, D] -> [seq_full, B, heads_local, D]
+        # Wait for the last AllToAll only
+        if task_ids:
+            scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids))
+    else:
+        attn_probs, _ = recompute_attention()
+
+    # Concatenate chunks
     grad_attn_output = torch.cat(output_chunks, dim=0)
 
-    return grad_attn_output
+    return grad_attn_output, attn_probs, None
 
 
 def attention_backward_chunked(
@@ -185,11 +210,13 @@ def attention_backward_chunked(
     scale: float,
     cp_group: dist.ProcessGroup,
     num_chunks: int = 4,
+    attn_probs_precomputed: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Attention backward with recomputation and chunked grad_Q/K/V + hp2sp AllToAll overlap.
+    Attention backward with chunked grad_Q/K/V + hp2sp AllToAll overlap.
 
-    Memory-efficient: saves Q, K, V instead of attention matrix, recomputes attn_probs.
+    If attn_probs_precomputed is provided (from output_projection_backward),
+    skips the recomputation step for better overlap.
 
     Args:
         grad_output: [batch, heads_local, seq_full, head_dim] - gradient w.r.t. attention output
@@ -199,20 +226,18 @@ def attention_backward_chunked(
         scale: attention scale factor (1/sqrt(head_dim))
         cp_group: context parallel process group
         num_chunks: number of chunks for head_dim splitting
+        attn_probs_precomputed: [batch, heads_local, seq_full, seq_full] - precomputed attn probs (optional)
 
     Returns:
         grad_q: [seq_local, batch, heads_full, head_dim] - gradient in SP format
         grad_k: [seq_local, batch, heads_full, head_dim] - gradient in SP format
         grad_v: [seq_local, batch, heads_full, head_dim] - gradient in SP format
 
-    Timeline:
-        Step 1: Recompute attn_probs (full)
-        Step 2: Compute grad_attn_scores (full)
-        Step 3: For each head_dim chunk:
-                - Compute grad_Q/K/V chunk
-                - Submit hp2sp AllToAll
-        Step 4: Execute dW tasks during AllToAll
-        Step 5: Wait and concatenate
+    Timeline (with precomputed attn_probs):
+        Step 1: Compute grad_attn_scores (using precomputed attn_probs)
+        Step 2: For each seq chunk: compute grad_Q/K/V -> submit hp2sp AllToAll
+        Step 3: Execute dW tasks during AllToAll
+        Step 4: Wait and concatenate
     """
     batch, heads_local, seq_full, head_dim = query.shape
     device = query.device
@@ -226,20 +251,23 @@ def attention_backward_chunked(
         num_chunks = 1
 
     if os.environ.get('FLUID_DEBUG_CHUNKS'):
-        print(f"[attention_backward_chunked] num_chunks={num_chunks}, head_dim={head_dim}")
+        print(f"[attention_backward_chunked] num_chunks={num_chunks}, head_dim={head_dim}, precomputed={attn_probs_precomputed is not None}")
 
     # ============================================
-    # Step 1: Recompute attention (full)
+    # Step 1: Use precomputed or recompute attention
     # ============================================
-    attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-
-    # Causal mask
-    causal_mask = torch.triu(
-        torch.ones(seq_full, seq_full, device=device, dtype=torch.bool),
-        diagonal=1
-    )
-    attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
-    attn_probs = F.softmax(attn_scores, dim=-1)
+    if attn_probs_precomputed is not None:
+        # Use precomputed attn_probs (already computed during output_projection AllToAll)
+        attn_probs = attn_probs_precomputed
+    else:
+        # Recompute attention (fallback if not precomputed)
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+        causal_mask = torch.triu(
+            torch.ones(seq_full, seq_full, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        attn_probs = F.softmax(attn_scores, dim=-1)
 
     # ============================================
     # Step 2: Compute grad_attn_scores (full)
@@ -267,17 +295,18 @@ def attention_backward_chunked(
         grad_v = grad_v.permute(2, 0, 1, 3)
 
         if cp_size > 1:
-            # hp2sp AllToAll with dW overlap
+            # hp2sp AllToAll via comm thread with dW overlap
             grad_qkv_merged = torch.cat([grad_q, grad_k, grad_v], dim=-1)
             if scheduler.is_enabled():
-                comm_stream = scheduler.comm_stream
-                default_stream = torch.cuda.current_stream()
-                with torch.cuda.stream(comm_stream):
-                    comm_stream.wait_stream(default_stream)
-                    grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
-                    scheduler.record_alltoall_end(comm_stream)
-                scheduler.on_alltoall_start(comm_type="attn_qkv_hp2sp")
-                default_stream.wait_stream(comm_stream)
+                result_holder = [None]
+                def do_alltoall():
+                    result_holder[0] = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
+                    return result_holder[0]
+
+                task_id = scheduler.submit_alltoall(do_alltoall)
+                scheduler.execute_dw_tasks()
+                scheduler.wait_alltoall(task_id)
+                grad_qkv_sp = result_holder[0]
             else:
                 grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
             grad_q, grad_k, grad_v = torch.split(grad_qkv_sp, head_dim, dim=-1)
@@ -286,83 +315,94 @@ def attention_backward_chunked(
 
     # ============================================
     # Step 4: Chunked path with AllToAll overlap
-    # Using alternating pattern (like Forward P2P) to ensure proper overlap
+    # Chunk by SEQ dimension (not head_dim) for efficient matmul
     # ============================================
-    chunk_size = head_dim // num_chunks
+    # Validate: seq_full must be divisible by num_chunks
+    if seq_full % num_chunks != 0:
+        num_chunks = 1
+        # Fall back to non-chunked path
+        grad_q = torch.matmul(grad_attn_scores, key) * scale
+        grad_k = torch.matmul(grad_attn_scores.transpose(-2, -1), query) * scale
+        grad_v = torch.matmul(attn_probs.transpose(-2, -1), grad_output)
+        grad_q = grad_q.permute(2, 0, 1, 3)
+        grad_k = grad_k.permute(2, 0, 1, 3)
+        grad_v = grad_v.permute(2, 0, 1, 3)
+        grad_qkv_merged = torch.cat([grad_q, grad_k, grad_v], dim=-1)
+        grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_merged, cp_group)
+        grad_q, grad_k, grad_v = torch.split(grad_qkv_sp, head_dim, dim=-1)
+        return grad_q, grad_k, grad_v
 
-    comm_stream = scheduler.comm_stream if scheduler.is_enabled() else torch.cuda.Stream()
-    default_stream = torch.cuda.current_stream()
+    seq_chunk_size = seq_full // num_chunks
 
-    # Reuse pre-created Event from scheduler to reduce overhead
-    compute_event = scheduler.get_compute_sync_event()
-    output_q_chunks = []
-    output_k_chunks = []
-    output_v_chunks = []
+    scheduler_enabled = scheduler.is_enabled()
 
-    # Helper function to compute one chunk
-    def compute_chunk(d_start, d_end):
-        grad_q_chunk = torch.matmul(grad_attn_scores, key[:, :, :, d_start:d_end]) * scale
+    # Storage for AllToAll results and task IDs
+    output_chunks = [None] * num_chunks
+    task_ids = []
+
+    # Helper function to compute one seq chunk (efficient: full key/query/grad_output used)
+    def compute_seq_chunk(s_start, s_end):
+        # grad_q: [B, H, chunk, head_dim] - uses full key
+        grad_q_chunk = torch.matmul(grad_attn_scores[:, :, s_start:s_end, :], key) * scale
+        # grad_k: [B, H, chunk, head_dim] - uses grad_attn_scores columns and full query
         grad_k_chunk = torch.matmul(
-            grad_attn_scores.transpose(-2, -1), query[:, :, :, d_start:d_end]
+            grad_attn_scores[:, :, :, s_start:s_end].transpose(-2, -1), query
         ) * scale
+        # grad_v: [B, H, chunk, head_dim] - uses attn_probs columns and full grad_output
         grad_v_chunk = torch.matmul(
-            attn_probs.transpose(-2, -1), grad_output[:, :, :, d_start:d_end]
+            attn_probs[:, :, :, s_start:s_end].transpose(-2, -1), grad_output
         )
+        # Permute: [B, H, chunk, D] -> [chunk, B, H, D]
         grad_q_chunk = grad_q_chunk.permute(2, 0, 1, 3).contiguous()
         grad_k_chunk = grad_k_chunk.permute(2, 0, 1, 3).contiguous()
         grad_v_chunk = grad_v_chunk.permute(2, 0, 1, 3).contiguous()
+        # Merge Q, K, V for AllToAll: [chunk, B, H, 3*D]
         return torch.cat([grad_q_chunk, grad_k_chunk, grad_v_chunk], dim=-1)
 
-    # Pre-compute first chunk (like Forward pre-computes first round)
-    grad_qkv_chunk = compute_chunk(0, chunk_size)
-    compute_event.record(default_stream)
-
-    # Pipeline loop: submit AllToAll, then compute next chunk (alternating)
+    # Pipeline loop: compute grad_qkv chunk, submit AllToAll (overlaps with next chunk)
     for chunk_idx in range(num_chunks):
-        # ============================================
-        # Step 4a: Submit current chunk's AllToAll (wait for current data)
-        # ============================================
-        with torch.cuda.stream(comm_stream):
-            comm_stream.wait_event(compute_event)  # Wait for current chunk
-
-            # hp2sp AllToAll: [seq_full, batch, heads_local, 3*chunk_size]
-            #              -> [seq_local, batch, heads_full, 3*chunk_size]
-            grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_chunk, cp_group)
-
-            # Split back to Q, K, V
-            grad_q_sp, grad_k_sp, grad_v_sp = torch.split(grad_qkv_sp, chunk_size, dim=-1)
-            output_q_chunks.append(grad_q_sp)
-            output_k_chunks.append(grad_k_sp)
-            output_v_chunks.append(grad_v_sp)
-
-            # Record event after last chunk's AllToAll
-            if chunk_idx == num_chunks - 1 and scheduler.is_enabled():
-                scheduler.record_alltoall_end(comm_stream)
+        s_start = chunk_idx * seq_chunk_size
+        s_end = s_start + seq_chunk_size
 
         # ============================================
-        # Step 4b: Compute next chunk (parallel with current AllToAll)
+        # Step 4a: Compute grad_qkv chunk
         # ============================================
-        if chunk_idx + 1 < num_chunks:
-            next_d_start = (chunk_idx + 1) * chunk_size
-            next_d_end = (chunk_idx + 2) * chunk_size
-            grad_qkv_chunk = compute_chunk(next_d_start, next_d_end)
-            compute_event.record(default_stream)  # Record AFTER wait, so no overwrite issue
+        grad_qkv_chunk = compute_seq_chunk(s_start, s_end)
+
+        # ============================================
+        # Step 4b: Submit AllToAll to comm thread (overlaps with next chunk)
+        # ============================================
+        if scheduler_enabled:
+            _chunk_idx = chunk_idx
+            _grad_qkv_chunk = grad_qkv_chunk.contiguous()
+
+            def make_alltoall_fn(idx, data):
+                def do_alltoall():
+                    result = _all_to_all_hp2sp_forward(data, cp_group)
+                    output_chunks[idx] = result
+                    return result
+                return do_alltoall
+
+            task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _grad_qkv_chunk))
+            task_ids.append(task_id)
+        else:
+            output_chunks[chunk_idx] = _all_to_all_hp2sp_forward(grad_qkv_chunk, cp_group)
 
     # ============================================
     # Step 5: Execute dW tasks while AllToAll in progress
     # ============================================
-    if scheduler.is_enabled():
-        scheduler.on_alltoall_start(comm_type="attn_qkv_hp2sp_chunked")
+    if scheduler_enabled:
+        scheduler.execute_dw_tasks()
 
-    # ============================================
-    # Step 6: Wait for all AllToAll and concatenate
-    # ============================================
-    default_stream.wait_stream(comm_stream)
+        # Wait for the last AllToAll only (FIFO guarantees earlier ones are done)
+        # Pass num_tasks to correctly decrement the in_progress counter
+        if task_ids:
+            scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids))
 
-    # Concatenate chunks along head_dim dimension
-    grad_q = torch.cat(output_q_chunks, dim=-1)
-    grad_k = torch.cat(output_k_chunks, dim=-1)
-    grad_v = torch.cat(output_v_chunks, dim=-1)
+    # Concatenate chunks along seq dimension (dim=0)
+    grad_qkv_full = torch.cat(output_chunks, dim=0)
+    # Split back to Q, K, V along head_dim
+    grad_q, grad_k, grad_v = torch.split(grad_qkv_full, head_dim, dim=-1)
 
     return grad_q, grad_k, grad_v
 
@@ -419,15 +459,15 @@ def qkv_projection_backward(
     if q_per_group > 1:
         # grad_k/v come in expanded form [seq_local, batch, num_heads, head_dim]
         # Need to sum back to [seq_local, batch, num_kv_heads, head_dim]
-        grad_k = grad_k.view(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
-        grad_v = grad_v.view(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
+        grad_k = grad_k.reshape(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
+        grad_v = grad_v.reshape(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
 
     # ============================================
     # Step 2: Reassemble to interleaved grad_qkv format
     # ============================================
     # grad_q: [seq_local, batch, num_heads, head_dim]
     # -> [seq_local, batch, num_kv_heads, q_per_group * head_dim]
-    grad_q_grouped = grad_q.view(seq_local, batch, num_kv_heads, q_per_group * head_dim)
+    grad_q_grouped = grad_q.reshape(seq_local, batch, num_kv_heads, q_per_group * head_dim)
 
     # Concatenate [Q_group, K, V] for each group
     grad_qkv = torch.cat([grad_q_grouped, grad_k, grad_v], dim=-1)

@@ -13,7 +13,6 @@ Usage:
     from fluid.core.stream import get_stream_manager
 
     manager = get_stream_manager()
-    compute_stream = manager.compute_stream
     comm_stream = manager.comm_stream
 
     # At end of iteration:
@@ -29,11 +28,9 @@ class StreamManager:
     """
     Global CUDA stream manager singleton.
 
-    Manages two primary streams:
-    - compute_stream: For compute operations (FC1, FC2, dW, etc.)
+    Manages:
     - comm_stream: For communication operations (P2P, AllToAll)
-
-    Also manages reusable CUDA events to avoid allocation overhead.
+    - Reusable CUDA events to avoid allocation overhead
 
     Thread-safe singleton pattern ensures only one instance per process.
     """
@@ -59,19 +56,12 @@ class StreamManager:
                 return
 
             self._device = None
-            self._compute_stream: Optional[torch.cuda.Stream] = None
             self._comm_stream: Optional[torch.cuda.Stream] = None
 
-            # Reusable ping-pong events for P2P synchronization
-            self._p2p_events = [None, None]
-
-            # Reusable events for compute-comm synchronization
-            self._compute_events = [None, None]
-
-            # Data ready event (for signaling data preparation complete)
+            # Data ready event (for signaling data preparation complete in forward)
             self._data_ready_event = None
 
-            # AllToAll completion event
+            # AllToAll completion event (for backward)
             self._alltoall_end_event = None
 
             # Compute sync event (for backward chunked operations)
@@ -99,19 +89,10 @@ class StreamManager:
             else:
                 raise RuntimeError("CUDA is not available")
 
-            # Create streams
-            self._compute_stream = torch.cuda.Stream(device=self._device)
+            # Create communication stream
             self._comm_stream = torch.cuda.Stream(device=self._device)
 
             # Create reusable events
-            self._p2p_events = [
-                torch.cuda.Event(),
-                torch.cuda.Event()
-            ]
-            self._compute_events = [
-                torch.cuda.Event(),
-                torch.cuda.Event()
-            ]
             self._data_ready_event = torch.cuda.Event()
             self._alltoall_end_event = torch.cuda.Event()
             self._compute_sync_event = torch.cuda.Event()
@@ -125,44 +106,26 @@ class StreamManager:
         return self._device
 
     @property
-    def compute_stream(self) -> torch.cuda.Stream:
-        """Get the compute stream for FC1, FC2, dW operations."""
-        self._ensure_initialized()
-        return self._compute_stream
-
-    @property
     def comm_stream(self) -> torch.cuda.Stream:
         """Get the communication stream for P2P and AllToAll operations."""
         self._ensure_initialized()
         return self._comm_stream
 
     @property
-    def p2p_events(self):
-        """Get ping-pong events for P2P synchronization."""
-        self._ensure_initialized()
-        return self._p2p_events
-
-    @property
-    def compute_events(self):
-        """Get ping-pong events for compute synchronization."""
-        self._ensure_initialized()
-        return self._compute_events
-
-    @property
     def data_ready_event(self) -> torch.cuda.Event:
-        """Get the data ready event."""
+        """Get the data ready event (for forward compute-comm sync)."""
         self._ensure_initialized()
         return self._data_ready_event
 
     @property
     def alltoall_end_event(self) -> torch.cuda.Event:
-        """Get the AllToAll completion event."""
+        """Get the AllToAll completion event (for backward)."""
         self._ensure_initialized()
         return self._alltoall_end_event
 
     @property
     def compute_sync_event(self) -> torch.cuda.Event:
-        """Get the compute sync event for chunked backward."""
+        """Get the compute sync event (for backward chunked operations)."""
         self._ensure_initialized()
         return self._compute_sync_event
 
@@ -184,20 +147,19 @@ class StreamManager:
 
     def sync_all(self):
         """
-        Synchronize all managed streams.
+        Synchronize the communication stream.
 
         This should be called at iteration boundaries (after backward, before next forward)
-        to ensure all work is complete.
+        to ensure all communication work is complete.
         """
         if not self._streams_initialized:
             return
 
-        self._compute_stream.synchronize()
         self._comm_stream.synchronize()
 
     def sync_to_current(self, device: Optional[torch.device] = None):
         """
-        Make current stream wait for both compute and comm streams.
+        Make current stream wait for comm stream.
 
         This is a lighter-weight alternative to sync_all() that doesn't block CPU.
         """
@@ -208,7 +170,6 @@ class StreamManager:
             device = self._device
 
         current = torch.cuda.current_stream(device)
-        current.wait_stream(self._compute_stream)
         current.wait_stream(self._comm_stream)
 
     def initialize(self, device: torch.device):
@@ -241,13 +202,9 @@ class StreamManager:
             if cls._instance is not None:
                 # Sync streams before destroying
                 if cls._instance._streams_initialized:
-                    cls._instance._compute_stream.synchronize()
                     cls._instance._comm_stream.synchronize()
 
-                cls._instance._compute_stream = None
                 cls._instance._comm_stream = None
-                cls._instance._p2p_events = [None, None]
-                cls._instance._compute_events = [None, None]
                 cls._instance._data_ready_event = None
                 cls._instance._alltoall_end_event = None
                 cls._instance._compute_sync_event = None

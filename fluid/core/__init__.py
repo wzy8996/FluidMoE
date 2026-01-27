@@ -4,6 +4,7 @@ Core module - Basic infrastructure for FluidMoE
 Contains:
 - comm: Communication primitives (AllToAll, P2P scheduling, overlap context)
 - scheduler: dW scheduler for backward pass
+- nvtx: NVIDIA Tools Extension for profiling
 """
 
 from .comm import (
@@ -19,12 +20,21 @@ from .comm import (
     get_num_rounds,
     # Overlap Context
     MultiCardOverlapContext,
-    AttentionMultiCardOverlapContext,
 )
 
 from .scheduler import (
     BackwardScheduler,
     get_backward_scheduler,
+)
+
+from .nvtx import (
+    nvtx_range,
+    nvtx_range_push,
+    nvtx_range_pop,
+    nvtx_mark,
+    nvtx_annotate,
+    Colors,
+    NVTX_ENABLED,
 )
 
 __all__ = [
@@ -40,8 +50,15 @@ __all__ = [
     'get_num_rounds',
     # Overlap Context
     'MultiCardOverlapContext',
-    'AttentionMultiCardOverlapContext',
     # Scheduler
     'BackwardScheduler',
     'get_backward_scheduler',
+    # NVTX Profiling
+    'nvtx_range',
+    'nvtx_range_push',
+    'nvtx_range_pop',
+    'nvtx_mark',
+    'nvtx_annotate',
+    'Colors',
+    'NVTX_ENABLED',
 ]

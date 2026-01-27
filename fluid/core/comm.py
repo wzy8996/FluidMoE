@@ -306,6 +306,8 @@ class MultiCardOverlapContext:
     统一管理 MoE 层和 Attention 层的通信重叠资源：
     - MoE: dispatch/combine 的多轮 P2P 通信
     - Attention: QKV sp2hp 和 hp2sp output projection 的 P2P 通信
+
+    使用全局 StreamManager 统一管理 stream，确保前向和反向使用相同的 stream。
     """
 
     def __init__(self, device: torch.device, ep_size: int, cp_size: int = None):
@@ -315,19 +317,16 @@ class MultiCardOverlapContext:
             ep_size: Expert Parallel size (MoE 通信)
             cp_size: Context Parallel size (Attention 通信，默认等于 ep_size)
         """
+        from fluid.core.stream import get_stream_manager
+
         self.device = device
         self.ep_size = ep_size
         self.cp_size = cp_size if cp_size is not None else ep_size
         self.num_rounds = ep_size - 1 if ep_size % 2 == 0 else ep_size
 
-        # 通信流（MoE 和 Attention 共用）
-        self.comm_stream = torch.cuda.Stream(device=device)
-
-        # 复用单个Event，用于计算-通信同步
-        self.data_ready_event = torch.cuda.Event()
-
-        # 复用ping-pong events，用于P2P pipeline同步（避免每次forward创建新event导致资源泄漏）
-        self.p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # 使用全局 StreamManager 统一管理 stream
+        self._stream_manager = get_stream_manager()
+        self._stream_manager.initialize(device)
 
         # 预计算调度表
         self.schedule = compute_round_robin_schedule(ep_size)
@@ -335,42 +334,21 @@ class MultiCardOverlapContext:
         # 缓存：my_rank的每轮partner
         self._partner_cache = {}
 
+    @property
+    def comm_stream(self) -> torch.cuda.Stream:
+        """通信流（从 StreamManager 获取）"""
+        return self._stream_manager.comm_stream
+
+    @property
+    def data_ready_event(self) -> torch.cuda.Event:
+        """数据就绪事件（从 StreamManager 获取）"""
+        return self._stream_manager.data_ready_event
+
     def get_partner(self, my_rank: int, round_idx: int) -> int:
         """获取指定轮次的partner（带缓存）"""
         cache_key = (my_rank, round_idx)
         if cache_key not in self._partner_cache:
             self._partner_cache[cache_key] = get_partner_for_round(my_rank, round_idx, self.ep_size)
-        return self._partner_cache[cache_key]
-
-    def get_stream(self) -> torch.cuda.Stream:
-        return self.comm_stream
-
-
-class AttentionMultiCardOverlapContext:
-    """注意力层多卡P2P通信的上下文管理（轻量级，仅用于Attention）"""
-
-    def __init__(self, device: torch.device, cp_size: int):
-        self.device = device
-        self.cp_size = cp_size
-        self.num_rounds = cp_size - 1 if cp_size % 2 == 0 else cp_size
-
-        # 通信流
-        self.comm_stream = torch.cuda.Stream(device=device)
-
-        # 复用单个Event，用于计算-通信同步
-        self.data_ready_event = torch.cuda.Event()
-
-        # 复用ping-pong events，用于P2P pipeline同步（避免每次forward创建新event导致资源泄漏）
-        self.p2p_events = [torch.cuda.Event(), torch.cuda.Event()]
-
-        # 预计算调度表
-        self.schedule = compute_round_robin_schedule(cp_size)
-        self._partner_cache = {}
-
-    def get_partner(self, my_rank: int, round_idx: int) -> int:
-        cache_key = (my_rank, round_idx)
-        if cache_key not in self._partner_cache:
-            self._partner_cache[cache_key] = get_partner_for_round(my_rank, round_idx, self.cp_size)
         return self._partner_cache[cache_key]
 
     def get_stream(self) -> torch.cuda.Stream:
@@ -390,5 +368,4 @@ __all__ = [
     'get_num_rounds',
     # Overlap Context
     'MultiCardOverlapContext',
-    'AttentionMultiCardOverlapContext',
 ]

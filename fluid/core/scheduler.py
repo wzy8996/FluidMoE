@@ -1,648 +1,374 @@
 """
-Global Backward Scheduler for Fine-grained Computation-Communication Overlap
+FluidMoE Backward Scheduler
 
-This scheduler implements a global backward pass optimization strategy:
-1. dX computation runs on the critical path
-2. When AlltoAll communication starts (EP or Ulysses), launch dW computations
-3. dW computations run on overlap stream while AlltoAll is in progress
-4. When one layer's dW finishes, continue with next layer's dW
-5. When AlltoAll finishes, continue with dX propagation
+Design:
+- dW overlaps with AllToAll (dW on default_stream, AllToAll on comm_stream)
+- AR submitted to unified comm queue, executed on comm_stream when idle
+- AllToAll has higher priority than AR in the queue
 
-Key Innovation:
-- Global scheduling across all layers (not per-layer optimization)
-- Dynamic dW queue management
-- Prioritize dX (critical path) while overlapping dW with communication
+Timeline:
+1. MoE/Attention backward: dX computed, dW registered (deferred)
+2. AllToAll submitted to comm_stream (high priority)
+3. dW executed on default_stream (overlaps with AllToAll)
+4. dW completion submits AR to comm queue (low priority)
+5. Comm thread processes queue: AllToAll first, then AR when idle
+6. At batch end: wait for all tasks to complete
 """
 
-import os
 import torch
-from typing import List, Optional, Callable, Tuple
-from collections import deque
+import torch.distributed as dist
+from typing import Optional, Callable, Any
+from dataclasses import dataclass
 import threading
+import queue
+from enum import IntEnum
 
-# Debug flag for scheduler verbose output
-_DEBUG_SCHEDULER = os.environ.get('FLUID_DEBUG_SCHEDULER', '0') == '1'
+
+class CommTaskType(IntEnum):
+    """Communication task priority (lower = higher priority)."""
+    ALLTOALL = 0  # Highest priority
+    ALLREDUCE = 1  # Lower priority
 
 
+@dataclass
+class CommTask:
+    """A communication task in the queue."""
+    task_type: CommTaskType
+    task_id: int
+    # For AllToAll
+    comm_fn: Optional[Callable] = None
+    done_event: Optional[threading.Event] = None
+    result_holder: Optional[list] = None  # [result, cuda_event]
+    # For AR
+    param: Optional[Any] = None
+
+    def __lt__(self, other):
+        """For priority queue ordering: by task_type first, then by task_id (FIFO)."""
+        if self.task_type != other.task_type:
+            return self.task_type < other.task_type
+        return self.task_id < other.task_id
+
+
+@dataclass
 class DWTask:
-    """Represents a single dW computation task"""
-
-    def __init__(
-        self,
-        layer_name: str,
-        layer_id: int,
-        compute_fn: Callable,
-        priority: int = 0,
-        weight_param: Optional[torch.nn.Parameter] = None,
-    ):
-        """
-        Args:
-            layer_name: Name of the layer (e.g., "layer_3_attention", "layer_5_moe")
-            layer_id: Layer index in the model
-            compute_fn: Function to execute dW computation (returns gradient tensor)
-            priority: Higher priority tasks run first (default: layer_id)
-            weight_param: Weight parameter to accumulate gradient into
-        """
-        self.layer_name = layer_name
-        self.layer_id = layer_id
-        self.compute_fn = compute_fn
-        self.priority = priority if priority > 0 else layer_id
-        self.weight_param = weight_param
-        self.completed = False
-        self.event: Optional[torch.cuda.Event] = None
+    """Deferred weight gradient computation task."""
+    layer_name: str
+    layer_id: int
+    compute_fn: Callable
+    weight_param: Optional[torch.nn.Parameter] = None
+    needs_ar: bool = True
 
 
 class BackwardScheduler:
-    """
-    Global backward scheduler that manages dX-dW overlap with AlltoAll communications
-
-    Singleton pattern to ensure only one scheduler exists per process.
-    """
-
+    """Singleton scheduler for backward pass compute-communication overlap."""
     _instance = None
-    _lock = threading.Lock()
 
-    def __init__(self):
-        # CUDA Streams
-        self.default_stream = torch.cuda.current_stream()  # dX and dW both use this!
-        self.comm_stream = torch.cuda.Stream()  # AlltoAll communication stream
-
-        # Stream architecture (User's requirement):
-        # - default_stream: dX and dW computation (sequential - share GPU compute)
-        # - comm_stream: AlltoAll communication (parallel - uses network, not GPU compute)
-        #
-        # Key insight:
-        # - dX and dW CANNOT run simultaneously (both need GPU compute)
-        # - AlltoAll (communication) and dW (compute) CAN overlap
-        # - dW fills the GPU idle time during AlltoAll
-
-        # Task queues
-        self.dw_queue: deque[DWTask] = deque()  # Pending dW tasks
-        self.active_dw_task: Optional[DWTask] = None  # Currently running dW task
-
-        # ============================================================
-        # Reusable CUDA Events (avoid repeated creation overhead)
-        # ============================================================
-        # Single reusable event for AllToAll completion tracking
-        # Only one AllToAll runs at a time during backward, so one event is sufficient
-        self._reusable_event = torch.cuda.Event()
-
-        # Reusable event for compute-to-comm synchronization in chunked backward
-        # Used by dispatch_backward, output_projection_backward_chunked, attention_backward_chunked
-        self._compute_sync_event = torch.cuda.Event()
-
-        # Reusable timing events (for dW task timing, if DEBUG enabled)
-        self._timing_event_start: Optional[torch.cuda.Event] = None
-        self._timing_event_end: Optional[torch.cuda.Event] = None
-        if _DEBUG_SCHEDULER:
-            self._timing_event_start = torch.cuda.Event(enable_timing=True)
-            self._timing_event_end = torch.cuda.Event(enable_timing=True)
-
-        # Communication tracking
-        self.comm_in_progress = False
-        self.alltoall_start_event: Optional[torch.cuda.Event] = None  # AlltoAll start marker
-        self.alltoall_end_event: Optional[torch.cuda.Event] = None  # AlltoAll completion marker
-
-        # Statistics
-        self.total_dw_tasks = 0
-        self.completed_dw_tasks = 0  # Total completed (overlap + finish_batch)
-        self.overlap_completed_dw_tasks = 0  # Only completed during overlap
-        self.finish_batch_completed_dw_tasks = 0  # Only completed in finish_batch
-        self.total_comm_time_ms = 0.0
-        self.total_dw_overlap_time_ms = 0.0
-
-        # Enable/disable flag
-        self.enabled = False
-
-        # Auto-finish mode: automatically call finish_batch() after each backward
-        # Suitable for single micro-batch per batch, or when using Megatron's
-        # built-in gradient accumulation
-        self.auto_finish = True  # Default: enabled for ease of use
-
-        # ============================================================
-        # Cross-layer QKV-Combine overlap context
-        # ============================================================
-        # Pending combine contexts: registered during combine forward,
-        # consumed by QKV backward to pre-launch AllToAll
-        self.pending_combine_contexts: List[dict] = []
-
-        # Pre-launched AllToAll results: launched by QKV backward,
-        # consumed by combine backward
-        self.prelaunched_combine_results: Optional[dict] = None
-
-    @classmethod
-    def get_instance(cls):
-        """Get the singleton instance"""
+    def __new__(cls):
         if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = cls()
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
         return cls._instance
 
-    @classmethod
-    def reset(cls):
-        """Reset the scheduler (useful for testing or between training runs)"""
-        with cls._lock:
-            if cls._instance is not None:
-                cls._instance._reset_internal()
-                cls._instance = None
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
 
-    def _reset_internal(self):
-        """Internal reset method"""
-        self.dw_queue.clear()
-        self.active_dw_task = None
-        self.comm_in_progress = False
-        self.total_dw_tasks = 0
-        self.completed_dw_tasks = 0
-        self.overlap_completed_dw_tasks = 0
-        self.finish_batch_completed_dw_tasks = 0
+        self.enabled = False
+        self.default_stream = None
+        self.comm_stream = None
 
-    def clear_iteration(self):
-        """
-        Clear the queue and stats for a new iteration while keeping the scheduler enabled.
+        # dW queue
+        self._dw_queue = []
 
-        Use this between benchmark iterations instead of reset() to avoid
-        destroying the singleton and losing the enabled state.
-        """
-        self.dw_queue.clear()
-        self.active_dw_task = None
-        self.comm_in_progress = False
-        self.total_dw_tasks = 0
-        self.completed_dw_tasks = 0
-        self.overlap_completed_dw_tasks = 0
-        self.finish_batch_completed_dw_tasks = 0
-        self.pending_combine_contexts.clear()
-        self.prelaunched_combine_results = None
+        # Unified communication queue (priority queue: AllToAll > AR)
+        self._comm_queue = queue.PriorityQueue()
+        self._comm_thread = None
+        self._comm_thread_stop = False
+        self._device = None
+
+        # AR state
+        self._ar_completed = set()
+        self._ar_completed_lock = threading.Lock()
+        self._ar_pending_count = 0
+        self._ar_done_event = threading.Event()
+        self._in_finish_batch = False
+        self._ar_task_id = 0
+
+        # AllToAll state
+        self._alltoall_task_id = 0
+        self._alltoall_in_progress = 0
+        self._alltoall_results = {}
+
+        # AR config
+        self.ar_enabled = False
+        self.dp_group = None
+        self.dp_world_size = 1
+
+        # Stats
+        self.total_dw = 0
+        self.completed_dw = 0
+        self.total_ar = 0
+        self.completed_ar = 0
+        self.ar_during_gap = 0
+
+        self._init_cuda()
+
+    def _init_cuda(self):
+        if torch.cuda.is_available():
+            self._device = torch.cuda.current_device()
+            self.default_stream = torch.cuda.default_stream()
+            self.comm_stream = torch.cuda.Stream()
 
     def enable(self):
-        """Enable the scheduler"""
         self.enabled = True
 
     def disable(self):
-        """Disable the scheduler"""
         self.enabled = False
 
-    def is_enabled(self) -> bool:
-        """Check if scheduler is enabled"""
+    def is_enabled(self):
         return self.enabled
 
-    def register_dw_task(
-        self,
-        layer_name: str,
-        layer_id: int,
-        compute_fn: Callable,
-        priority: Optional[int] = None,
-        weight_param: Optional[torch.nn.Parameter] = None,
-    ):
-        """
-        Register a dW computation task to be executed during communication overlap
+    def configure_allreduce(self, enabled=True, dp_group=None, **kwargs):
+        """Configure AllReduce settings."""
+        self.ar_enabled = enabled
+        self.dp_group = dp_group
+        self.dp_world_size = dist.get_world_size(dp_group) if dp_group else (
+            dist.get_world_size() if dist.is_initialized() else 1)
 
-        FIFO scheduling: Tasks execute in registration order (backward pass order).
-        Priority parameter is ignored but kept for API compatibility.
+        if torch.cuda.is_available():
+            self._device = torch.cuda.current_device()
 
-        Args:
-            layer_name: Name of the layer
-            layer_id: Layer index
-            compute_fn: Function that computes dW (takes no args, returns gradient tensor)
-            priority: (Ignored) Kept for API compatibility
-            weight_param: Weight parameter to accumulate gradient into
-        """
-        if not self.enabled:
-            if os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1':
-                print(f"[DEBUG] register_dw_task({layer_name}) skipped: scheduler not enabled", flush=True)
-            return
+        if enabled and self._comm_thread is None:
+            self._start_comm_thread()
 
-        task = DWTask(
-            layer_name=layer_name,
-            layer_id=layer_id,
-            compute_fn=compute_fn,
-            priority=0,  # Not used in FIFO mode
-            weight_param=weight_param,
-        )
-        self.dw_queue.append(task)
-        self.total_dw_tasks += 1
+    def _start_comm_thread(self):
+        """Start unified communication thread."""
+        self._comm_thread_stop = False
+        self._comm_thread = threading.Thread(target=self._comm_thread_worker, daemon=True)
+        self._comm_thread.start()
 
-        # Debug: print registered tasks
-        if _DEBUG_SCHEDULER or os.environ.get('FLUID_DEBUG_DW_TASKS', '0') == '1':
-            print(f"[DEBUG-DW] Task #{self.total_dw_tasks}: {layer_name} (layer_id={layer_id})", flush=True)
+    def _stop_comm_thread(self):
+        """Stop communication thread."""
+        if self._comm_thread is not None:
+            self._comm_thread_stop = True
+            self._comm_queue.put(CommTask(CommTaskType.ALLTOALL, -1))
+            self._comm_thread.join(timeout=5.0)
+            self._comm_thread = None
 
-    def set_auto_finish(self, enabled: bool):
-        """
-        Enable or disable auto-finish mode.
+    def _comm_thread_worker(self):
+        """Unified communication thread: process AllToAll and AR by priority."""
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
 
-        Args:
-            enabled: If True, automatically call finish_batch() when backward ends
-        """
-        self.auto_finish = enabled
-        if _DEBUG_SCHEDULER:
-            print(f"[BackwardScheduler] Auto-finish mode: {'enabled' if enabled else 'disabled'}")
+        while not self._comm_thread_stop:
+            try:
+                task = self._comm_queue.get(timeout=0.001)
+            except queue.Empty:
+                continue
 
-    def on_alltoall_start(self, comm_type: str = "unknown"):
-        """
-        Called when AlltoAll communication is running on comm_stream
-
-        Strategy (User's requirement - NOW ACHIEVABLE!):
-        Since AlltoAll is on comm_stream and we have end_event recorded:
-        1. Execute dW tasks incrementally on default_stream
-        2. After each dW block, check if AlltoAll has completed (via event)
-        3. If AlltoAll completed → stop dW, return to continue dX
-        4. If AlltoAll not completed → continue next dW block
-
-        This achieves true incremental overlap: dW (GPU) || AlltoAll (network)
-
-        Args:
-            comm_type: "ep" for Expert Parallel, "ulysses" for Context Parallel
-        """
-        if not self.enabled:
-            return
-
-        self.comm_in_progress = True
-
-        queue_before = len(self.dw_queue)
-
-        # Execute dW tasks incrementally with AlltoAll completion checking
-        self._launch_dw_tasks_incremental()
-
-        queue_after = len(self.dw_queue)
-        tasks_executed = queue_before - queue_after
-
-        if _DEBUG_SCHEDULER and tasks_executed > 0:
-            print(f"[Scheduler] {comm_type}: executed {tasks_executed} dW tasks (queue: {queue_before} -> {queue_after})")
-
-        self.comm_in_progress = False
-
-    def get_reusable_event(self) -> torch.cuda.Event:
-        """
-        Get the reusable CUDA event for AllToAll completion tracking.
-
-        This avoids the overhead of creating new events for each AllToAll.
-        Since only one AllToAll runs at a time during backward, a single
-        reusable event is sufficient.
-
-        Returns:
-            The reusable CUDA event
-        """
-        return self._reusable_event
-
-    def get_compute_sync_event(self) -> torch.cuda.Event:
-        """
-        Get the reusable CUDA event for compute-to-comm synchronization.
-
-        This is used by chunked backward functions (dispatch_backward,
-        output_projection_backward_chunked, attention_backward_chunked) to
-        synchronize compute completion before submitting communication.
-
-        Returns:
-            The compute sync CUDA event
-        """
-        return self._compute_sync_event
-
-    def set_alltoall_end_event(self, event: torch.cuda.Event):
-        """
-        Set the AlltoAll completion event (called by wrapper after AlltoAll finishes)
-
-        Args:
-            event: CUDA event recorded after AlltoAll completes on comm_stream
-        """
-        self.alltoall_end_event = event
-
-    def record_alltoall_end(self, stream: torch.cuda.Stream) -> torch.cuda.Event:
-        """
-        Record AllToAll completion using a reusable event.
-
-        This is a convenience method that combines get_reusable_event(),
-        record(), and set_alltoall_end_event() into one call.
-
-        Args:
-            stream: The CUDA stream where AllToAll is running
-
-        Returns:
-            The recorded event (for chaining if needed)
-        """
-        event = self.get_reusable_event()
-        event.record(stream)
-        self.alltoall_end_event = event
-        return event
-
-    def on_alltoall_end(self):
-        """
-        Called when an AlltoAll communication completes (optional)
-
-        Note: We DON'T wait for dW to complete here!
-        Remaining dW will overlap with subsequent AlltoAll operations.
-        """
-        if not self.enabled:
-            return
-
-        # Don't synchronize! Let dW continue running
-        # It will overlap with the next layer's AlltoAll
-        pass
-
-    def _is_alltoall_complete(self) -> bool:
-        """
-        Check if AlltoAll communication has completed (non-blocking)
-
-        Returns:
-            True if AlltoAll has completed, False otherwise
-        """
-        if self.alltoall_end_event is None:
-            # No event recorded yet, assume not started
-            return False
-
-        # Non-blocking query
-        return self.alltoall_end_event.query()
-
-    def _launch_dw_tasks_incremental(self):
-        """
-        Execute dW tasks incrementally on default_stream, checking AlltoAll
-        completion after each block
-
-        Strategy (User's requirement):
-        1. Sort tasks by priority (higher priority first)
-        2. Execute dW tasks ONE BY ONE on default_stream
-        3. After each dW task completes, check if AlltoAll has finished
-        4. If AlltoAll completed → stop dW execution, return to continue dX
-        5. If AlltoAll not completed → continue next dW task
-
-        Key insight:
-        - dW and dX both use GPU compute (sequential on default_stream)
-        - AlltoAll uses network (on comm_stream, parallel with dW)
-        - dW fills GPU idle time during AlltoAll
-        """
-        if not self.dw_queue:
-            return
-
-        # Goal: hide AllToAll communication under dW compute
-        # Execute dW tasks until AllToAll completes or queue is empty
-        tasks_executed = 0
-        while self.dw_queue:
-            # Check if AllToAll has completed - if so, stop to continue dX
-            if tasks_executed > 0 and self._is_alltoall_complete():
+            if task.task_id == -1:  # Sentinel
                 break
 
-            # Get next task
-            task = self.dw_queue.popleft()
-            self.active_dw_task = task
+            if task.task_type == CommTaskType.ALLTOALL:
+                with torch.cuda.stream(self.comm_stream):
+                    result = task.comm_fn()
+                    cuda_event = torch.cuda.Event()
+                    cuda_event.record(self.comm_stream)
 
-            # Optional timing (only when DEBUG enabled, uses reusable events)
-            if _DEBUG_SCHEDULER and self._timing_event_start is not None:
-                self._timing_event_start.record(self.default_stream)
+                task.result_holder[0] = result
+                task.result_holder[1] = cuda_event
+                task.done_event.set()
+                self._alltoall_in_progress -= 1
 
+            elif task.task_type == CommTaskType.ALLREDUCE:
+                param = task.param
+                param_id = id(param)
+
+                with self._ar_completed_lock:
+                    if param_id in self._ar_completed or param.grad is None:
+                        self._ar_pending_count -= 1
+                        if self._ar_pending_count == 0:
+                            self._ar_done_event.set()
+                        continue
+
+                with torch.cuda.stream(self.comm_stream):
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.dp_group)
+                    param.grad.div_(self.dp_world_size)
+
+                with self._ar_completed_lock:
+                    self._ar_completed.add(param_id)
+                    self.total_ar += 1
+                    self.completed_ar += 1
+                    if not self._in_finish_batch:
+                        self.ar_during_gap += 1
+                    self._ar_pending_count -= 1
+                    if self._ar_pending_count == 0:
+                        self._ar_done_event.set()
+
+    # ========================================
+    # dW Tasks
+    # ========================================
+    def register_dw_task(self, layer_name, layer_id, compute_fn, weight_param=None, needs_ar=True, **kwargs):
+        """Register a deferred dW task."""
+        if not self.enabled:
+            return
+        self._dw_queue.append(DWTask(layer_name, layer_id, compute_fn, weight_param, needs_ar))
+        self.total_dw += 1
+
+    def execute_dw_tasks(self):
+        """Execute dW tasks. After dW completes, submit AR to comm queue."""
+        while self._dw_queue:
+            task = self._dw_queue.pop(0)
+            grad_weight = task.compute_fn()
+
+            if task.weight_param is not None and grad_weight is not None:
+                if task.weight_param.grad is None:
+                    task.weight_param.grad = grad_weight.clone()
+                else:
+                    task.weight_param.grad.add_(grad_weight)
+
+                if task.needs_ar and self.ar_enabled:
+                    param = task.weight_param
+                    param_id = id(param)
+
+                    with self._ar_completed_lock:
+                        if param_id not in self._ar_completed:
+                            self._ar_pending_count += 1
+                            self._ar_done_event.clear()
+
+                    ar_task = CommTask(
+                        task_type=CommTaskType.ALLREDUCE,
+                        task_id=self._ar_task_id,
+                        param=param,
+                    )
+                    self._ar_task_id += 1
+                    self._comm_queue.put(ar_task)
+
+            self.completed_dw += 1
+
+    # ========================================
+    # AllToAll
+    # ========================================
+    def submit_alltoall(self, comm_fn: Callable) -> int:
+        """Submit AllToAll to comm queue (high priority)."""
+        if not self.enabled:
+            return comm_fn()
+
+        task_id = self._alltoall_task_id
+        self._alltoall_task_id += 1
+        self._alltoall_in_progress += 1
+
+        done_event = threading.Event()
+        result_holder = [None, None]
+
+        input_event = torch.cuda.Event()
+        input_event.record(self.default_stream)
+
+        def wrapped_fn():
+            self.comm_stream.wait_event(input_event)
+            return comm_fn()
+
+        task = CommTask(
+            task_type=CommTaskType.ALLTOALL,
+            task_id=task_id,
+            comm_fn=wrapped_fn,
+            done_event=done_event,
+            result_holder=result_holder,
+        )
+        self._comm_queue.put(task)
+        self._alltoall_results[task_id] = (done_event, result_holder)
+
+        return task_id
+
+    def wait_alltoall(self, task_id: int, num_tasks: int = 1) -> Any:
+        """Wait for AllToAll to complete."""
+        if not self.enabled:
+            return None
+
+        task_data = self._alltoall_results.get(task_id)
+        if task_data is None:
+            return None
+
+        done_event, result_holder = task_data
+        done_event.wait()
+        result = result_holder[0]
+        cuda_event = result_holder[1]
+        if cuda_event is not None:
+            self.default_stream.wait_event(cuda_event)
+
+        del self._alltoall_results[task_id]
+        return result
+
+    # ========================================
+    # Iteration management
+    # ========================================
+    def clear_iteration(self):
+        """Clear state for new iteration."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        self._dw_queue.clear()
+        while not self._comm_queue.empty():
             try:
-                # Execute dW computation - returns gradient tensor
-                grad_weight = task.compute_fn()
+                self._comm_queue.get_nowait()
+            except queue.Empty:
+                break
 
-                # DEBUG: Print dW norm for MoE experts
-                if os.environ.get('FLUID_DEBUG_DW_NORM', '0') == '1' and 'moe_expert' in task.layer_name:
-                    print(f"[Scheduler] {task.layer_name} grad norm: {grad_weight.norm().item():.6f}", flush=True)
+        with self._ar_completed_lock:
+            self._ar_completed.clear()
+            self._ar_pending_count = 0
+        self._ar_done_event.set()
+        self._alltoall_results.clear()
+        self._alltoall_in_progress = 0
+        self._alltoall_task_id = 0
+        self._ar_task_id = 0
+        self._in_finish_batch = False
 
-                # Accumulate gradient into weight parameter
-                # Note: clone() when setting to match PyTorch autograd behavior
-                if task.weight_param is not None and grad_weight is not None:
-                    if task.weight_param.grad is None:
-                        task.weight_param.grad = grad_weight.clone()
-                    else:
-                        task.weight_param.grad.add_(grad_weight)
-
-            except Exception as e:
-                # If dW computation fails, log but continue
-                if _DEBUG_SCHEDULER:
-                    print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
-                continue
-
-            # Optional timing end (only when DEBUG enabled)
-            if _DEBUG_SCHEDULER and self._timing_event_end is not None:
-                self._timing_event_end.record(self.default_stream)
-                task.event = self._timing_event_end
-
-            task.completed = True
-            self.completed_dw_tasks += 1
-            self.overlap_completed_dw_tasks += 1  # Count as overlap completion
-            tasks_executed += 1
-
-            # After this dW block completes, loop will check AlltoAll status again
-
-        self.active_dw_task = None
+        self.total_dw = 0
+        self.completed_dw = 0
+        self.total_ar = 0
+        self.completed_ar = 0
+        self.ar_during_gap = 0
 
     def finish_batch(self):
-        """
-        Finish all remaining dW tasks at the end of a batch.
-
-        This ensures mathematical correctness by computing all pending gradients
-        before optimizer.step(). Should be called after backward() completes
-        for the entire batch (all micro-batches).
-
-        Design:
-        - During micro-batches: dW tasks can remain in queue and overlap with
-          subsequent micro-batch communications (cross micro-batch overlap)
-        - End of batch: All remaining dW tasks must be completed synchronously
-        """
+        """Finish batch: execute remaining dW, wait for comm thread to complete, sync."""
         if not self.enabled:
             return
 
-        if not self.dw_queue:
-            return
+        self._in_finish_batch = True
+        self.execute_dw_tasks()
 
-        remaining = len(self.dw_queue)
-        if _DEBUG_SCHEDULER:
-            print(f"[BackwardScheduler] Batch finished, completing {remaining} remaining dW tasks")
+        if self._comm_thread is not None and self.ar_enabled:
+            self._ar_done_event.wait(timeout=10.0)
 
-        # Execute all remaining tasks synchronously
-        while self.dw_queue:
-            task = self.dw_queue.popleft()
+        if torch.cuda.is_available():
+            self.comm_stream.synchronize()
+            torch.cuda.synchronize()
 
-            try:
-                # Execute dW computation
-                grad_weight = task.compute_fn()
+        with self._ar_completed_lock:
+            self._ar_completed.clear()
+            self._ar_pending_count = 0
+        self._ar_done_event.set()
+        self._in_finish_batch = False
 
-                # Accumulate gradient into weight parameter
-                # Note: clone() when setting to match PyTorch autograd behavior
-                if task.weight_param is not None and grad_weight is not None:
-                    if task.weight_param.grad is None:
-                        task.weight_param.grad = grad_weight.clone()
-                    else:
-                        task.weight_param.grad.add_(grad_weight)
-
-                if _DEBUG_SCHEDULER:
-                    print(f"[BackwardScheduler] Completed remaining dW: {task.layer_name}")
-            except Exception as e:
-                if _DEBUG_SCHEDULER:
-                    print(f"[BackwardScheduler] Warning: Failed to complete dW {task.layer_name}: {e}")
-                continue
-
-            task.completed = True
-            self.completed_dw_tasks += 1
-            self.finish_batch_completed_dw_tasks += 1  # Count as finish_batch completion
-
-        if _DEBUG_SCHEDULER:
-            print(f"[BackwardScheduler] All {remaining} remaining dW tasks completed")
-
-    def _execute_all_dw_tasks_sync(self) -> int:
-        """
-        Execute all pending dW tasks synchronously on default_stream.
-
-        This is used by TRUE ASYNC mode where dW runs in parallel with AllToAll.
-        Unlike _launch_dw_tasks_incremental(), this does NOT poll AllToAll status.
-
-        Returns:
-            Number of dW tasks executed
-        """
-        if not self.enabled:
-            return 0
-
-        tasks_executed = 0
-
-        while self.dw_queue:
-            task = self.dw_queue.popleft()
-            self.active_dw_task = task
-
-            try:
-                # Execute dW computation on default_stream
-                grad_weight = task.compute_fn()
-
-                # Accumulate gradient into weight parameter
-                # Note: clone() when setting to match PyTorch autograd behavior
-                if task.weight_param is not None and grad_weight is not None:
-                    if task.weight_param.grad is None:
-                        task.weight_param.grad = grad_weight.clone()
-                    else:
-                        task.weight_param.grad.add_(grad_weight)
-
-            except Exception as e:
-                if _DEBUG_SCHEDULER:
-                    print(f"[BackwardScheduler] Warning: dW task {task.layer_name} failed: {e}")
-                continue
-
-            task.completed = True
-            self.completed_dw_tasks += 1
-            self.overlap_completed_dw_tasks += 1  # Count as overlap completion
-            tasks_executed += 1
-
-        self.active_dw_task = None
-        return tasks_executed
-
-    # ============================================================
-    # Cross-layer QKV-Combine overlap methods
-    # ============================================================
-
-    def register_combine_context(
-        self,
-        output_splits: List[int],
-        input_splits: List[int],
-        group,
-        permutation_map: torch.Tensor,
-        permuted_probs: Optional[torch.Tensor] = None,
-    ):
-        """
-        Register combine context during combine forward.
-        This will be consumed by QKV backward to pre-launch AllToAll.
-
-        Args:
-            output_splits: AllToAll output splits (backward input)
-            input_splits: AllToAll input splits (backward output)
-            group: Process group
-            permutation_map: Token permutation map
-            permuted_probs: Permuted probs for gradient scaling
-        """
-        if not self.enabled:
-            return
-
-        ctx = {
-            'output_splits': output_splits,
-            'input_splits': input_splits,
-            'group': group,
-            'permutation_map': permutation_map,
-            'permuted_probs': permuted_probs,
-        }
-        self.pending_combine_contexts.append(ctx)
-
-    def get_pending_combine_context(self) -> Optional[dict]:
-        """
-        Get the next pending combine context (LIFO order - stack).
-
-        Why LIFO: Forward registers contexts as Layer 0, 1, ..., N.
-        Backward processes Layer N first, then N-1, etc.
-        Layer N's QKV backward should pre-launch for Layer N-1's combine.
-        With LIFO, after Layer N's combine pops its own context (N),
-        the next pop() returns N-1's context for Layer N's QKV to use.
-
-        Returns None if no context is pending.
-        """
-        if not self.enabled or not self.pending_combine_contexts:
-            return None
-        return self.pending_combine_contexts.pop()  # LIFO - pop from end
-
-    def set_prelaunched_combine_results(
-        self,
-        results: List[torch.Tensor],
-        events: List[torch.cuda.Event],
-    ):
-        """
-        Store pre-launched AllToAll results from QKV backward.
-
-        Args:
-            results: List of AllToAll result chunks (hidden dim chunks)
-            events: List of events marking each chunk's completion
-        """
-        self.prelaunched_combine_results = {
-            'results': results,
-            'events': events,
-        }
-
-    def get_prelaunched_combine_results(self) -> Optional[dict]:
-        """
-        Get pre-launched combine results. Returns None if not available.
-        Clears the storage after retrieval.
-        """
-        results = self.prelaunched_combine_results
-        self.prelaunched_combine_results = None
-        return results
-
-    def clear_combine_context(self):
-        """Clear all pending combine contexts (called at batch boundary)."""
-        self.pending_combine_contexts.clear()
-        self.prelaunched_combine_results = None
-
-    def get_stats(self) -> dict:
-        """
-        Get scheduler statistics
-
-        Returns:
-            dict with keys:
-                - total_dw_tasks: Total number of dW tasks registered
-                - completed_dw_tasks: Number of completed dW tasks
-                - total_comm_time_ms: Total AlltoAll communication time
-                - total_dw_overlap_time_ms: Total dW computation time during overlap
-                - overlap_efficiency: Ratio of dW time to comm time (ideally ~1.0)
-        """
-        overlap_efficiency = 0.0
-        if self.total_comm_time_ms > 0:
-            overlap_efficiency = self.total_dw_overlap_time_ms / self.total_comm_time_ms
-
+    def get_stats(self):
+        """Get scheduler statistics."""
         return {
-            'total_dw_tasks': self.total_dw_tasks,
-            'completed_dw_tasks': self.completed_dw_tasks,
-            'overlap_completed_dw_tasks': self.overlap_completed_dw_tasks,
-            'finish_batch_completed_dw_tasks': self.finish_batch_completed_dw_tasks,
-            'pending_dw_tasks': len(self.dw_queue),
-            'total_comm_time_ms': self.total_comm_time_ms,
-            'total_dw_overlap_time_ms': self.total_dw_overlap_time_ms,
-            'overlap_efficiency': overlap_efficiency,
+            'total_dw_tasks': self.total_dw,
+            'completed_dw_tasks': self.completed_dw,
+            'total_ar_tasks': self.total_ar,
+            'completed_ar_tasks': self.completed_ar,
+            'ar_during_gap': self.ar_during_gap,
+            'ar_at_end': self.completed_ar - self.ar_during_gap,
         }
 
-    def print_stats(self):
-        """Print scheduler statistics"""
-        stats = self.get_stats()
-        print(f"[BackwardScheduler] Statistics:")
-        print(f"  Total dW tasks: {stats['total_dw_tasks']}")
-        print(f"  Completed dW tasks: {stats['completed_dw_tasks']}")
-        print(f"  Pending dW tasks: {stats['pending_dw_tasks']}")
-        print(f"  Total comm time: {stats['total_comm_time_ms']:.2f} ms")
-        print(f"  Total dW overlap time: {stats['total_dw_overlap_time_ms']:.2f} ms")
-        print(f"  Overlap efficiency: {stats['overlap_efficiency']:.2%}")
+    @classmethod
+    def reset(cls):
+        """Reset singleton instance."""
+        cls._instance = None
 
 
-# Global scheduler instance accessor
 def get_backward_scheduler() -> BackwardScheduler:
-    """Get the global backward scheduler instance"""
-    return BackwardScheduler.get_instance()
+    """Get the singleton scheduler instance."""
+    return BackwardScheduler()

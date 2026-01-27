@@ -30,8 +30,6 @@ Key design principles:
 
 from .forward import (
     router_forward,
-    compute_fc1_act_per_source,
-    compute_fc2_per_source,
     merge_tokens_expert_major,
     precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
@@ -41,18 +39,14 @@ from .backward import (
     recompute_fc1,
     register_moe_dw_tasks,
     combine_backward,
-    expert_backward,
-    dispatch_backward,
+    expert_dispatch_backward,
     router_backward,
     register_router_dw_task,
 )
 
 __all__ = [
-    # Router forward
-    'router_forward',
     # Forward operations (P2P overlap)
-    'compute_fc1_act_per_source',
-    'compute_fc2_per_source',
+    'router_forward',
     'merge_tokens_expert_major',
     'precompute_backward_sort_indices',
     'dispatch_fc1_p2p_forward',
@@ -61,9 +55,7 @@ __all__ = [
     'recompute_fc1',
     'register_moe_dw_tasks',
     'combine_backward',
-    'expert_backward',
-    'dispatch_backward',
-    # Router backward
+    'expert_dispatch_backward',
     'router_backward',
     'register_router_dw_task',
 ]

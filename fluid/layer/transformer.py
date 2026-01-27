@@ -5,6 +5,7 @@ Single autograd.Function for complete Transformer layer (Attention + MoE).
 Minimizes Python overhead by combining all operations into one Function.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,9 +37,7 @@ from fluid.attention.backward import (
 )
 from fluid.moe.backward import (
     combine_backward,
-    expert_backward,
-    register_moe_dw_tasks,
-    dispatch_backward,
+    expert_dispatch_backward,
     router_backward,
     register_router_dw_task,
 )
@@ -81,7 +80,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         num_kv_heads: int,
         num_experts: int,
         top_k: int,
-        num_chunks: int,
+        # Chunk configs for different backward passes
+        attn_proj_chunks: int,  # output projection backward (sp2hp)
+        attn_qkv_chunks: int,   # attention/qkv backward (hp2sp)
+        moe_chunks: int,        # MoE dispatch backward
         activation_func: Callable,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
@@ -167,38 +169,31 @@ class TransformerLayerFunction(torch.autograd.Function):
         ln2_flat = ln2_out.view(-1, hidden_size)
         num_tokens = ln2_flat.shape[0]
 
-        # Router forward
+        # Router forward (AllGather for tokens_per_expert_2d removed - metadata piggybacked on P2P)
         (permuted_tokens, permuted_probs, restore_indices, sorted_indices,
-         input_splits, output_splits, tokens_per_expert, tokens_per_expert_2d,
+         input_splits, output_splits, tokens_per_expert,
          router_probs, top_indices, router_logits) = router_forward(
             ln2_flat, router_weight, num_experts, top_k, ep_group
         )
 
-        # Compute num_global_tokens_per_local_expert
-        local_start_expert = my_ep_rank * num_local_experts
-        num_global_tokens_per_local_expert = tokens_per_expert_2d[
-            :, local_start_expert:local_start_expert + num_local_experts
-        ].unsqueeze(0)
-
         input_splits_list = input_splits.tolist()
         output_splits_list = output_splits.tolist()
 
-        # Dispatch + FC1 with P2P overlap
+        # Dispatch + FC1 with P2P overlap (tokens_cpu built from P2P metadata)
         (local_tokens, local_act, recv_act_results, recv_buffers,
-         moe_partners, recv_offsets) = dispatch_fc1_p2p_forward(
+         moe_partners, recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
-            num_global_tokens_per_local_expert, needs_backward=needs_grad,
+            tokens_per_expert, needs_backward=needs_grad,
         )
 
-        # FC2 + Combine with P2P overlap
+        # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
         (combined_output, local_fc2, all_expert_tokens,
          all_tokens_per_expert, backward_indices) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
             moe_w2_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, num_local_experts,
-            num_global_tokens_per_local_expert, moe_partners,
-            needs_backward=needs_grad,
+            moe_partners, tokens_cpu, needs_backward=needs_grad,
         )
 
         # Apply probs and restore order
@@ -234,6 +229,10 @@ class TransformerLayerFunction(torch.autograd.Function):
                 router_weight.detach(), moe_w1.detach(), moe_w2.detach(),
             )
             # Store original weights for gradient assignment
+            ctx._orig_ln1_weight = ln1_weight
+            ctx._orig_ln1_bias = ln1_bias
+            ctx._orig_ln2_weight = ln2_weight
+            ctx._orig_ln2_bias = ln2_bias
             ctx._orig_qkv_weight = qkv_weight
             ctx._orig_proj_weight = proj_weight
             ctx._orig_router_weight = router_weight
@@ -248,7 +247,9 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.num_kv_heads = num_kv_heads
             ctx.num_experts = num_experts
             ctx.top_k = top_k
-            ctx.num_chunks = num_chunks
+            ctx.attn_proj_chunks = attn_proj_chunks
+            ctx.attn_qkv_chunks = attn_qkv_chunks
+            ctx.moe_chunks = moe_chunks
             ctx.activation_func = activation_func
             ctx.num_local_experts = num_local_experts
             ctx.head_dim = head_dim
@@ -273,7 +274,7 @@ class TransformerLayerFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass with P2P overlap and dW scheduling."""
         if not ctx.needs_grad:
-            return (None,) * 21
+            return (None,) * 23  # 10 weights + 4 groups/contexts + 9 config params
 
         # Retrieve saved tensors
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
@@ -292,7 +293,9 @@ class TransformerLayerFunction(torch.autograd.Function):
         num_kv_heads = ctx.num_kv_heads
         num_experts = ctx.num_experts
         top_k = ctx.top_k
-        num_chunks = ctx.num_chunks
+        attn_proj_chunks = ctx.attn_proj_chunks
+        attn_qkv_chunks = ctx.attn_qkv_chunks
+        moe_chunks = ctx.moe_chunks
         activation_func = ctx.activation_func
         num_local_experts = ctx.num_local_experts
         head_dim = ctx.head_dim
@@ -309,6 +312,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         hidden_size = ctx.hidden_size
         num_tokens = ctx.num_tokens
 
+        orig_ln1_weight = ctx._orig_ln1_weight
+        orig_ln1_bias = ctx._orig_ln1_bias
+        orig_ln2_weight = ctx._orig_ln2_weight
+        orig_ln2_bias = ctx._orig_ln2_bias
         orig_qkv_weight = ctx._orig_qkv_weight
         orig_proj_weight = ctx._orig_proj_weight
         orig_router_weight = ctx._orig_router_weight
@@ -318,12 +325,17 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler = get_backward_scheduler()
         dtype = hidden_states.dtype
         device = grad_output.device
+        cp_size = cp_group.size()
 
         # MoE weights are already 3D: [num_local_experts, hidden/ffn, ffn/hidden]
         moe_w1 = moe_w1_2d  # Already in shape [E, hidden, ffn]
         moe_w2 = moe_w2_2d  # Already in shape [E, ffn, hidden]
 
-        num_chunks_actual = num_chunks if scheduler.is_enabled() else 1
+        # Compute actual chunk values (1 if scheduler disabled)
+        is_enabled = scheduler.is_enabled()
+        attn_proj_chunks_actual = attn_proj_chunks if is_enabled else 1
+        attn_qkv_chunks_actual = attn_qkv_chunks if is_enabled else 1
+        moe_chunks_actual = moe_chunks if is_enabled else 1
 
         # =====================================================================
         # MoE Backward (reverse order)
@@ -361,33 +373,21 @@ class TransformerLayerFunction(torch.autograd.Function):
         else:
             grad_all_fc2 = grad_combined_recv
 
-        # Step 5: Expert backward computation
-        compute_dx = (num_chunks_actual == 1)
-        grad_all_fc1, act_output, grad_all_tokens = expert_backward(
-            grad_all_fc2, all_fc1, moe_w1, moe_w2,
-            activation_func, num_local_experts, all_tokens_per_expert,
-            compute_dx=compute_dx
-        )
-
-        # Step 6: Register dW tasks for expert weights
-        grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
-            moe_w1, moe_w2, all_expert_tokens, act_output,
-            grad_all_fc2, grad_all_fc1,
-            num_local_experts, all_tokens_per_expert, layer_id,
-            orig_moe_w1, orig_moe_w2
-        )
-
-        # Step 7: Dispatch Backward AllToAll
+        # Step 5-7: Combined expert backward + dW registration + dispatch AllToAll
+        # This computes grad_fc1, registers dW tasks, then dX with chunking overlapped with AllToAll
         split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
         sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
 
-        grad_permuted_tokens = dispatch_backward(
-            grad_all_fc1, moe_w1,
+        grad_all_fc1, act_output, grad_permuted_tokens, grad_moe_w1, grad_moe_w2 = expert_dispatch_backward(
+            grad_all_fc2, all_fc1, moe_w1, moe_w2,
+            activation_func, num_local_experts, all_tokens_per_expert,
             split_sizes_exp_major, sorted_idxs_exp_to_rank,
-            all_tokens_per_expert, input_splits_list, output_splits_list,
-            ep_group, layer_id=layer_id, num_chunks=num_chunks_actual,
-            grad_all_tokens=grad_all_tokens,
-            comm_stream=scheduler.comm_stream if scheduler.is_enabled() else None,
+            input_splits_list, output_splits_list, ep_group,
+            layer_id=layer_id, num_chunks=moe_chunks_actual,
+            comm_stream=scheduler.comm_stream if is_enabled else None,
+            all_expert_tokens=all_expert_tokens,
+            orig_weight1=orig_moe_w1,
+            orig_weight2=orig_moe_w2,
         )
 
         # Step 8: Backward through sort/permute
@@ -425,18 +425,46 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Step 13: LayerNorm 2 backward
         grad_ln2_out = grad_ln2_flat.view(seq_len, batch_size, hidden_size)
 
-        # Simplified LN backward (full implementation would use proper LN backward)
-        # For now, approximate: grad passes through, LN weight/bias grads computed
+        # Compute dX immediately (needed for gradient propagation)
         mean = hidden_after_attn.mean(dim=-1, keepdim=True)
         var = hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
         std = (var + 1e-5).sqrt()
         normalized = (hidden_after_attn - mean) / std
 
-        grad_ln2_weight = (grad_ln2_out * normalized).sum(dim=(0, 1))
-        grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
-
-        # Approximate: grad_hidden_after_attn += scaled grad through LN
+        # dX: gradient through LayerNorm
         grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std
+
+        # Register dW tasks for LN2 (deferred, overlaps with AllToAll)
+        scheduler = get_backward_scheduler()
+        if scheduler.is_enabled():
+            grad_ln2_out_saved = grad_ln2_out.detach()
+            normalized_saved = normalized.detach()
+
+            def compute_ln2_weight_dw():
+                return (grad_ln2_out_saved * normalized_saved).sum(dim=(0, 1))
+
+            def compute_ln2_bias_dw():
+                return grad_ln2_out_saved.sum(dim=(0, 1))
+
+            scheduler.register_dw_task(
+                layer_name=f"ln2_weight_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_ln2_weight_dw,
+                weight_param=orig_ln2_weight,
+                needs_ar=True,
+            )
+            scheduler.register_dw_task(
+                layer_name=f"ln2_bias_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_ln2_bias_dw,
+                weight_param=orig_ln2_bias,
+                needs_ar=True,
+            )
+            grad_ln2_weight = None
+            grad_ln2_bias = None
+        else:
+            grad_ln2_weight = (grad_ln2_out * normalized).sum(dim=(0, 1))
+            grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
 
         # =====================================================================
         # Attention Backward
@@ -447,40 +475,92 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_hidden_after_attn, attn_input_full, proj_weight, layer_id
         )
 
-        # Step 15: Output projection backward (chunked dX + sp2hp AllToAll)
-        grad_attn_output = output_projection_backward_chunked(
-            grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group, num_chunks
-        )
-
-        # Step 16: Attention backward
-        grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
-        q_perm = q_hp.permute(1, 2, 0, 3)
+        # Prepare Q, K, V in attention format for recomputation overlap
+        q_perm = q_hp.permute(1, 2, 0, 3)  # [batch, heads_local, seq_full, head_dim]
         k_perm = k_hp.permute(1, 2, 0, 3)
         v_perm = v_hp.permute(1, 2, 0, 3)
 
-        grad_q, grad_k, grad_v = attention_backward_chunked(
-            grad_attn_hp, q_perm, k_perm, v_perm, scale, cp_group, num_chunks
+        # GQA expansion for attention recomputation (K/V have fewer heads than Q)
+        kv_heads_local = num_kv_heads // cp_size
+        q_heads_local = num_heads // cp_size
+        if q_heads_local > kv_heads_local:
+            expand_ratio = q_heads_local // kv_heads_local
+            k_perm_expanded = k_perm.repeat_interleave(expand_ratio, dim=1)
+            v_perm_expanded = v_perm.repeat_interleave(expand_ratio, dim=1)
+        else:
+            k_perm_expanded = k_perm
+            v_perm_expanded = v_perm
+
+        # Step 15: Output projection backward (chunked dX + sp2hp AllToAll + attention recompute)
+        # Attention recomputation overlaps with AllToAll communication
+        grad_attn_output, attn_probs, _ = output_projection_backward_chunked(
+            grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group,
+            num_chunks=attn_proj_chunks_actual,
+            query=q_perm, key=k_perm_expanded, value=v_perm_expanded, scale=scale,
         )
+
+        # Step 16: Attention backward (uses precomputed attn_probs)
+        grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
+
+        # Attention backward with chunked hp2sp AllToAll
+        # Use expanded K/V for GQA (same as forward attention)
+        grad_q, grad_k_expanded, grad_v_expanded = attention_backward_chunked(
+            grad_attn_hp, q_perm, k_perm_expanded, v_perm_expanded, scale, cp_group,
+            num_chunks=attn_qkv_chunks_actual,
+            attn_probs_precomputed=attn_probs,
+        )
+
+        # Note: grad_k_expanded/grad_v_expanded are in expanded form [seq_local, batch, num_heads, head_dim]
+        # qkv_projection_backward will handle GQA contraction internally
 
         # Step 17: QKV projection backward
         grad_ln1_out, grad_qkv_weight = qkv_projection_backward(
-            grad_q, grad_k, grad_v, ln1_out, qkv_weight, cp_group,
+            grad_q, grad_k_expanded, grad_v_expanded, ln1_out, qkv_weight, cp_group,
             num_heads, num_kv_heads, head_dim, layer_id
         )
 
         # Step 18: Residual backward - grad flows to hidden_states
         grad_hidden_states = grad_hidden_after_attn.clone()
 
-        # Step 19: LayerNorm 1 backward (simplified)
+        # Step 19: LayerNorm 1 backward
         mean1 = hidden_states.mean(dim=-1, keepdim=True)
         var1 = hidden_states.var(dim=-1, unbiased=False, keepdim=True)
         std1 = (var1 + 1e-5).sqrt()
         normalized1 = (hidden_states - mean1) / std1
 
-        grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
-        grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
-
+        # dX: gradient through LayerNorm
         grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
+
+        # Register dW tasks for LN1 (deferred, overlaps with AllToAll)
+        if scheduler.is_enabled():
+            grad_ln1_out_saved = grad_ln1_out.detach()
+            normalized1_saved = normalized1.detach()
+
+            def compute_ln1_weight_dw():
+                return (grad_ln1_out_saved * normalized1_saved).sum(dim=(0, 1))
+
+            def compute_ln1_bias_dw():
+                return grad_ln1_out_saved.sum(dim=(0, 1))
+
+            scheduler.register_dw_task(
+                layer_name=f"ln1_weight_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_ln1_weight_dw,
+                weight_param=orig_ln1_weight,
+                needs_ar=True,
+            )
+            scheduler.register_dw_task(
+                layer_name=f"ln1_bias_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=compute_ln1_bias_dw,
+                weight_param=orig_ln1_bias,
+                needs_ar=True,
+            )
+            grad_ln1_weight = None
+            grad_ln1_bias = None
+        else:
+            grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
+            grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
 
         # Return gradients in same order as forward inputs
         return (
@@ -495,7 +575,9 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_moe_w1,          # moe_w1
             grad_moe_w2,          # moe_w2
             None, None, None, None,  # groups and contexts
-            None, None, None, None, None, None, None,  # config
+            None, None, None, None, None,  # layer_id, num_heads, num_kv_heads, num_experts, top_k
+            None, None, None,     # attn_proj_chunks, attn_qkv_chunks, moe_chunks
+            None,                 # activation_func
         )
 
 
@@ -513,7 +595,9 @@ class TransformerLayer(nn.Module):
         cp_group: Context parallel group
         ep_group: Expert parallel group
         layer_id: Layer index
-        num_chunks: Chunks for backward overlap
+        attn_proj_chunks: Chunks for output projection backward (sp2hp AllToAll)
+        attn_qkv_chunks: Chunks for attention/qkv backward (hp2sp AllToAll)
+        moe_chunks: Chunks for MoE dispatch backward (expert AllToAll)
         activation_func: MoE activation function
         dtype: Parameter dtype
         device: Parameter device
@@ -530,7 +614,9 @@ class TransformerLayer(nn.Module):
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
         layer_id: int = 0,
-        num_chunks: int = 4,
+        attn_proj_chunks: int = 4,
+        attn_qkv_chunks: int = 4,
+        moe_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -546,7 +632,9 @@ class TransformerLayer(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.layer_id = layer_id
-        self.num_chunks = num_chunks
+        self.attn_proj_chunks = attn_proj_chunks
+        self.attn_qkv_chunks = attn_qkv_chunks
+        self.moe_chunks = moe_chunks
         self.activation_func = activation_func or F.gelu
 
         self.cp_group = cp_group
@@ -608,7 +696,8 @@ class TransformerLayer(nn.Module):
             self.cp_group, self.ep_group,
             self.attn_overlap_ctx, self.moe_overlap_ctx,
             self.layer_id, self.num_heads, self.num_kv_heads,
-            self.num_experts, self.top_k, self.num_chunks,
+            self.num_experts, self.top_k,
+            self.attn_proj_chunks, self.attn_qkv_chunks, self.moe_chunks,
             self.activation_func,
         )
 
@@ -627,7 +716,9 @@ class TransformerModel(nn.Module):
         top_k: int,
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
-        num_chunks: int = 4,
+        attn_proj_chunks: int = 4,
+        attn_qkv_chunks: int = 4,
+        moe_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -645,7 +736,9 @@ class TransformerModel(nn.Module):
                 cp_group=cp_group,
                 ep_group=ep_group,
                 layer_id=i,
-                num_chunks=num_chunks,
+                attn_proj_chunks=attn_proj_chunks,
+                attn_qkv_chunks=attn_qkv_chunks,
+                moe_chunks=moe_chunks,
                 activation_func=activation_func,
                 dtype=dtype,
                 device=device,

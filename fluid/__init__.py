@@ -44,7 +44,6 @@ from .core import (
     get_num_rounds,
     # Overlap context
     MultiCardOverlapContext,
-    AttentionMultiCardOverlapContext,
     # Scheduler
     BackwardScheduler,
     get_backward_scheduler,
@@ -56,8 +55,6 @@ from .core import (
 from .moe import (
     # Forward operations
     router_forward,
-    compute_fc1_act_per_source,
-    compute_fc2_per_source,
     merge_tokens_expert_major,
     precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
@@ -66,8 +63,7 @@ from .moe import (
     recompute_fc1,
     register_moe_dw_tasks,
     combine_backward,
-    expert_backward,
-    dispatch_backward,
+    expert_dispatch_backward,
     router_backward,
     register_router_dw_task,
 )
@@ -120,15 +116,12 @@ __all__ = [
     "get_num_rounds",
     # Core - Overlap context
     "MultiCardOverlapContext",
-    "AttentionMultiCardOverlapContext",
     # Core - Scheduler
     "BackwardScheduler",
     "get_backward_scheduler",
 
     # MoE - Forward operations
     "router_forward",
-    "compute_fc1_act_per_source",
-    "compute_fc2_per_source",
     "merge_tokens_expert_major",
     "precompute_backward_sort_indices",
     "dispatch_fc1_p2p_forward",
@@ -137,8 +130,7 @@ __all__ = [
     "recompute_fc1",
     "register_moe_dw_tasks",
     "combine_backward",
-    "expert_backward",
-    "dispatch_backward",
+    "expert_dispatch_backward",
     "router_backward",
     "register_router_dw_task",
 
