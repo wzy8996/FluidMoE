@@ -13,7 +13,8 @@ FluidMoE Benchmark: 完整的性能测试
     - ar_enabled: 是否启用AR interleaved
 """
 import sys
-sys.path.insert(0, '/home/zju/wzy/FluidMoE')
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -43,7 +44,7 @@ seq_local = 2048
 batch_size = 2
 
 # 调度配置
-chunks = 4          # 反向分块数: 1=不分块, 4/8=分块
+chunks = 1          # 反向分块数: 1=不分块, 4/8=分块
 ar_enabled = True   # AR interleaved开关
 
 p0("=" * 60)
@@ -85,7 +86,7 @@ fluidmoe_model = TransformerModel(
     cp_group=dist.group.WORLD,
     ep_group=dist.group.WORLD,
     attn_proj_chunks=chunks,
-    attn_qkv_chunks=chunks,
+    attn_qkv_chunks=2,
     moe_chunks=chunks,
     dtype=torch.bfloat16,
     device=device,
@@ -111,7 +112,12 @@ fluidmoe_layer = TransformerLayer(attn_proj_chunks=chunks, attn_qkv_chunks=chunk
 # 启用调度器
 scheduler = get_backward_scheduler()
 scheduler.enable()
-scheduler.configure_allreduce(enabled=ar_enabled, dp_group=dist.group.WORLD)
+# 注意：当dp_group和ep_group相同时，AR会延迟到finish_batch同步执行（避免死锁）
+scheduler.configure_allreduce(
+    enabled=ar_enabled,
+    dp_group=dist.group.WORLD,
+    ep_group=dist.group.WORLD  # 与AllToAll使用相同group
+)
 
 x = torch.randn(seq_local, batch_size, hidden_size, dtype=torch.bfloat16, device=device)
 
