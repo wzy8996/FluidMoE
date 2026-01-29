@@ -193,11 +193,16 @@ class BackwardScheduler:
         self._dw_queue.append(DWTask(layer_name, layer_id, compute_fn, weight_param, needs_ar))
         self.total_dw += 1
 
-    def execute_dw_tasks(self):
-        """Execute all deferred dW tasks.
+    def execute_dw_tasks(self, check_alltoall_id: Optional[int] = None) -> bool:
+        """Execute deferred dW tasks, optionally yielding when AllToAll completes.
 
-        dW computation overlaps with AllToAll on comm_thread.
-        AR is deferred to finish_batch to avoid deadlock.
+        Args:
+            check_alltoall_id: If provided, after each dW task, check whether
+                this AllToAll task has completed. If so, stop executing dW and
+                return True so the caller can process the arrived data.
+
+        Returns:
+            True if stopped early because AllToAll completed, False otherwise.
         """
         while self._dw_queue:
             task = self._dw_queue.pop(0)
@@ -214,6 +219,14 @@ class BackwardScheduler:
                     self._ar_pending_params.append((task.layer_name, task.weight_param))
 
             self.completed_dw += 1
+
+            # Check if the monitored AllToAll has completed
+            if check_alltoall_id is not None:
+                task_data = self._alltoall_results.get(check_alltoall_id)
+                if task_data is not None and task_data[0].is_set():
+                    return True
+
+        return False
 
     # ========================================
     # AllToAll
@@ -358,6 +371,7 @@ class BackwardScheduler:
             self.completed_dw += 1
 
         # 2. Execute all pending AR synchronously
+        self.total_ar = len(self._ar_pending_params)
         for _, param in self._ar_pending_params:
             if param.grad is not None:
                 dist.all_reduce(param.grad, group=self.dp_group)

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Optional, Callable, List
 
-from fluid.attention.forward import scaled_dot_product_attention_forward
+from fluid.attention.forward import scaled_dot_product_attention_forward  # noqa: F401 (used in forward)
 
 
 class BaselineTransformerFunction(torch.autograd.Function):
@@ -282,12 +282,21 @@ class BaselineTransformerFunction(torch.autograd.Function):
             k_hp_expanded = k_hp
             v_hp_expanded = v_hp
 
-        # Recompute attention output
+        # Recompute attention output via SDPA (for output projection dW)
         q_bf = q_hp.permute(1, 2, 0, 3)
         k_bf = k_hp_expanded.permute(1, 2, 0, 3)
         v_bf = v_hp_expanded.permute(1, 2, 0, 3)
-        attn_out_bf = scaled_dot_product_attention_forward(q_bf, k_bf, v_bf, scale=scale, is_causal=True)
-        attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
+
+        with torch.enable_grad():
+            q_recomp = q_bf.detach().requires_grad_(True)
+            k_recomp = k_bf.detach().requires_grad_(True)
+            v_recomp = v_bf.detach().requires_grad_(True)
+            attn_out_bf = F.scaled_dot_product_attention(
+                q_recomp, k_recomp, v_recomp,
+                attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale,
+            )
+
+        attn_out = attn_out_bf.detach().permute(2, 0, 1, 3).contiguous()
 
         # hp2sp for recomputed attention
         attn_out_sp = _all_to_all_hp2sp(attn_out, cp_group)
@@ -304,11 +313,13 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # sp2hp AllToAll backward
         grad_attn_out = _all_to_all_sp2hp(grad_attn_out_sp, cp_group)
 
-        # Attention backward (manual implementation)
+        # Attention backward via SDPA autograd
         grad_attn_bf = grad_attn_out.permute(1, 2, 0, 3)
-        grad_q_bf, grad_k_bf, grad_v_bf = _attention_backward(
-            grad_attn_bf, q_bf, k_bf, v_bf, scale
-        )
+        with torch.enable_grad():
+            grad_q_bf, grad_k_bf, grad_v_bf = torch.autograd.grad(
+                attn_out_bf, (q_recomp, k_recomp, v_recomp),
+                grad_attn_bf, retain_graph=False,
+            )
 
         grad_q_hp = grad_q_bf.permute(2, 0, 1, 3)
         grad_k_hp = grad_k_bf.permute(2, 0, 1, 3)
@@ -367,31 +378,6 @@ def _gelu_backward(x):
     cdf = 0.5 * (1.0 + torch.erf(x / 1.4142135623730951))
     pdf = torch.exp(-0.5 * x * x) / 2.5066282746310002
     return cdf + x * pdf
-
-
-def _attention_backward(grad_output, query, key, value, scale):
-    """Manual attention backward with causal mask."""
-    batch, heads, seq_len, head_dim = query.shape
-    device = query.device
-
-    # Recompute attention
-    attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-    attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
-    attn_probs = F.softmax(attn_scores, dim=-1)
-
-    # grad_attn_probs = grad_output @ V.T
-    grad_attn_probs = torch.matmul(grad_output, value.transpose(-2, -1))
-
-    # Softmax backward
-    grad_attn_scores = attn_probs * (grad_attn_probs - (grad_attn_probs * attn_probs).sum(dim=-1, keepdim=True))
-
-    # Compute gradients
-    grad_q = torch.matmul(grad_attn_scores, key) * scale
-    grad_k = torch.matmul(grad_attn_scores.transpose(-2, -1), query) * scale
-    grad_v = torch.matmul(attn_probs.transpose(-2, -1), grad_output)
-
-    return grad_q, grad_k, grad_v
 
 
 def _all_to_all_sp2hp(x: torch.Tensor, group) -> torch.Tensor:

@@ -14,8 +14,6 @@ from typing import Optional, Callable, Tuple, List
 
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.scheduler import get_backward_scheduler
-from fluid.core import _sort_chunks_by_idxs
-
 # Import forward operations
 from fluid.attention.forward import (
     qkv_projection_p2p_forward,
@@ -30,14 +28,15 @@ from fluid.moe.forward import (
 
 # Import backward operations
 from fluid.attention.backward import (
-    output_projection_backward_chunked,
-    attention_backward_chunked,
-    qkv_projection_backward,
+    outproj_sp2hp_backward,
+    attention_score_backward,
+    hp2sp_qkv_backward,
     output_projection_register_dw,
 )
 from fluid.moe.backward import (
-    combine_backward,
-    expert_dispatch_backward,
+    combine_fc2_backward,
+    fc1_dispatch_backward,
+    register_moe_dw_tasks,
     router_backward,
     register_router_dw_task,
 )
@@ -80,10 +79,11 @@ class TransformerLayerFunction(torch.autograd.Function):
         num_kv_heads: int,
         num_experts: int,
         top_k: int,
-        # Chunk configs for different backward passes
-        attn_proj_chunks: int,  # output projection backward (sp2hp)
-        attn_qkv_chunks: int,   # attention/qkv backward (hp2sp)
-        moe_chunks: int,        # MoE dispatch backward
+        # Chunk configs for 4 backward overlap regions
+        attn_proj_chunks: int,       # Region 3: output projection dX + sp2hp AllToAll
+        attn_qkv_chunks: int,        # Region 4: hp2sp AllToAll + QKV dX
+        moe_combine_chunks: int,     # Region 1: Combine AllToAll + FC2 dX
+        moe_dispatch_chunks: int,    # Region 2: FC1 dX + Dispatch AllToAll
         activation_func: Callable,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
@@ -249,7 +249,8 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.top_k = top_k
             ctx.attn_proj_chunks = attn_proj_chunks
             ctx.attn_qkv_chunks = attn_qkv_chunks
-            ctx.moe_chunks = moe_chunks
+            ctx.moe_combine_chunks = moe_combine_chunks
+            ctx.moe_dispatch_chunks = moe_dispatch_chunks
             ctx.activation_func = activation_func
             ctx.num_local_experts = num_local_experts
             ctx.head_dim = head_dim
@@ -274,7 +275,7 @@ class TransformerLayerFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass with P2P overlap and dW scheduling."""
         if not ctx.needs_grad:
-            return (None,) * 23  # 10 weights + 4 groups/contexts + 9 config params
+            return (None,) * 24  # 10 weights + 4 groups/contexts + 10 config params
 
         # Retrieve saved tensors
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
@@ -295,7 +296,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         top_k = ctx.top_k
         attn_proj_chunks = ctx.attn_proj_chunks
         attn_qkv_chunks = ctx.attn_qkv_chunks
-        moe_chunks = ctx.moe_chunks
+        moe_combine_chunks = ctx.moe_combine_chunks
+        moe_dispatch_chunks = ctx.moe_dispatch_chunks
         activation_func = ctx.activation_func
         num_local_experts = ctx.num_local_experts
         head_dim = ctx.head_dim
@@ -335,7 +337,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         is_enabled = scheduler.is_enabled()
         attn_proj_chunks_actual = attn_proj_chunks if is_enabled else 1
         attn_qkv_chunks_actual = attn_qkv_chunks if is_enabled else 1
-        moe_chunks_actual = moe_chunks if is_enabled else 1
+        moe_combine_chunks_actual = moe_combine_chunks if is_enabled else 1
+        moe_dispatch_chunks_actual = moe_dispatch_chunks if is_enabled else 1
 
         # =====================================================================
         # MoE Backward (reverse order)
@@ -354,40 +357,40 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(grad_weighted.dtype)
         grad_permuted_probs = (grad_weighted * combined_output.to(grad_weighted.dtype)).sum(dim=-1)
 
-        # Step 3: Combine Backward AllToAll with FC1 recomputation
-        grad_combined_recv, all_fc1 = combine_backward(
+        # Region 1: Combine AllToAll → FC2 dx (communication-first pipeline)
+        # Chunked AllToAll submitted first, FC2 dx computed as each chunk arrives
+        grad_all_fc1, act_output, all_fc1, grad_all_fc2 = combine_fc2_backward(
             grad_combined, input_splits_list, output_splits_list, ep_group, layer_id,
-            all_expert_tokens=all_expert_tokens,
-            weight1=moe_w1,
+            weight2=moe_w2,
+            activation_func=activation_func,
             num_local_experts=num_local_experts,
             all_tokens_per_expert=all_tokens_per_expert,
+            num_chunks=moe_combine_chunks_actual,
+            all_expert_tokens=all_expert_tokens,
+            weight1=moe_w1,
+            backward_indices=backward_indices,
         )
 
-        # Step 4: Convert layout: rank-major -> expert-major
-        if 'split_sizes_rank_major' in backward_indices:
-            grad_all_fc2 = _sort_chunks_by_idxs(
-                grad_combined_recv,
-                backward_indices['split_sizes_rank_major'],
-                backward_indices['sorted_idxs_rank_to_exp'],
-            )
-        else:
-            grad_all_fc2 = grad_combined_recv
+        # Register dW tasks for MoE weights (between Region 1 and 2)
+        grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
+            moe_w1, moe_w2, all_expert_tokens, act_output,
+            grad_all_fc2,
+            grad_all_fc1,
+            num_local_experts, all_tokens_per_expert, layer_id,
+            orig_moe_w1, orig_moe_w2,
+        )
 
-        # Step 5-7: Combined expert backward + dW registration + dispatch AllToAll
-        # This computes grad_fc1, registers dW tasks, then dX with chunking overlapped with AllToAll
+        # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
+        # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
         split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
         sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
 
-        grad_all_fc1, act_output, grad_permuted_tokens, grad_moe_w1, grad_moe_w2 = expert_dispatch_backward(
-            grad_all_fc2, all_fc1, moe_w1, moe_w2,
-            activation_func, num_local_experts, all_tokens_per_expert,
+        grad_permuted_tokens = fc1_dispatch_backward(
+            grad_all_fc1, moe_w1,
+            num_local_experts, all_tokens_per_expert,
             split_sizes_exp_major, sorted_idxs_exp_to_rank,
             input_splits_list, output_splits_list, ep_group,
-            layer_id=layer_id, num_chunks=moe_chunks_actual,
-            comm_stream=scheduler.comm_stream if is_enabled else None,
-            all_expert_tokens=all_expert_tokens,
-            orig_weight1=orig_moe_w1,
-            orig_weight2=orig_moe_w2,
+            layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
         )
 
         # Step 8: Backward through sort/permute
@@ -491,32 +494,25 @@ class TransformerLayerFunction(torch.autograd.Function):
             k_perm_expanded = k_perm
             v_perm_expanded = v_perm
 
-        # Step 15: Output projection backward (chunked dX + sp2hp AllToAll + attention recompute)
-        # Attention recomputation overlaps with AllToAll communication
-        grad_attn_output, attn_probs, _ = output_projection_backward_chunked(
+        # Step 15: Output projection backward (chunked dX + sp2hp AllToAll)
+        # SDPA handles attention recomputation internally during backward
+        grad_attn_output = outproj_sp2hp_backward(
             grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group,
             num_chunks=attn_proj_chunks_actual,
-            query=q_perm, key=k_perm_expanded, value=v_perm_expanded, scale=scale,
         )
 
-        # Step 16: Attention backward (uses precomputed attn_probs)
+        # Step 16: Attention score backward (SDPA, independent computation)
         grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
-
-        # Attention backward with chunked hp2sp AllToAll
-        # Use expanded K/V for GQA (same as forward attention)
-        grad_q, grad_k_expanded, grad_v_expanded = attention_backward_chunked(
-            grad_attn_hp, q_perm, k_perm_expanded, v_perm_expanded, scale, cp_group,
-            num_chunks=attn_qkv_chunks_actual,
-            attn_probs_precomputed=attn_probs,
+        grad_q, grad_k, grad_v = attention_score_backward(
+            grad_attn_hp, q_perm, k_perm_expanded, v_perm_expanded, scale,
         )
 
-        # Note: grad_k_expanded/grad_v_expanded are in expanded form [seq_local, batch, num_heads, head_dim]
-        # qkv_projection_backward will handle GQA contraction internally
-
-        # Step 17: QKV projection backward
-        grad_ln1_out, grad_qkv_weight = qkv_projection_backward(
-            grad_q, grad_k_expanded, grad_v_expanded, ln1_out, qkv_weight, cp_group,
-            num_heads, num_kv_heads, head_dim, layer_id
+        # Region 4: hp2sp AllToAll → QKV dX (communication-first pipeline)
+        grad_ln1_out, grad_qkv_weight = hp2sp_qkv_backward(
+            grad_q, grad_k, grad_v, cp_group,
+            tokens=ln1_out, weight_qkv=qkv_weight,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            layer_id=layer_id, num_chunks=attn_qkv_chunks_actual,
         )
 
         # Step 18: Residual backward - grad flows to hidden_states
@@ -576,7 +572,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_moe_w2,          # moe_w2
             None, None, None, None,  # groups and contexts
             None, None, None, None, None,  # layer_id, num_heads, num_kv_heads, num_experts, top_k
-            None, None, None,     # attn_proj_chunks, attn_qkv_chunks, moe_chunks
+            None, None, None, None,  # attn_proj_chunks, attn_qkv_chunks, moe_combine_chunks, moe_dispatch_chunks
             None,                 # activation_func
         )
 
@@ -595,9 +591,10 @@ class TransformerLayer(nn.Module):
         cp_group: Context parallel group
         ep_group: Expert parallel group
         layer_id: Layer index
-        attn_proj_chunks: Chunks for output projection backward (sp2hp AllToAll)
-        attn_qkv_chunks: Chunks for attention/qkv backward (hp2sp AllToAll)
-        moe_chunks: Chunks for MoE dispatch backward (expert AllToAll)
+        attn_proj_chunks: Region 3 chunks - output projection dX + sp2hp AllToAll
+        attn_qkv_chunks: Region 4 chunks - hp2sp AllToAll + QKV dX
+        moe_combine_chunks: Region 1 chunks - Combine AllToAll + FC2 dX
+        moe_dispatch_chunks: Region 2 chunks - FC1 dX + Dispatch AllToAll
         activation_func: MoE activation function
         dtype: Parameter dtype
         device: Parameter device
@@ -616,7 +613,8 @@ class TransformerLayer(nn.Module):
         layer_id: int = 0,
         attn_proj_chunks: int = 4,
         attn_qkv_chunks: int = 4,
-        moe_chunks: int = 1,
+        moe_combine_chunks: int = 1,
+        moe_dispatch_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -634,7 +632,8 @@ class TransformerLayer(nn.Module):
         self.layer_id = layer_id
         self.attn_proj_chunks = attn_proj_chunks
         self.attn_qkv_chunks = attn_qkv_chunks
-        self.moe_chunks = moe_chunks
+        self.moe_combine_chunks = moe_combine_chunks
+        self.moe_dispatch_chunks = moe_dispatch_chunks
         self.activation_func = activation_func or F.gelu
 
         self.cp_group = cp_group
@@ -697,7 +696,8 @@ class TransformerLayer(nn.Module):
             self.attn_overlap_ctx, self.moe_overlap_ctx,
             self.layer_id, self.num_heads, self.num_kv_heads,
             self.num_experts, self.top_k,
-            self.attn_proj_chunks, self.attn_qkv_chunks, self.moe_chunks,
+            self.attn_proj_chunks, self.attn_qkv_chunks,
+            self.moe_combine_chunks, self.moe_dispatch_chunks,
             self.activation_func,
         )
 
@@ -718,7 +718,8 @@ class TransformerModel(nn.Module):
         ep_group: dist.ProcessGroup,
         attn_proj_chunks: int = 4,
         attn_qkv_chunks: int = 4,
-        moe_chunks: int = 1,
+        moe_combine_chunks: int = 1,
+        moe_dispatch_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -738,7 +739,8 @@ class TransformerModel(nn.Module):
                 layer_id=i,
                 attn_proj_chunks=attn_proj_chunks,
                 attn_qkv_chunks=attn_qkv_chunks,
-                moe_chunks=moe_chunks,
+                moe_combine_chunks=moe_combine_chunks,
+                moe_dispatch_chunks=moe_dispatch_chunks,
                 activation_func=activation_func,
                 dtype=dtype,
                 device=device,

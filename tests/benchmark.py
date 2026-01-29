@@ -41,10 +41,10 @@ num_experts = 8
 top_k = 4
 num_layers = 2
 seq_local = 2048
-batch_size = 2
+batch_size = 4
 
 # 调度配置
-chunks = 1          # 反向分块数: 1=不分块, 4/8=分块
+chunks = 2          # 反向分块数: 1=不分块, 4/8=分块
 ar_enabled = True   # AR interleaved开关
 
 p0("=" * 60)
@@ -86,8 +86,9 @@ fluidmoe_model = TransformerModel(
     cp_group=dist.group.WORLD,
     ep_group=dist.group.WORLD,
     attn_proj_chunks=chunks,
-    attn_qkv_chunks=2,
-    moe_chunks=chunks,
+    attn_qkv_chunks=chunks,
+    moe_combine_chunks=chunks,
+    moe_dispatch_chunks=chunks,
     dtype=torch.bfloat16,
     device=device,
 )
@@ -107,7 +108,7 @@ config = dict(
     device=device,
 )
 baseline_layer = BaselineTransformerLayer(**config)
-fluidmoe_layer = TransformerLayer(attn_proj_chunks=chunks, attn_qkv_chunks=chunks, moe_chunks=chunks, **config)
+fluidmoe_layer = TransformerLayer(attn_proj_chunks=chunks, attn_qkv_chunks=chunks, moe_combine_chunks=chunks, moe_dispatch_chunks=chunks, **config)
 
 # 启用调度器
 scheduler = get_backward_scheduler()
@@ -138,11 +139,16 @@ def allreduce_model_grads(model, group):
 # Warmup
 # ============================================================
 p0("\nWarmup...")
-for _ in range(3):
+for i in range(3):
     with torch.no_grad():
+        p0(f"  warmup {i}: baseline forward...")
         baseline_model(x)
+        torch.cuda.synchronize()
+        p0(f"  warmup {i}: fluidmoe forward...")
         fluidmoe_model(x)
-torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        p0(f"  warmup {i}: done")
+p0("Warmup done.")
 
 # ============================================================
 # Test 1: Forward Only

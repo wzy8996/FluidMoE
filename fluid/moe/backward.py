@@ -1,28 +1,25 @@
 """
-MoE Backward Operations with AllToAll + Chunked Overlap + dW Scheduling
+MoE Backward Operations with AllToAll + Overlap
 
-This module provides all backward operations for MoE layers with:
-- Combine AllToAll backward with dW overlap
-- Expert computation backward (grad_fc1, grad_tokens)
-- Dispatch AllToAll backward with optional chunked dX overlap
-- dW task registration for weight1 and weight2
+4 Overlap Regions (matching forward's 4 P2P overlap points):
+
+  Region 1 (communication-first): Combine AllToAll → FC2 dx
+    - Submit all AllToAll chunks first
+    - As each chunk completes, compute FC2 dx partial (grad @ w2.T slice)
+    - After all chunks: activation backward → grad_all_fc1
+
+  Region 2 (compute-first): FC1 dx → Dispatch AllToAll
+    - Compute FC1 dx in chunks (grad @ w1.T slice)
+    - As each chunk completes, submit dispatch AllToAll for that chunk
+    - During AllToAll: dW tasks, router backward, LN2 backward
+
+  Region 3 (compute-first): Output Proj dX → sp2hp AllToAll  [in attention/backward.py]
+  Region 4 (communication-first): hp2sp AllToAll → QKV dX    [in attention/backward.py]
 
 Key functions:
+- combine_fc2_backward: Region 1 - combine AllToAll + FC2 dx pipeline
+- fc1_dispatch_backward: Region 2 - FC1 dx + dispatch AllToAll pipeline
 - register_moe_dw_tasks: Register dW tasks for weight1 and weight2
-- combine_backward: Combine AllToAll backward with dW overlap
-- expert_backward: Expert computation backward
-- dispatch_backward: Dispatch AllToAll with optional chunked dX + AllToAll overlap
-
-Design:
-- dW tasks are registered BEFORE AllToAll to execute during communication
-- Chunked dX computation overlaps with AllToAll (hidden dimension chunking)
-- Two AllToAll operations: Combine backward and Dispatch backward
-
-Timeline:
-  Combine AllToAll: Launch async -> Execute queued dW tasks -> Wait
-  Expert backward:  Compute grad_fc1, grad_tokens
-  Register dW:      Register weight1/weight2 dW tasks
-  Dispatch AllToAll: Chunked dX + AllToAll overlap (if num_chunks > 1)
 """
 
 import os
@@ -232,27 +229,39 @@ def recompute_fc1(
 # Combine Backward AllToAll with FC1 Recomputation
 # =============================================================================
 
-def combine_backward(
+
+# =============================================================================
+# Region 1: Combine AllToAll → FC2 dx (Communication-First Pipeline)
+# =============================================================================
+
+def combine_fc2_backward(
     grad_output: torch.Tensor,
     input_splits_list: List[int],
     output_splits_list: List[int],
     ep_group,
     layer_id: int,
+    weight2: torch.Tensor,
+    activation_func,
+    num_local_experts: int,
+    all_tokens_per_expert: List[int],
+    num_chunks: int = 4,
+    # For FC1 recompute
     all_expert_tokens: Optional[torch.Tensor] = None,
     weight1: Optional[torch.Tensor] = None,
-    num_local_experts: int = 0,
-    all_tokens_per_expert: Optional[List[int]] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    # Layout convert indices
+    backward_indices: Optional[Dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
-    Combine backward AllToAll with dW overlap and optional FC1 recomputation.
+    Region 1: Combine AllToAll overlap FC2 dx (communication-first pipeline).
 
-    Uses comm thread for AllToAll execution:
-    1. Submit AllToAll to comm thread
-    2. Recompute FC1 on main thread (overlaps with AllToAll)
-    3. Execute queued dW tasks (overlaps with AllToAll)
-    4. Wait for AllToAll completion
+    Pipeline:
+      1. Submit all AllToAll chunks (chunked along hidden_size)
+      2. FC1 recompute + dW tasks overlap with AllToAll
+      3. For each chunk: wait → layout convert → FC2 dx partial (accumulate)
+      4. After all chunks: activation backward → grad_all_fc1
 
-    FC1 recomputation (~5ms) is hidden by Combine AllToAll (~28ms).
+    comm_thread: |A2A_0|A2A_1|A2A_2|A2A_3|
+    default:     |fc1_recomp+dW|wait0+dx0|wait1+dx1|wait2+dx2|wait3+dx3|act_bwd|
 
     Args:
         grad_output: [total_output, hidden] gradient w.r.t. output
@@ -260,93 +269,202 @@ def combine_backward(
         output_splits_list: AllToAll output split sizes
         ep_group: Expert parallel process group
         layer_id: Layer ID for debugging
-        all_expert_tokens: [total_recv, hidden] tokens for FC1 recomputation (optional)
-        weight1: [num_local_experts, hidden, ffn_hidden] FC1 weight for recomputation (optional)
-        num_local_experts: Number of local experts (required if recomputing FC1)
-        all_tokens_per_expert: Token count per expert (required if recomputing FC1)
+        weight2: [num_local_experts, ffn_hidden, hidden] FC2 weight
+        activation_func: Activation function
+        num_local_experts: Number of local experts
+        all_tokens_per_expert: Token count per expert
+        num_chunks: Number of chunks for hidden dimension
+        all_expert_tokens: [total_recv, hidden] tokens for FC1 recomputation
+        weight1: [num_local_experts, hidden, ffn_hidden] FC1 weight
+        backward_indices: Dict with layout convert indices
 
     Returns:
-        grad_combined: [total_recv, hidden] gradient after AllToAll
+        grad_all_fc1: [total_recv, ffn_hidden] gradient w.r.t. FC1 output
+        act_output: [total_recv, ffn_hidden] activation output (detached)
         all_fc1: [total_recv, ffn_hidden] recomputed FC1 or None
+        grad_all_fc2: [total_recv, hidden] gradient after AllToAll + layout convert (for dW)
     """
-    nvtx_range_push("combine_backward")
+    nvtx_range_push("combine_fc2_backward")
     scheduler = get_backward_scheduler()
+    device = grad_output.device
+    dtype = grad_output.dtype
+    hidden_size = grad_output.shape[1]
+    ffn_hidden = weight2.shape[1]
+    total_output = grad_output.shape[0]
+    total_recv = sum(output_splits_list)
+
+    # Validate chunk size
+    if num_chunks > 1 and hidden_size % num_chunks != 0:
+        num_chunks = 1
+
     all_fc1 = None
 
-    if scheduler.is_enabled():
-        # Prepare input tensor
-        grad_output_contig = grad_output.contiguous()
-
-        # Create closure for AllToAll execution
-        result_holder = [None]
-        def do_alltoall():
-            result_holder[0] = _all_to_all(
-                grad_output_contig,
-                output_split_sizes=output_splits_list,
-                input_split_sizes=input_splits_list,
-                group=ep_group
-            )
-            return result_holder[0]
-
-        # Submit AllToAll to comm thread (async)
-        nvtx_range_push("combine_alltoall_submit")
-        task_id = scheduler.submit_alltoall(do_alltoall)
-        nvtx_range_pop()
-
-        # Recompute FC1 on main thread while AllToAll is running
-        # This overlaps with communication (~5ms compute vs ~28ms AllToAll)
-        if all_expert_tokens is not None and weight1 is not None:
-            nvtx_range_push("fc1_recompute")
-            all_fc1 = recompute_fc1(
-                all_expert_tokens, weight1,
-                num_local_experts, all_tokens_per_expert
-            )
-            nvtx_range_pop()
-
-        # Execute dW tasks while AllToAll is running
-        if not os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1':
-            nvtx_range_push("dw_tasks_execute")
-            scheduler.execute_dw_tasks()
-            nvtx_range_pop()
-
-        # Wait for AllToAll to complete
-        nvtx_range_push("combine_alltoall_wait")
-        scheduler.wait_alltoall(task_id)
-        nvtx_range_pop()
-
-        grad_combined = result_holder[0]
-    else:
-        nvtx_range_push("combine_alltoall_sync")
-        grad_combined = _all_to_all(
+    if not scheduler.is_enabled() or num_chunks <= 1:
+        # ---- Fallback: non-chunked path ----
+        nvtx_range_push("combine_alltoall")
+        grad_combined_recv = _all_to_all(
             grad_output.contiguous(),
             output_split_sizes=output_splits_list,
             input_split_sizes=input_splits_list,
             group=ep_group
         )
         nvtx_range_pop()
-        # Recompute FC1 (no overlap in non-scheduler mode)
+
+        # FC1 recompute
         if all_expert_tokens is not None and weight1 is not None:
             nvtx_range_push("fc1_recompute")
-            all_fc1 = recompute_fc1(
-                all_expert_tokens, weight1,
-                num_local_experts, all_tokens_per_expert
-            )
+            all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
             nvtx_range_pop()
 
-    nvtx_range_pop()  # combine_backward
-    return grad_combined, all_fc1
+        # Layout convert: rank-major -> expert-major
+        nvtx_range_push("layout_convert")
+        if backward_indices is not None and 'split_sizes_rank_major' in backward_indices:
+            grad_all_fc2 = _sort_chunks_by_idxs(
+                grad_combined_recv,
+                backward_indices['split_sizes_rank_major'],
+                backward_indices['sorted_idxs_rank_to_exp'],
+            )
+        else:
+            grad_all_fc2 = grad_combined_recv
+        nvtx_range_pop()
+
+        # FC2 dx: grad_fc2 @ w2.T → grad_exp_act
+        nvtx_range_push("fc2_dx")
+        grad_exp_act = torch.zeros(total_recv, ffn_hidden, dtype=dtype, device=device)
+        start = 0
+        for exp_idx in range(num_local_experts):
+            n_tok = all_tokens_per_expert[exp_idx]
+            if n_tok > 0:
+                grad_exp_act[start:start+n_tok] = torch.matmul(
+                    grad_all_fc2[start:start+n_tok], weight2[exp_idx].t()
+                )
+                start += n_tok
+        nvtx_range_pop()
+
+        # Activation backward
+        nvtx_range_push("act_backward")
+        if all_fc1 is None:
+            all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
+        with torch.enable_grad():
+            fc1_with_grad = all_fc1.detach().requires_grad_(True)
+            act_output = activation_func(fc1_with_grad)
+            grad_all_fc1, = torch.autograd.grad(act_output, fc1_with_grad, grad_exp_act, retain_graph=False)
+        nvtx_range_pop()
+
+        nvtx_range_pop()  # combine_fc2_backward
+        return grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2
+
+    # ========================================================================
+    # Chunked communication-first pipeline
+    # ========================================================================
+    nvtx_range_push("combine_fc2_chunked")
+    chunk_size = hidden_size // num_chunks
+
+    # Step 1: Submit all AllToAll chunks
+    task_ids = []
+    chunk_results = [None] * num_chunks
+
+    grad_output_contig = grad_output.contiguous()
+    for chunk_idx in range(num_chunks):
+        h_start = chunk_idx * chunk_size
+        h_end = h_start + chunk_size
+
+        _chunk_idx = chunk_idx
+        _input_chunk = grad_output_contig[:, h_start:h_end].contiguous()
+
+        def make_alltoall_fn(idx, input_buf):
+            def do_alltoall():
+                result = _all_to_all(
+                    input_buf,
+                    output_split_sizes=output_splits_list,
+                    input_split_sizes=input_splits_list,
+                    group=ep_group
+                )
+                chunk_results[idx] = result
+                return result
+            return do_alltoall
+
+        nvtx_range_push(f"submit_a2a_{chunk_idx}")
+        task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _input_chunk))
+        task_ids.append(task_id)
+        nvtx_range_pop()
+
+    # Step 2: FC1 recompute + dW tasks overlap with AllToAll
+    if all_expert_tokens is not None and weight1 is not None:
+        nvtx_range_push("fc1_recompute")
+        all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
+        nvtx_range_pop()
+
+    if not os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1':
+        nvtx_range_push("dw_tasks")
+        scheduler.execute_dw_tasks()
+        nvtx_range_pop()
+
+    # Step 3: For each chunk: wait → layout convert → FC2 dx partial
+    grad_exp_act = torch.zeros(total_recv, ffn_hidden, dtype=dtype, device=device)
+    grad_all_fc2 = torch.empty(total_recv, hidden_size, dtype=dtype, device=device)
+
+    for chunk_idx in range(num_chunks):
+        h_start = chunk_idx * chunk_size
+        h_end = h_start + chunk_size
+
+        # Wait for this chunk's AllToAll
+        nvtx_range_push(f"wait_a2a_{chunk_idx}")
+        scheduler.wait_alltoall(task_ids[chunk_idx])
+        nvtx_range_pop()
+
+        grad_recv_chunk = chunk_results[chunk_idx]  # [total_recv, chunk_size]
+
+        # Layout convert for this chunk
+        nvtx_range_push(f"layout_cvt_{chunk_idx}")
+        if backward_indices is not None and 'split_sizes_rank_major' in backward_indices:
+            grad_fc2_chunk = _sort_chunks_by_idxs(
+                grad_recv_chunk,
+                backward_indices['split_sizes_rank_major'],
+                backward_indices['sorted_idxs_rank_to_exp'],
+            )
+        else:
+            grad_fc2_chunk = grad_recv_chunk
+        nvtx_range_pop()
+
+        # Save for dW computation
+        grad_all_fc2[:, h_start:h_end] = grad_fc2_chunk
+
+        # FC2 dx partial: grad_fc2_chunk @ w2[exp, :, h_start:h_end].T
+        nvtx_range_push(f"fc2_dx_{chunk_idx}")
+        start = 0
+        for exp_idx in range(num_local_experts):
+            n_tok = all_tokens_per_expert[exp_idx]
+            if n_tok > 0:
+                grad_exp_act[start:start+n_tok].addmm_(
+                    grad_fc2_chunk[start:start+n_tok],
+                    weight2[exp_idx, :, h_start:h_end].t()
+                )
+                start += n_tok
+        nvtx_range_pop()
+
+    # Step 4: Activation backward (after all chunks complete)
+    nvtx_range_push("act_backward")
+    if all_fc1 is None:
+        all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
+    with torch.enable_grad():
+        fc1_with_grad = all_fc1.detach().requires_grad_(True)
+        act_output = activation_func(fc1_with_grad)
+        grad_all_fc1, = torch.autograd.grad(act_output, fc1_with_grad, grad_exp_act, retain_graph=False)
+    nvtx_range_pop()
+
+    nvtx_range_pop()  # combine_fc2_chunked
+    nvtx_range_pop()  # combine_fc2_backward
+    return grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2
 
 
 # =============================================================================
-# Combined Expert + Dispatch Backward with Chunked dX + AllToAll Overlap
+# Region 2: FC1 dx → Dispatch AllToAll (Compute-First Pipeline)
 # =============================================================================
 
-def expert_dispatch_backward(
-    grad_all_fc2: torch.Tensor,
-    all_fc1: torch.Tensor,
+def fc1_dispatch_backward(
+    grad_all_fc1: torch.Tensor,
     weight1: torch.Tensor,
-    weight2: torch.Tensor,
-    activation_func,
     num_local_experts: int,
     all_tokens_per_expert: List[int],
     split_sizes_exp_major: List[int],
@@ -356,32 +474,22 @@ def expert_dispatch_backward(
     ep_group,
     layer_id: int = 0,
     num_chunks: int = 1,
-    comm_stream: Optional[torch.cuda.Stream] = None,
-    # For dW registration (optional - if provided, will register dW tasks)
-    all_expert_tokens: Optional[torch.Tensor] = None,
-    orig_weight1: Optional[torch.Tensor] = None,
-    orig_weight2: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> torch.Tensor:
     """
-    Combined expert backward + dispatch AllToAll with optional chunked dX overlap.
+    Region 2: FC1 dx + Dispatch AllToAll (compute-first pipeline).
 
-    This function combines expert_backward, register_moe_dw_tasks, and dispatch_backward:
-    1. Compute grad_fc1 from grad_fc2 through FC2 and activation
-    2. Register dW tasks for weight1/weight2 (if params provided)
-    3. Compute dX (grad_tokens = grad_fc1 @ weight1.T) with optional chunking
-    4. Do AllToAll (overlapped with dX computation when chunked, dW tasks during A2A)
+    Pipeline:
+      1. Compute FC1 dx in chunks (grad_fc1 @ w1.T, chunked along hidden)
+      2. As each chunk completes: reorder + submit dispatch AllToAll
+      3. dW tasks overlap with final AllToAll
+      4. Wait for all AllToAll to complete, gather results
 
-    When num_chunks > 1: dX is computed in chunks, each immediately sent via AllToAll
-    while the next chunk is being computed. This overlaps compute with communication.
-
-    When num_chunks == 1: dX is computed in one pass, then AllToAll is performed.
+    default:     |dx_0+reorder+submit|dx_1+reorder+submit|...|dW|wait|
+    comm_thread:                     |A2A_0              |A2A_1|...|
 
     Args:
-        grad_all_fc2: [total_recv, hidden] gradient w.r.t. FC2 output
-        all_fc1: [total_recv, ffn_hidden] all FC1 outputs (expert-major order)
+        grad_all_fc1: [total_recv, ffn_hidden] gradient w.r.t. FC1 output
         weight1: [num_local_experts, hidden, ffn_hidden] FC1 weight
-        weight2: [num_local_experts, ffn_hidden, hidden] FC2 weight
-        activation_func: Activation function
         num_local_experts: Number of local experts
         all_tokens_per_expert: Token count per expert
         split_sizes_exp_major: Chunk sizes in expert-major order
@@ -390,36 +498,17 @@ def expert_dispatch_backward(
         output_splits_list: AllToAll output split sizes
         ep_group: Expert parallel process group
         layer_id: Layer ID for debugging
-        num_chunks: Number of chunks for hidden dimension (1 = no chunking)
-        comm_stream: CUDA stream for communication
-        all_expert_tokens: [total_recv, hidden] input tokens (for dW registration)
-        orig_weight1: Original weight1 tensor for gradient assignment
-        orig_weight2: Original weight2 tensor for gradient assignment
+        num_chunks: Number of chunks for hidden dimension
 
     Returns:
-        grad_all_fc1: [total_recv, ffn_hidden] gradient w.r.t. FC1 output
-        act_output: [total_recv, ffn_hidden] activation output
         grad_tokens: [total_send, hidden] gradient w.r.t. input tokens (after AllToAll)
-        grad_weight1: Gradient for weight1 (if scheduler disabled, else None)
-        grad_weight2: Gradient for weight2 (if scheduler disabled, else None)
-
-    Timeline (when num_chunks > 1):
-        1. Compute grad_fc1 (FC2 backward + activation backward)
-        2. Register dW tasks for weight1/weight2
-        3. Chunk 0: compute dX[:, 0:H/4] → submit A2A
-        4. Chunk 1: compute dX[:, H/4:H/2] → submit A2A (while A2A_0 runs)
-        5. Chunk 2: compute dX[:, H/2:3H/4] → submit A2A (while A2A_1 runs)
-        6. Chunk 3: compute dX[:, 3H/4:H] → submit A2A (while A2A_2 runs)
-        7. Execute dW tasks during final A2A
-        8. Wait for all A2A to complete
     """
-    nvtx_range_push("expert_dispatch_backward")
+    nvtx_range_push("fc1_dispatch_backward")
     scheduler = get_backward_scheduler()
-    device = grad_all_fc2.device
-    dtype = grad_all_fc2.dtype
-    total_recv = grad_all_fc2.shape[0]
-    hidden_size = weight2.shape[-1]
-    ffn_hidden = weight1.shape[-1]
+    device = grad_all_fc1.device
+    dtype = grad_all_fc1.dtype
+    total_recv = grad_all_fc1.shape[0]
+    hidden_size = weight1.shape[1]
 
     # Convert to list if tensor
     if torch.is_tensor(split_sizes_exp_major):
@@ -431,60 +520,11 @@ def expert_dispatch_backward(
     if num_chunks > 1 and hidden_size % num_chunks != 0:
         num_chunks = 1
 
-    # Get streams
-    if comm_stream is None and scheduler.is_enabled():
-        comm_stream = scheduler.comm_stream
-    default_stream = torch.cuda.current_stream()
+    total_send = sum(input_splits_list)
 
-    # =========================================================================
-    # Step 1: Expert backward - compute grad_fc1 from grad_fc2
-    # =========================================================================
-    nvtx_range_push("expert_backward_fc2_to_fc1")
-
-    # Compute grad_exp_act = grad_fc2 @ weight2.T for all experts
-    grad_all_exp_act = torch.zeros(total_recv, ffn_hidden, dtype=dtype, device=device)
-    start = 0
-    for exp_idx in range(num_local_experts):
-        n_tok = all_tokens_per_expert[exp_idx]
-        if n_tok > 0:
-            grad_all_exp_act[start:start+n_tok] = torch.matmul(
-                grad_all_fc2[start:start+n_tok], weight2[exp_idx].t()
-            )
-            start += n_tok
-
-    # Activation backward using autograd (much faster than explicit formula)
-    with torch.enable_grad():
-        fc1_with_grad = all_fc1.detach().requires_grad_(True)
-        act_output = activation_func(fc1_with_grad)
-        grad_all_fc1, = torch.autograd.grad(
-            act_output, fc1_with_grad, grad_all_exp_act, retain_graph=False
-        )
-    nvtx_range_pop()
-
-    # =========================================================================
-    # Step 2: Register dW tasks (if params provided)
-    # =========================================================================
-    grad_weight1 = None
-    grad_weight2 = None
-    if all_expert_tokens is not None and orig_weight1 is not None and orig_weight2 is not None:
-        grad_weight1, grad_weight2 = register_moe_dw_tasks(
-            weight1, weight2, all_expert_tokens, act_output.detach(),
-            grad_all_fc2, grad_all_fc1,
-            num_local_experts, all_tokens_per_expert, layer_id,
-            orig_weight1, orig_weight2
-        )
-
-    # =========================================================================
-    # Step 3: Dispatch backward - compute dX and AllToAll
-    # =========================================================================
-    if num_chunks == 1:
-        # -----------------------------------------------------------------
-        # Non-chunked path: compute full dX, then AllToAll via comm thread
-        # -----------------------------------------------------------------
-        nvtx_range_push("dispatch_non_chunked")
-
-        # Compute dX = grad_fc1 @ weight1.T
-        nvtx_range_push("dx_compute")
+    if not scheduler.is_enabled() or num_chunks <= 1:
+        # ---- Non-chunked path ----
+        nvtx_range_push("fc1_dx")
         grad_all_tokens = torch.zeros(total_recv, hidden_size, dtype=dtype, device=device)
         start = 0
         for exp_idx in range(num_local_experts):
@@ -503,10 +543,10 @@ def expert_dispatch_backward(
         )
         nvtx_range_pop()
 
-        # AllToAll via comm thread with dW overlap
+        # Dispatch AllToAll
         if scheduler.is_enabled():
-            grad_dispatched_contig = grad_dispatched.contiguous()
             result_holder = [None]
+            grad_dispatched_contig = grad_dispatched.contiguous()
             def do_alltoall():
                 result_holder[0] = _all_to_all(
                     grad_dispatched_contig,
@@ -516,151 +556,108 @@ def expert_dispatch_backward(
                 )
                 return result_holder[0]
 
-            nvtx_range_push("alltoall_submit")
             task_id = scheduler.submit_alltoall(do_alltoall)
-            nvtx_range_pop()
 
-            # Execute dW tasks while AllToAll is running
             if not (os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1' or
                     os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'):
                 nvtx_range_push("dw_tasks")
                 scheduler.execute_dw_tasks()
                 nvtx_range_pop()
 
-            nvtx_range_push("alltoall_wait")
             scheduler.wait_alltoall(task_id)
-            nvtx_range_pop()
-
             grad_tokens = result_holder[0]
         else:
-            nvtx_range_push("alltoall_sync")
             grad_tokens = _all_to_all(
                 grad_dispatched.contiguous(),
                 output_split_sizes=input_splits_list,
                 input_split_sizes=output_splits_list,
                 group=ep_group
             )
-            nvtx_range_pop()
 
-        nvtx_range_pop()  # dispatch_non_chunked
+        nvtx_range_pop()  # fc1_dispatch_backward
+        return grad_tokens
 
-    else:
-        # -----------------------------------------------------------------
-        # Chunked path: compute dX in chunks overlapped with AllToAll
-        # Uses comm thread for AllToAll execution
-        # Pipeline: dX_0 -> submit A2A_0 -> dX_1 (parallel) -> submit A2A_1 -> ...
-        # -----------------------------------------------------------------
-        nvtx_range_push("dispatch_chunked")
-        chunk_size = hidden_size // num_chunks
+    # ========================================================================
+    # Chunked compute-first pipeline
+    # ========================================================================
+    nvtx_range_push("fc1_dispatch_chunked")
+    chunk_size = hidden_size // num_chunks
+    grad_tokens = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
+    chunk_results = [None] * num_chunks
+    task_ids = []
 
-        # Pre-allocate output buffer
-        total_send = sum(input_splits_list)
-        grad_tokens = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
+    for chunk_idx in range(num_chunks):
+        h_start = chunk_idx * chunk_size
+        h_end = h_start + chunk_size
 
-        # Pre-allocate chunk buffers
-        chunk_dx_buffers = [torch.empty(total_recv, chunk_size, dtype=dtype, device=device)
-                           for _ in range(num_chunks)]
-        chunk_reorder_buffers = [torch.empty(total_recv, chunk_size, dtype=dtype, device=device)
-                                 for _ in range(num_chunks)]
+        # Compute FC1 dx chunk: grad_fc1 @ w1[exp, h_start:h_end, :].T
+        nvtx_range_push(f"fc1_dx_{chunk_idx}")
+        dx_chunk = torch.zeros(total_recv, chunk_size, dtype=dtype, device=device)
+        start = 0
+        for exp_idx in range(num_local_experts):
+            n_tok = all_tokens_per_expert[exp_idx]
+            if n_tok > 0:
+                dx_chunk[start:start+n_tok] = torch.matmul(
+                    grad_all_fc1[start:start+n_tok],
+                    weight1[exp_idx, h_start:h_end, :].t()
+                )
+                start += n_tok
+        nvtx_range_pop()
 
-        # Track AllToAll results and task IDs
-        chunk_results = [None] * num_chunks
-        task_ids = []
+        # Reorder expert-major -> rank-major
+        nvtx_range_push(f"reorder_{chunk_idx}")
+        reordered = _sort_chunks_by_idxs(
+            dx_chunk, split_sizes_exp_major, sorted_idxs_exp_to_rank
+        )
+        nvtx_range_pop()
 
-        scheduler_enabled = scheduler.is_enabled()
+        # Submit AllToAll
+        _chunk_idx = chunk_idx
+        _input_buf = reordered.contiguous()
 
-        # Pipeline: compute dX_i, submit AllToAll_i (overlaps with dX_{i+1})
-        for chunk_idx in range(num_chunks):
-            h_start = chunk_idx * chunk_size
-            h_end = h_start + chunk_size
-
-            # ----- Step 1: Compute dX chunk -----
-            nvtx_range_push(f"dx_chunk_{chunk_idx}")
-            chunk_dx_buffers[chunk_idx].zero_()
-            start = 0
-            for exp_idx in range(num_local_experts):
-                n_tok = all_tokens_per_expert[exp_idx]
-                if n_tok > 0:
-                    chunk_dx_buffers[chunk_idx][start:start + n_tok] = torch.matmul(
-                        grad_all_fc1[start:start + n_tok],
-                        weight1[exp_idx, h_start:h_end, :].t()
-                    )
-                    start += n_tok
-
-            # Reorder for AllToAll
-            reordered = _sort_chunks_by_idxs(
-                chunk_dx_buffers[chunk_idx],
-                split_sizes_exp_major,
-                sorted_idxs_exp_to_rank
-            )
-            chunk_reorder_buffers[chunk_idx].copy_(reordered)
-            nvtx_range_pop()
-
-            # ----- Step 2: Submit AllToAll to comm thread (overlaps with next dX) -----
-            nvtx_range_push(f"alltoall_submit_{chunk_idx}")
-            if scheduler_enabled:
-                # Capture chunk_idx for closure
-                _chunk_idx = chunk_idx
-                _input_buf = chunk_reorder_buffers[chunk_idx].contiguous()
-                _total_send = total_send
-                _chunk_size = chunk_size
-
-                def make_alltoall_fn(idx, input_buf, out_size, c_size):
-                    def do_alltoall():
-                        output_buf = torch.empty(out_size, c_size, dtype=dtype, device=device)
-                        dist.all_to_all_single(
-                            output_buf,
-                            input_buf,
-                            output_split_sizes=input_splits_list,
-                            input_split_sizes=output_splits_list,
-                            group=ep_group,
-                        )
-                        chunk_results[idx] = output_buf
-                        return output_buf
-                    return do_alltoall
-
-                task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _input_buf, _total_send, _chunk_size))
-                task_ids.append(task_id)
-            else:
-                # Synchronous execution
-                output_buf = torch.empty(total_send, chunk_size, dtype=dtype, device=device)
+        def make_alltoall_fn(idx, input_buf, t_send, c_size):
+            def do_alltoall():
+                output_buf = torch.empty(t_send, c_size, dtype=dtype, device=device)
                 dist.all_to_all_single(
-                    output_buf,
-                    chunk_reorder_buffers[chunk_idx],
+                    output_buf, input_buf,
                     output_split_sizes=input_splits_list,
                     input_split_sizes=output_splits_list,
                     group=ep_group,
                 )
-                chunk_results[chunk_idx] = output_buf
-            nvtx_range_pop()
+                chunk_results[idx] = output_buf
+                return output_buf
+            return do_alltoall
 
-        # Execute dW tasks while AllToAll is running
-        if scheduler_enabled:
-            if not (os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1' or
-                    os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'):
-                nvtx_range_push("dw_tasks")
-                scheduler.execute_dw_tasks()
-                nvtx_range_pop()
-
-            # Wait for the last AllToAll only (FIFO guarantees earlier ones are done)
-            # Pass num_tasks to correctly decrement the in_progress counter
-            nvtx_range_push("alltoall_wait")
-            if task_ids:
-                scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids))
-            nvtx_range_pop()
-
-        # Gather results
-        nvtx_range_push("gather_alltoall_results")
-        for chunk_idx in range(num_chunks):
-            h_start = chunk_idx * chunk_size
-            h_end = h_start + chunk_size
-            grad_tokens[:, h_start:h_end].copy_(chunk_results[chunk_idx])
+        nvtx_range_push(f"submit_a2a_{chunk_idx}")
+        task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _input_buf, total_send, chunk_size))
+        task_ids.append(task_id)
         nvtx_range_pop()
 
-        nvtx_range_pop()  # dispatch_chunked
+    # dW tasks during final AllToAll
+    if not (os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1' or
+            os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'):
+        nvtx_range_push("dw_tasks")
+        scheduler.execute_dw_tasks()
+        nvtx_range_pop()
 
-    nvtx_range_pop()  # expert_dispatch_backward
-    return grad_all_fc1, act_output.detach(), grad_tokens, grad_weight1, grad_weight2
+    # Wait for last AllToAll (FIFO guarantees all earlier ones done)
+    nvtx_range_push("wait_alltoall")
+    if task_ids:
+        scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids))
+    nvtx_range_pop()
+
+    # Gather results into output
+    nvtx_range_push("gather_results")
+    for chunk_idx in range(num_chunks):
+        h_start = chunk_idx * chunk_size
+        h_end = h_start + chunk_size
+        grad_tokens[:, h_start:h_end].copy_(chunk_results[chunk_idx])
+    nvtx_range_pop()
+
+    nvtx_range_pop()  # fc1_dispatch_chunked
+    nvtx_range_pop()  # fc1_dispatch_backward
+    return grad_tokens
+
 
 
 # =============================================================================
@@ -782,16 +779,13 @@ def register_router_dw_task(
 
 
 __all__ = [
-    # FC1 recomputation
-    'recompute_fc1',
+    # Region 1: Combine AllToAll + FC2 dx
+    'combine_fc2_backward',
+    # Region 2: FC1 dx + Dispatch AllToAll
+    'fc1_dispatch_backward',
     # dW registration
     'register_moe_dw_tasks',
-    # Combine backward
-    'combine_backward',
-    # Expert backward
-    'expert_backward',
-    # Dispatch backward (unified)
-    'dispatch_backward',
+    'recompute_fc1',
     # Router backward
     'router_backward',
     'register_router_dw_task',

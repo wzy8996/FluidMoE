@@ -28,9 +28,11 @@ from .forward import (
     output_projection_p2p_forward,
 )
 from .backward import (
-    output_projection_backward_chunked,
-    attention_backward_chunked,
-    qkv_projection_backward,
+    # Region 3: outproj dx → sp2hp AllToAll
+    outproj_sp2hp_backward,
+    # Region 4: hp2sp AllToAll → QKV dx
+    attention_score_backward,
+    hp2sp_qkv_backward,
     output_projection_register_dw,
 )
 
@@ -39,9 +41,10 @@ __all__ = [
     'qkv_projection_p2p_forward',
     'scaled_dot_product_attention_forward',
     'output_projection_p2p_forward',
-    # Backward operations (AllToAll + chunked overlap + dW scheduling)
-    'output_projection_backward_chunked',
-    'attention_backward_chunked',
-    'qkv_projection_backward',
+    # Region 3: outproj dx → sp2hp AllToAll (compute-first)
+    'outproj_sp2hp_backward',
+    # Region 4: hp2sp AllToAll → QKV dx (communication-first)
+    'attention_score_backward',
+    'hp2sp_qkv_backward',
     'output_projection_register_dw',
 ]

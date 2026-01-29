@@ -36,10 +36,12 @@ from .forward import (
     fc2_combine_p2p_forward,
 )
 from .backward import (
-    recompute_fc1,
+    # Region 1: combine AllToAll → FC2 dx
+    combine_fc2_backward,
+    # Region 2: FC1 dx → dispatch AllToAll
+    fc1_dispatch_backward,
     register_moe_dw_tasks,
-    combine_backward,
-    expert_dispatch_backward,
+    recompute_fc1,
     router_backward,
     register_router_dw_task,
 )
@@ -51,11 +53,12 @@ __all__ = [
     'precompute_backward_sort_indices',
     'dispatch_fc1_p2p_forward',
     'fc2_combine_p2p_forward',
-    # Backward operations (AllToAll + optional chunked overlap + dW scheduling)
-    'recompute_fc1',
+    # Region 1: combine AllToAll → FC2 dx (communication-first)
+    'combine_fc2_backward',
+    # Region 2: FC1 dx → dispatch AllToAll (compute-first)
+    'fc1_dispatch_backward',
     'register_moe_dw_tasks',
-    'combine_backward',
-    'expert_dispatch_backward',
+    'recompute_fc1',
     'router_backward',
     'register_router_dw_task',
 ]

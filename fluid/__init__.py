@@ -59,11 +59,11 @@ from .moe import (
     precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
     fc2_combine_p2p_forward,
-    # Backward operations
-    recompute_fc1,
+    # Backward - Region 1 & 2
+    combine_fc2_backward,
+    fc1_dispatch_backward,
     register_moe_dw_tasks,
-    combine_backward,
-    expert_dispatch_backward,
+    recompute_fc1,
     router_backward,
     register_router_dw_task,
 )
@@ -76,10 +76,10 @@ from .attention import (
     qkv_projection_p2p_forward,
     scaled_dot_product_attention_forward,
     output_projection_p2p_forward,
-    # Backward operations
-    output_projection_backward_chunked,
-    attention_backward_chunked,
-    qkv_projection_backward,
+    # Backward - Region 3 & 4
+    outproj_sp2hp_backward,
+    attention_score_backward,
+    hp2sp_qkv_backward,
     output_projection_register_dw,
 )
 
@@ -126,22 +126,21 @@ __all__ = [
     "precompute_backward_sort_indices",
     "dispatch_fc1_p2p_forward",
     "fc2_combine_p2p_forward",
-    # MoE - Backward operations
-    "recompute_fc1",
+    # MoE - Backward (Region 1 & 2)
+    "combine_fc2_backward",
+    "fc1_dispatch_backward",
     "register_moe_dw_tasks",
-    "combine_backward",
-    "expert_dispatch_backward",
+    "recompute_fc1",
     "router_backward",
     "register_router_dw_task",
-
     # Attention - Forward operations
     "qkv_projection_p2p_forward",
     "scaled_dot_product_attention_forward",
     "output_projection_p2p_forward",
-    # Attention - Backward operations
-    "output_projection_backward_chunked",
-    "attention_backward_chunked",
-    "qkv_projection_backward",
+    # Attention - Backward (Region 3 & 4)
+    "outproj_sp2hp_backward",
+    "attention_score_backward",
+    "hp2sp_qkv_backward",
     "output_projection_register_dw",
 
     # Layer - Unified Transformer (single autograd.Function)

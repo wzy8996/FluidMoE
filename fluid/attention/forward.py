@@ -193,7 +193,11 @@ def scaled_dot_product_attention_forward(
     is_causal: bool = True,
 ) -> torch.Tensor:
     """
-    Scaled dot-product attention computation.
+    Scaled dot-product attention using PyTorch native SDPA.
+
+    Uses F.scaled_dot_product_attention which automatically selects the best
+    backend (FlashAttention, Memory-Efficient, or Math) based on hardware.
+    No manual recomputation needed - SDPA handles this internally during backward.
 
     Args:
         query: [batch, heads, seq, head_dim] - batch-first format
@@ -204,36 +208,18 @@ def scaled_dot_product_attention_forward(
 
     Returns:
         output: [batch, heads, seq, head_dim] - same format as input
-
-    Formula:
-        attn_scores = Q @ K.T * scale
-        attn_probs = softmax(masked(attn_scores))
-        output = attn_probs @ V
     """
-    # Input format: [batch, heads, seq, head_dim]
     head_dim = query.shape[-1]
     if scale is None:
         scale = 1.0 / (head_dim ** 0.5)
 
-    # Compute attention scores
-    # [batch, heads, seq, head_dim] @ [batch, heads, head_dim, seq] -> [batch, heads, seq, seq]
-    attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-
-    # Apply causal mask if needed
-    if is_causal:
-        seq_len = query.shape[2]
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool),
-            diagonal=1
-        )
-        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
-
-    # Softmax
-    attn_probs = F.softmax(attn_scores, dim=-1)
-
-    # Apply attention to values
-    # [batch, heads, seq, seq] @ [batch, heads, seq, head_dim] -> [batch, heads, seq, head_dim]
-    output = torch.matmul(attn_probs, value)
+    output = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=scale,
+    )
 
     return output
 
