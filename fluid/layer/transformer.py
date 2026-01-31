@@ -89,6 +89,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         """Forward pass for complete Transformer layer."""
         needs_grad = hidden_states.requires_grad
         ctx.needs_grad = needs_grad
+        ctx.dtype = hidden_states.dtype
 
         device = hidden_states.device
         dtype = hidden_states.dtype
@@ -277,6 +278,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         if not ctx.needs_grad:
             return (None,) * 24  # 10 weights + 4 groups/contexts + 10 config params
 
+        # Ensure grad_output matches forward dtype (e.g. loss computed in float32 → cast back to bf16)
+        if grad_output.dtype != ctx.dtype:
+            grad_output = grad_output.to(ctx.dtype)
+
         # Retrieve saved tensors
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
          q_hp, k_hp, v_hp, attn_input_full,
@@ -359,6 +364,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Region 1: Combine AllToAll → FC2 dx (communication-first pipeline)
         # Chunked AllToAll submitted first, FC2 dx computed as each chunk arrives
+        scheduler.begin_region('moe_combine')
         grad_all_fc1, act_output, all_fc1, grad_all_fc2 = combine_fc2_backward(
             grad_combined, input_splits_list, output_splits_list, ep_group, layer_id,
             weight2=moe_w2,
@@ -370,6 +376,10 @@ class TransformerLayerFunction(torch.autograd.Function):
             weight1=moe_w1,
             backward_indices=backward_indices,
         )
+
+        scheduler.end_region()
+        # Flush AR accumulated during Region 1
+        scheduler.flush_pending_ar()
 
         # Register dW tasks for MoE weights (between Region 1 and 2)
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
@@ -385,6 +395,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
         sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
 
+        scheduler.begin_region('moe_dispatch')
         grad_permuted_tokens = fc1_dispatch_backward(
             grad_all_fc1, moe_w1,
             num_local_experts, all_tokens_per_expert,
@@ -392,6 +403,10 @@ class TransformerLayerFunction(torch.autograd.Function):
             input_splits_list, output_splits_list, ep_group,
             layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
         )
+
+        scheduler.end_region()
+        # Flush AR accumulated during Region 2
+        scheduler.flush_pending_ar()
 
         # Step 8: Backward through sort/permute
         grad_expanded_tokens = torch.zeros_like(grad_permuted_tokens)
@@ -475,7 +490,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Step 14: Register output projection dW task
         grad_proj_weight = output_projection_register_dw(
-            grad_hidden_after_attn, attn_input_full, proj_weight, layer_id
+            grad_hidden_after_attn, attn_input_full, orig_proj_weight, layer_id
         )
 
         # Prepare Q, K, V in attention format for recomputation overlap
@@ -496,10 +511,15 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Step 15: Output projection backward (chunked dX + sp2hp AllToAll)
         # SDPA handles attention recomputation internally during backward
+        scheduler.begin_region('attn_proj')
         grad_attn_output = outproj_sp2hp_backward(
             grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group,
             num_chunks=attn_proj_chunks_actual,
         )
+
+        scheduler.end_region()
+        # Flush AR accumulated during Region 3
+        scheduler.flush_pending_ar()
 
         # Step 16: Attention score backward (SDPA, independent computation)
         grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
@@ -508,12 +528,17 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         # Region 4: hp2sp AllToAll → QKV dX (communication-first pipeline)
+        scheduler.begin_region('attn_qkv')
         grad_ln1_out, grad_qkv_weight = hp2sp_qkv_backward(
             grad_q, grad_k, grad_v, cp_group,
-            tokens=ln1_out, weight_qkv=qkv_weight,
+            tokens=ln1_out, weight_qkv=orig_qkv_weight,
             num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
             layer_id=layer_id, num_chunks=attn_qkv_chunks_actual,
         )
+
+        scheduler.end_region()
+        # Flush AR accumulated during Region 4
+        scheduler.flush_pending_ar()
 
         # Step 18: Residual backward - grad flows to hidden_states
         grad_hidden_states = grad_hidden_after_attn.clone()
