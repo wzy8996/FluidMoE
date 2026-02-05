@@ -34,6 +34,7 @@ Timeline:
     Final:    Compute local FC2 (parallel with last P2P)
 """
 
+import os
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -47,10 +48,35 @@ from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop, nvtx_ma
 # =============================================================================
 try:
     import grouped_gemm as gg
-    GROUPED_GEMM_AVAILABLE = True
+    _GROUPED_GEMM_LIB_AVAILABLE = True
 except ImportError:
     gg = None
-    GROUPED_GEMM_AVAILABLE = False
+    _GROUPED_GEMM_LIB_AVAILABLE = False
+
+
+def _check_use_grouped_gemm() -> bool:
+    """Check if grouped GEMM should be used (called once at import time).
+
+    Controlled by environment variable FLUID_USE_GROUPED_GEMM:
+      - '0' or unset: Disable grouped GEMM (default, for fair comparison with baseline)
+      - '1': Enable grouped GEMM if library is available
+    """
+    if os.environ.get('FLUID_USE_GROUPED_GEMM', '0') != '1':
+        return False
+    return _GROUPED_GEMM_LIB_AVAILABLE
+
+
+# Cache the result at import time (avoid repeated os.environ.get calls)
+_USE_GROUPED_GEMM = _check_use_grouped_gemm()
+
+
+def use_grouped_gemm() -> bool:
+    """Check if grouped GEMM should be used (cached)."""
+    return _USE_GROUPED_GEMM
+
+
+# For backward compatibility
+GROUPED_GEMM_AVAILABLE = _GROUPED_GEMM_LIB_AVAILABLE
 
 
 def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
@@ -67,7 +93,7 @@ def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
         return torch.empty(0, w1.shape[-1], dtype=tokens.dtype, device=tokens.device)
 
     num_experts = w1.shape[0]
-    if GROUPED_GEMM_AVAILABLE and num_experts > 1:
+    if use_grouped_gemm() and num_experts > 1:
         return activation_func(gg.ops.gmm(tokens, w1, tokens_per_expert, trans_b=False))
     elif num_experts == 1:
         return activation_func(torch.matmul(tokens, w1[0]))
@@ -94,7 +120,7 @@ def grouped_fc2(act: torch.Tensor, w2: torch.Tensor, tokens_per_expert: torch.Te
         return torch.empty(0, w2.shape[-1], dtype=act.dtype, device=act.device)
 
     num_experts = w2.shape[0]
-    if GROUPED_GEMM_AVAILABLE and num_experts > 1:
+    if use_grouped_gemm() and num_experts > 1:
         return gg.ops.gmm(act, w2, tokens_per_expert, trans_b=False)
     elif num_experts == 1:
         return torch.matmul(act, w2[0])

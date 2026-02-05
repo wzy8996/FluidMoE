@@ -31,6 +31,221 @@ from fluid.core import _all_to_all, _sort_chunks_by_idxs
 from fluid.core.scheduler import get_backward_scheduler
 from fluid.core.nvtx import nvtx_range_push, nvtx_range_pop, nvtx_mark
 
+# =============================================================================
+# Grouped GEMM Support (optional, for efficient expert computation)
+# =============================================================================
+try:
+    import grouped_gemm as gg
+    _GROUPED_GEMM_LIB_AVAILABLE = True
+except ImportError:
+    gg = None
+    _GROUPED_GEMM_LIB_AVAILABLE = False
+
+
+def _check_use_grouped_gemm() -> bool:
+    """Check if grouped GEMM should be used (called once at import time).
+
+    Controlled by environment variable FLUID_USE_GROUPED_GEMM:
+      - '0' or unset: Disable grouped GEMM (default, for fair comparison with baseline)
+      - '1': Enable grouped GEMM if library is available
+    """
+    if os.environ.get('FLUID_USE_GROUPED_GEMM', '0') != '1':
+        return False
+    return _GROUPED_GEMM_LIB_AVAILABLE
+
+
+# Cache the result at import time (avoid repeated os.environ.get calls)
+_USE_GROUPED_GEMM = _check_use_grouped_gemm()
+_SKIP_ALL_DW = os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'
+_SKIP_DISPATCH_DW = os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1'
+_DEBUG_SCHEDULER_REGISTER = os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1'
+
+
+def use_grouped_gemm() -> bool:
+    """Check if grouped GEMM should be used (cached)."""
+    return _USE_GROUPED_GEMM
+
+
+def skip_all_dw() -> bool:
+    """Check if all dW tasks should be skipped (cached)."""
+    return _SKIP_ALL_DW
+
+
+def skip_dispatch_dw() -> bool:
+    """Check if dispatch dW tasks should be skipped (cached)."""
+    return _SKIP_DISPATCH_DW
+
+
+# For backward compatibility
+GROUPED_GEMM_AVAILABLE = _GROUPED_GEMM_LIB_AVAILABLE
+
+
+def grouped_fc2_dx(grad_fc2: torch.Tensor, w2: torch.Tensor,
+                   tokens_per_expert: List[int]) -> torch.Tensor:
+    """Compute FC2 dx for all experts: grad_fc2 @ w2.T
+
+    Uses grouped GEMM if available.
+
+    Args:
+        grad_fc2: [total_tokens, hidden] gradient w.r.t FC2 output
+        w2: [num_experts, ffn_hidden, hidden] FC2 weights
+        tokens_per_expert: token counts per expert
+
+    Returns:
+        grad_exp_act: [total_tokens, ffn_hidden] gradient w.r.t activation output
+    """
+    if grad_fc2.shape[0] == 0:
+        return torch.empty(0, w2.shape[1], dtype=grad_fc2.dtype, device=grad_fc2.device)
+
+    num_experts = w2.shape[0]
+    tokens_per_expert_cpu = torch.tensor(tokens_per_expert, dtype=torch.int64)
+
+    if use_grouped_gemm() and num_experts > 1:
+        # gmm with trans_b=True: a @ b^T where b is stored as [E, N, K]
+        # a: [tokens, K=hidden], output: [tokens, N=ffn_hidden]
+        # So b should be [E, ffn_hidden, hidden] - w2 is already this shape!
+        return gg.ops.gmm(grad_fc2, w2, tokens_per_expert_cpu, trans_b=True)
+    elif num_experts == 1:
+        return torch.matmul(grad_fc2, w2[0].t())
+    else:
+        # Fallback: for loop over experts
+        ffn_hidden = w2.shape[1]
+        output = torch.empty(grad_fc2.shape[0], ffn_hidden, dtype=grad_fc2.dtype, device=grad_fc2.device)
+        offset = 0
+        for i, n in enumerate(tokens_per_expert):
+            if n > 0:
+                output[offset:offset+n] = torch.matmul(grad_fc2[offset:offset+n], w2[i].t())
+                offset += n
+        return output
+
+
+def grouped_fc1_dx(grad_fc1: torch.Tensor, w1: torch.Tensor,
+                   tokens_per_expert: List[int]) -> torch.Tensor:
+    """Compute FC1 dx for all experts: grad_fc1 @ w1.T
+
+    Uses grouped GEMM if available.
+
+    Args:
+        grad_fc1: [total_tokens, ffn_hidden] gradient w.r.t FC1 output
+        w1: [num_experts, hidden, ffn_hidden] FC1 weights
+        tokens_per_expert: token counts per expert
+
+    Returns:
+        grad_tokens: [total_tokens, hidden] gradient w.r.t input tokens
+    """
+    if grad_fc1.shape[0] == 0:
+        return torch.empty(0, w1.shape[1], dtype=grad_fc1.dtype, device=grad_fc1.device)
+
+    num_experts = w1.shape[0]
+    tokens_per_expert_cpu = torch.tensor(tokens_per_expert, dtype=torch.int64)
+
+    if use_grouped_gemm() and num_experts > 1:
+        # gmm with trans_b=True: grad_fc1 @ w1.T
+        # w1 shape: [num_experts, hidden, ffn_hidden]
+        # We need: grad_fc1 @ w1.T = grad_fc1 @ [ffn_hidden, hidden]
+        # So we use trans_b=True directly
+        return gg.ops.gmm(grad_fc1, w1, tokens_per_expert_cpu, trans_b=True)
+    elif num_experts == 1:
+        return torch.matmul(grad_fc1, w1[0].t())
+    else:
+        # Fallback: for loop over experts
+        hidden_size = w1.shape[1]
+        output = torch.empty(grad_fc1.shape[0], hidden_size, dtype=grad_fc1.dtype, device=grad_fc1.device)
+        offset = 0
+        for i, n in enumerate(tokens_per_expert):
+            if n > 0:
+                output[offset:offset+n] = torch.matmul(grad_fc1[offset:offset+n], w1[i].t())
+                offset += n
+        return output
+
+
+def grouped_fc1_dx_chunked(grad_fc1: torch.Tensor, w1: torch.Tensor,
+                           tokens_per_expert: List[int],
+                           h_start: int, h_end: int) -> torch.Tensor:
+    """Compute FC1 dx for a chunk of hidden dimension: grad_fc1 @ w1[:, h_start:h_end, :].T
+
+    Uses grouped GEMM if available.
+
+    Args:
+        grad_fc1: [total_tokens, ffn_hidden] gradient w.r.t FC1 output
+        w1: [num_experts, hidden, ffn_hidden] FC1 weights (full)
+        tokens_per_expert: token counts per expert
+        h_start: start index of hidden dimension chunk
+        h_end: end index of hidden dimension chunk
+
+    Returns:
+        dx_chunk: [total_tokens, chunk_size] gradient chunk
+    """
+    chunk_size = h_end - h_start
+    if grad_fc1.shape[0] == 0:
+        return torch.empty(0, chunk_size, dtype=grad_fc1.dtype, device=grad_fc1.device)
+
+    num_experts = w1.shape[0]
+    tokens_per_expert_cpu = torch.tensor(tokens_per_expert, dtype=torch.int64)
+
+    if use_grouped_gemm() and num_experts > 1:
+        # Slice weight: [num_experts, chunk_size, ffn_hidden]
+        w1_chunk = w1[:, h_start:h_end, :].contiguous()
+        # gmm with trans_b=True: grad_fc1 @ w1_chunk.T
+        return gg.ops.gmm(grad_fc1, w1_chunk, tokens_per_expert_cpu, trans_b=True)
+    elif num_experts == 1:
+        return torch.matmul(grad_fc1, w1[0, h_start:h_end, :].t())
+    else:
+        # Fallback: for loop over experts
+        output = torch.empty(grad_fc1.shape[0], chunk_size, dtype=grad_fc1.dtype, device=grad_fc1.device)
+        offset = 0
+        for i, n in enumerate(tokens_per_expert):
+            if n > 0:
+                output[offset:offset+n] = torch.matmul(grad_fc1[offset:offset+n], w1[i, h_start:h_end, :].t())
+                offset += n
+        return output
+
+
+def grouped_fc2_dx_chunked(grad_fc2_chunk: torch.Tensor, w2: torch.Tensor,
+                           tokens_per_expert: List[int],
+                           h_start: int, h_end: int) -> torch.Tensor:
+    """Compute FC2 dx for a chunk of hidden dimension: grad_fc2_chunk @ w2[:, :, h_start:h_end].T
+
+    Uses grouped GEMM if available.
+
+    Args:
+        grad_fc2_chunk: [total_tokens, chunk_size] gradient chunk (sliced along hidden dim)
+        w2: [num_experts, ffn_hidden, hidden] FC2 weights (full)
+        tokens_per_expert: token counts per expert
+        h_start: start index of hidden dimension chunk
+        h_end: end index of hidden dimension chunk
+
+    Returns:
+        grad_act_partial: [total_tokens, ffn_hidden] partial gradient w.r.t activation output
+    """
+    ffn_hidden = w2.shape[1]
+    if grad_fc2_chunk.shape[0] == 0:
+        return torch.empty(0, ffn_hidden, dtype=grad_fc2_chunk.dtype, device=grad_fc2_chunk.device)
+
+    num_experts = w2.shape[0]
+    tokens_per_expert_cpu = torch.tensor(tokens_per_expert, dtype=torch.int64)
+
+    if use_grouped_gemm() and num_experts > 1:
+        # Slice weight: [num_experts, ffn_hidden, chunk_size]
+        w2_chunk = w2[:, :, h_start:h_end].contiguous()
+        # gmm with trans_b=True: grad_fc2_chunk @ w2_chunk.T
+        # grad_fc2_chunk: [total_tokens, chunk_size]
+        # w2_chunk: [num_experts, ffn_hidden, chunk_size]
+        # w2_chunk transposed conceptually: [num_experts, chunk_size, ffn_hidden]
+        # Output: [total_tokens, ffn_hidden]
+        return gg.ops.gmm(grad_fc2_chunk, w2_chunk, tokens_per_expert_cpu, trans_b=True)
+    elif num_experts == 1:
+        return torch.matmul(grad_fc2_chunk, w2[0, :, h_start:h_end].t())
+    else:
+        # Fallback: for loop over experts
+        output = torch.empty(grad_fc2_chunk.shape[0], ffn_hidden, dtype=grad_fc2_chunk.dtype, device=grad_fc2_chunk.device)
+        offset = 0
+        for i, n in enumerate(tokens_per_expert):
+            if n > 0:
+                output[offset:offset+n] = torch.matmul(grad_fc2_chunk[offset:offset+n], w2[i, :, h_start:h_end].t())
+                offset += n
+        return output
+
 
 # =============================================================================
 # dW Task Registration
@@ -75,7 +290,7 @@ def register_moe_dw_tasks(
     scheduler = get_backward_scheduler()
 
     # Debug output
-    if os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1':
+    if _DEBUG_SCHEDULER_REGISTER:
         print(f"[DEBUG] register_moe_dw_tasks(L{layer_id}): scheduler.is_enabled()={scheduler.is_enabled()}", flush=True)
 
     # Get dimensions
@@ -244,7 +459,7 @@ def combine_fc2_backward(
     activation_func,
     num_local_experts: int,
     all_tokens_per_expert: List[int],
-    num_chunks: int = 4,
+    num_chunks: int = 1,
     # For FC1 recompute
     all_expert_tokens: Optional[torch.Tensor] = None,
     weight1: Optional[torch.Tensor] = None,
@@ -255,13 +470,14 @@ def combine_fc2_backward(
     Region 1: Combine AllToAll overlap FC2 dx (communication-first pipeline).
 
     Pipeline:
-      1. Submit all AllToAll chunks (chunked along hidden_size)
-      2. FC1 recompute + dW tasks overlap with AllToAll
-      3. For each chunk: wait → layout convert → FC2 dx partial (accumulate)
-      4. After all chunks: activation backward → grad_all_fc1
+      1. Prepare all input chunks (batch memory operations)
+      2. Submit all AllToAll chunks (chunked along hidden_size)
+      3. FC1 recompute + dW tasks overlap with AllToAll
+      4. For each chunk: wait → layout convert → FC2 dx partial (accumulate)
+      5. After all chunks: activation backward → grad_all_fc1
 
     comm_thread: |A2A_0|A2A_1|A2A_2|A2A_3|
-    default:     |fc1_recomp+dW|wait0+dx0|wait1+dx1|wait2+dx2|wait3+dx3|act_bwd|
+    default:     |prep|fc1_recomp+dW|wait0+dx0|wait1+dx1|wait2+dx2|wait3+dx3|act_bwd|
 
     Args:
         grad_output: [total_output, hidden] gradient w.r.t. output
@@ -299,8 +515,8 @@ def combine_fc2_backward(
 
     all_fc1 = None
 
-    if not scheduler.is_enabled() or num_chunks <= 1:
-        # ---- Fallback: non-chunked path ----
+    if not scheduler.is_enabled():
+        # ---- Fallback: scheduler disabled, fully synchronous ----
         nvtx_range_push("combine_alltoall")
         grad_combined_recv = _all_to_all(
             grad_output.contiguous(),
@@ -328,17 +544,68 @@ def combine_fc2_backward(
             grad_all_fc2 = grad_combined_recv
         nvtx_range_pop()
 
-        # FC2 dx: grad_fc2 @ w2.T → grad_exp_act
+        # FC2 dx: grad_fc2 @ w2.T → grad_exp_act (uses grouped GEMM if available)
         nvtx_range_push("fc2_dx")
-        grad_exp_act = torch.zeros(total_recv, ffn_hidden, dtype=dtype, device=device)
-        start = 0
-        for exp_idx in range(num_local_experts):
-            n_tok = all_tokens_per_expert[exp_idx]
-            if n_tok > 0:
-                grad_exp_act[start:start+n_tok] = torch.matmul(
-                    grad_all_fc2[start:start+n_tok], weight2[exp_idx].t()
-                )
-                start += n_tok
+        grad_exp_act = grouped_fc2_dx(grad_all_fc2, weight2, all_tokens_per_expert)
+        nvtx_range_pop()
+
+        # Activation backward
+        nvtx_range_push("act_backward")
+        if all_fc1 is None:
+            all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
+        with torch.enable_grad():
+            fc1_with_grad = all_fc1.detach().requires_grad_(True)
+            act_output = activation_func(fc1_with_grad)
+            grad_all_fc1, = torch.autograd.grad(act_output, fc1_with_grad, grad_exp_act, retain_graph=False)
+        nvtx_range_pop()
+
+        nvtx_range_pop()  # combine_fc2_backward
+        return grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2
+
+    if num_chunks <= 1:
+        # ---- C=1 with scheduler: async AllToAll + recomp/dW overlap ----
+        result_holder = [None]
+        grad_output_contig = grad_output.contiguous()
+        def do_alltoall():
+            result_holder[0] = _all_to_all(
+                grad_output_contig,
+                output_split_sizes=output_splits_list,
+                input_split_sizes=input_splits_list,
+                group=ep_group
+            )
+            return result_holder[0]
+
+        task_id = scheduler.submit_alltoall(do_alltoall)
+
+        # FC1 recompute + dW tasks overlap with AllToAll
+        if all_expert_tokens is not None and weight1 is not None:
+            nvtx_range_push("fc1_recompute")
+            all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
+            nvtx_range_pop()
+
+        if not skip_all_dw():
+            nvtx_range_push("dw_tasks")
+            scheduler.execute_dw_tasks()
+            nvtx_range_pop()
+
+        scheduler.wait_alltoall(task_id)
+        grad_combined_recv = result_holder[0]
+
+        # Layout convert: rank-major -> expert-major
+        nvtx_range_push("layout_convert")
+        if backward_indices is not None and 'split_sizes_rank_major' in backward_indices:
+            grad_all_fc2 = _sort_chunks_by_idxs(
+                grad_combined_recv,
+                backward_indices['split_sizes_rank_major'],
+                backward_indices['sorted_idxs_rank_to_exp'],
+            )
+        else:
+            grad_all_fc2 = grad_combined_recv
+        nvtx_range_pop()
+
+        # FC2 dx: grad_fc2 @ w2.T → grad_exp_act (uses grouped GEMM if available)
+        nvtx_range_push("fc2_dx")
+        grad_exp_act = grouped_fc2_dx(grad_all_fc2, weight2, all_tokens_per_expert)
         nvtx_range_pop()
 
         # Activation backward
@@ -360,47 +627,50 @@ def combine_fc2_backward(
     nvtx_range_push("combine_fc2_chunked")
     chunk_size = hidden_size // num_chunks
 
-    # Step 1: Submit all AllToAll chunks
-    task_ids = []
-    chunk_results = [None] * num_chunks
-
+    # Step 1: Prepare all input chunks (outside loop to batch memory operations)
     grad_output_contig = grad_output.contiguous()
+    input_chunks = []
+    nvtx_range_push("prepare_input_chunks")
     for chunk_idx in range(num_chunks):
         h_start = chunk_idx * chunk_size
         h_end = h_start + chunk_size
+        input_chunks.append(grad_output_contig[:, h_start:h_end].contiguous())
+    nvtx_range_pop()
 
-        _chunk_idx = chunk_idx
-        _input_chunk = grad_output_contig[:, h_start:h_end].contiguous()
+    # Step 2: Submit all AllToAll chunks
+    task_ids = []
+    chunk_results = [None] * num_chunks
 
-        def make_alltoall_fn(idx, input_buf):
-            def do_alltoall():
-                result = _all_to_all(
-                    input_buf,
-                    output_split_sizes=output_splits_list,
-                    input_split_sizes=input_splits_list,
-                    group=ep_group
-                )
-                chunk_results[idx] = result
-                return result
-            return do_alltoall
+    def make_alltoall_fn(idx, input_buf):
+        def do_alltoall():
+            result = _all_to_all(
+                input_buf,
+                output_split_sizes=output_splits_list,
+                input_split_sizes=input_splits_list,
+                group=ep_group
+            )
+            chunk_results[idx] = result
+            return result
+        return do_alltoall
 
+    for chunk_idx in range(num_chunks):
         nvtx_range_push(f"submit_a2a_{chunk_idx}")
-        task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _input_chunk))
+        task_id = scheduler.submit_alltoall(make_alltoall_fn(chunk_idx, input_chunks[chunk_idx]))
         task_ids.append(task_id)
         nvtx_range_pop()
 
-    # Step 2: FC1 recompute + dW tasks overlap with AllToAll
+    # Step 3: FC1 recompute + dW tasks overlap with AllToAll
     if all_expert_tokens is not None and weight1 is not None:
         nvtx_range_push("fc1_recompute")
         all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
         nvtx_range_pop()
 
-    if not os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1':
+    if not skip_all_dw():
         nvtx_range_push("dw_tasks")
         scheduler.execute_dw_tasks()
         nvtx_range_pop()
 
-    # Step 3: For each chunk: wait → layout convert → FC2 dx partial
+    # Step 4: For each chunk: wait → layout convert → FC2 dx partial
     grad_exp_act = torch.zeros(total_recv, ffn_hidden, dtype=dtype, device=device)
     grad_all_fc2 = torch.empty(total_recv, hidden_size, dtype=dtype, device=device)
 
@@ -430,7 +700,10 @@ def combine_fc2_backward(
         # Save for dW computation
         grad_all_fc2[:, h_start:h_end] = grad_fc2_chunk
 
-        # FC2 dx partial: grad_fc2_chunk @ w2[exp, :, h_start:h_end].T
+        # FC2 dx partial: grad_fc2_chunk @ w2[:, :, h_start:h_end].T (accumulated)
+        # Note: For chunked case, for loop + addmm_ is faster than grouped GEMM because:
+        # 1. Weight slice w2[exp, :, h_s:h_e] is a view (no copy)
+        # 2. addmm_ is in-place (no extra allocation)
         nvtx_range_push(f"fc2_dx_{chunk_idx}")
         start = 0
         for exp_idx in range(num_local_experts):
@@ -443,7 +716,7 @@ def combine_fc2_backward(
                 start += n_tok
         nvtx_range_pop()
 
-    # Step 4: Activation backward (after all chunks complete)
+    # Step 5: Activation backward (after all chunks complete)
     nvtx_range_push("act_backward")
     if all_fc1 is None:
         all_fc1 = recompute_fc1(all_expert_tokens, weight1, num_local_experts, all_tokens_per_expert)
@@ -523,17 +796,9 @@ def fc1_dispatch_backward(
     total_send = sum(input_splits_list)
 
     if not scheduler.is_enabled() or num_chunks <= 1:
-        # ---- Non-chunked path ----
+        # ---- Non-chunked path (uses grouped GEMM if available) ----
         nvtx_range_push("fc1_dx")
-        grad_all_tokens = torch.zeros(total_recv, hidden_size, dtype=dtype, device=device)
-        start = 0
-        for exp_idx in range(num_local_experts):
-            n_tok = all_tokens_per_expert[exp_idx]
-            if n_tok > 0:
-                grad_all_tokens[start:start+n_tok] = torch.matmul(
-                    grad_all_fc1[start:start+n_tok], weight1[exp_idx].t()
-                )
-                start += n_tok
+        grad_all_tokens = grouped_fc1_dx(grad_all_fc1, weight1, all_tokens_per_expert)
         nvtx_range_pop()
 
         # Reorder expert-major -> rank-major
@@ -558,8 +823,8 @@ def fc1_dispatch_backward(
 
             task_id = scheduler.submit_alltoall(do_alltoall)
 
-            if not (os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1' or
-                    os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'):
+            if not (skip_dispatch_dw() or
+                    skip_all_dw()):
                 nvtx_range_push("dw_tasks")
                 scheduler.execute_dw_tasks()
                 nvtx_range_pop()
@@ -590,18 +855,22 @@ def fc1_dispatch_backward(
         h_start = chunk_idx * chunk_size
         h_end = h_start + chunk_size
 
-        # Compute FC1 dx chunk: grad_fc1 @ w1[exp, h_start:h_end, :].T
+        # Compute FC1 dx chunk: grad_fc1 @ w1[:, h_start:h_end, :].T
+        # Note: For chunked case, for loop is faster than grouped GEMM because
+        # w1[i, h_start:h_end, :] is a contiguous view (no copy needed)
         nvtx_range_push(f"fc1_dx_{chunk_idx}")
-        dx_chunk = torch.zeros(total_recv, chunk_size, dtype=dtype, device=device)
-        start = 0
+        chunk_size_actual = h_end - h_start
+        dx_chunk = torch.empty(grad_all_fc1.shape[0], chunk_size_actual,
+                               dtype=dtype, device=device)
+        offset = 0
         for exp_idx in range(num_local_experts):
             n_tok = all_tokens_per_expert[exp_idx]
             if n_tok > 0:
-                dx_chunk[start:start+n_tok] = torch.matmul(
-                    grad_all_fc1[start:start+n_tok],
+                dx_chunk[offset:offset+n_tok] = torch.matmul(
+                    grad_all_fc1[offset:offset+n_tok],
                     weight1[exp_idx, h_start:h_end, :].t()
                 )
-                start += n_tok
+                offset += n_tok
         nvtx_range_pop()
 
         # Reorder expert-major -> rank-major
@@ -634,8 +903,8 @@ def fc1_dispatch_backward(
         nvtx_range_pop()
 
     # dW tasks during final AllToAll
-    if not (os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1' or
-            os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'):
+    if not (skip_dispatch_dw() or
+            skip_all_dw()):
         nvtx_range_push("dw_tasks")
         scheduler.execute_dw_tasks()
         nvtx_range_pop()
@@ -779,6 +1048,10 @@ def register_router_dw_task(
 
 
 __all__ = [
+    # Grouped GEMM helpers
+    'grouped_fc2_dx',
+    'grouped_fc1_dx',
+    'grouped_fc1_dx_chunked',
     # Region 1: Combine AllToAll + FC2 dx
     'combine_fc2_backward',
     # Region 2: FC1 dx + Dispatch AllToAll

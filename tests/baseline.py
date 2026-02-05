@@ -55,10 +55,14 @@ class BaselineTransformerFunction(torch.autograd.Function):
         k_sp = qkv[:, :, :, q_dim:q_dim + head_dim]
         v_sp = qkv[:, :, :, q_dim + head_dim:]
 
-        # AllToAll: sp2hp
-        q_hp = _all_to_all_sp2hp(q_sp, cp_group)
-        k_hp = _all_to_all_sp2hp(k_sp, cp_group)
-        v_hp = _all_to_all_sp2hp(v_sp, cp_group)
+        # AllToAll: sp2hp (combined QKV)
+        qkv_sp = torch.cat([q_sp, k_sp, v_sp], dim=2)  # [seq, batch, heads+2*kv_heads, dim]
+        qkv_hp = _all_to_all_sp2hp(qkv_sp, cp_group)
+        q_heads_local = num_heads // cp_size
+        kv_heads_local = num_kv_heads // cp_size
+        q_hp = qkv_hp[:, :, :q_heads_local, :]
+        k_hp = qkv_hp[:, :, q_heads_local:q_heads_local + kv_heads_local, :]
+        v_hp = qkv_hp[:, :, q_heads_local + kv_heads_local:, :]
 
         # GQA expansion
         kv_heads_local = num_kv_heads // cp_size
@@ -73,9 +77,9 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         # Attention
         seq_full = q_hp.shape[0]
-        q_bf = q_hp.permute(1, 2, 0, 3)
-        k_bf = k_hp_expanded.permute(1, 2, 0, 3)
-        v_bf = v_hp_expanded.permute(1, 2, 0, 3)
+        q_bf = q_hp.permute(1, 2, 0, 3).contiguous()
+        k_bf = k_hp_expanded.permute(1, 2, 0, 3).contiguous()
+        v_bf = v_hp_expanded.permute(1, 2, 0, 3).contiguous()
 
         scale = 1.0 / (head_dim ** 0.5)
         attn_out_bf = scaled_dot_product_attention_forward(q_bf, k_bf, v_bf, scale=scale, is_causal=True)
@@ -283,9 +287,9 @@ class BaselineTransformerFunction(torch.autograd.Function):
             v_hp_expanded = v_hp
 
         # Recompute attention output via SDPA (for output projection dW)
-        q_bf = q_hp.permute(1, 2, 0, 3)
-        k_bf = k_hp_expanded.permute(1, 2, 0, 3)
-        v_bf = v_hp_expanded.permute(1, 2, 0, 3)
+        q_bf = q_hp.permute(1, 2, 0, 3).contiguous()
+        k_bf = k_hp_expanded.permute(1, 2, 0, 3).contiguous()
+        v_bf = v_hp_expanded.permute(1, 2, 0, 3).contiguous()
 
         with torch.enable_grad():
             q_recomp = q_bf.detach().requires_grad_(True)
@@ -330,10 +334,14 @@ class BaselineTransformerFunction(torch.autograd.Function):
             grad_k_hp = grad_k_hp.view(grad_k_hp.shape[0], batch_size, kv_heads_local, expand_ratio, head_dim).sum(dim=3)
             grad_v_hp = grad_v_hp.view(grad_v_hp.shape[0], batch_size, kv_heads_local, expand_ratio, head_dim).sum(dim=3)
 
-        # hp2sp AllToAll backward
-        grad_q_sp = _all_to_all_hp2sp(grad_q_hp, cp_group)
-        grad_k_sp = _all_to_all_hp2sp(grad_k_hp, cp_group)
-        grad_v_sp = _all_to_all_hp2sp(grad_v_hp, cp_group)
+        # hp2sp AllToAll backward (combined QKV)
+        grad_qkv_hp = torch.cat([grad_q_hp, grad_k_hp, grad_v_hp], dim=2)
+        grad_qkv_sp = _all_to_all_hp2sp(grad_qkv_hp, cp_group)
+        q_heads_local = num_heads // cp_size
+        kv_heads_local = num_kv_heads // cp_size
+        grad_q_sp = grad_qkv_sp[:, :, :num_heads, :]
+        grad_k_sp = grad_qkv_sp[:, :, num_heads:num_heads + num_kv_heads, :]
+        grad_v_sp = grad_qkv_sp[:, :, num_heads + num_kv_heads:, :]
 
         # QKV projection backward
         q_per_kv = num_heads // num_kv_heads

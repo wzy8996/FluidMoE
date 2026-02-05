@@ -6,7 +6,6 @@ FluidMoE Benchmark
 
 配置说明:
     - chunks: 反向传播分块数 (1=不分块, 2/4/8=分块重叠)
-    - ar_enabled: True=AR插空执行, False=AR末尾同步执行
 """
 import sys
 import os
@@ -15,11 +14,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-dist.init_process_group(backend='nccl')
-rank = dist.get_rank()
-world_size = dist.get_world_size()
+rank = int(os.environ.get('LOCAL_RANK', 0))
 device = torch.device(f'cuda:{rank}')
 torch.cuda.set_device(device)
+dist.init_process_group(backend='nccl', device_id=device)
+world_size = dist.get_world_size()
 
 def p0(*args):
     if rank == 0:
@@ -38,8 +37,11 @@ num_layers = 2
 seq_local = 2048
 batch_size = 4
 
-chunks = 2
-ar_enabled = True   # True=AR插空, False=AR末尾同步
+# 各 region 分块数 (R1=moe_combine, R2=moe_dispatch, R3=attn_proj, R4=attn_qkv)
+moe_combine_chunks = 2
+moe_dispatch_chunks = 1
+attn_proj_chunks = 1
+attn_qkv_chunks = 2
 
 p0("=" * 60)
 p0("FluidMoE Benchmark")
@@ -47,7 +49,8 @@ p0("=" * 60)
 p0(f"Config: hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
 p0(f"        experts={num_experts}, top_k={top_k}, layers={num_layers}")
 p0(f"        seq_local={seq_local}, batch={batch_size}, GPUs={world_size}")
-p0(f"        chunks={chunks}, ar_enabled={ar_enabled}")
+p0(f"        chunks: R1={moe_combine_chunks}, R2={moe_dispatch_chunks}, "
+   f"R3={attn_proj_chunks}, R4={attn_qkv_chunks}")
 p0("=" * 60)
 
 from fluid.layer import TransformerModel
@@ -68,16 +71,17 @@ fluidmoe_model = TransformerModel(
     num_heads=num_heads, num_kv_heads=num_kv_heads,
     ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
     cp_group=dist.group.WORLD, ep_group=dist.group.WORLD,
-    attn_proj_chunks=chunks, attn_qkv_chunks=chunks,
-    moe_combine_chunks=chunks, moe_dispatch_chunks=chunks,
+    attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
+    moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
     dtype=torch.bfloat16, device=device,
 )
 
 # 启用调度器
 scheduler = get_backward_scheduler()
 scheduler.enable()
+scheduler.ar_chunk_size = 16 * 1024 * 1024  # 16 MB (根据 ar_tune.py 测得的最优值)
 scheduler.configure_allreduce(
-    enabled=ar_enabled,
+    enabled=True,
     dp_group=dist.group.WORLD,
     ep_group=dist.group.WORLD,
 )
@@ -105,9 +109,8 @@ for i in range(3):
     with torch.no_grad():
         baseline_model(x)
         fluidmoe_model(x)
-    torch.cuda.synchronize()
 
-for _ in range(2):
+for wi in range(2):
     x_grad.grad = None
     for p in baseline_model.parameters():
         p.grad = None
@@ -120,7 +123,9 @@ for _ in range(2):
     fluidmoe_model(x_grad).sum().backward()
     scheduler.finish_batch()
     scheduler.clear_iteration()
+
 torch.cuda.synchronize()
+dist.barrier()
 p0("Warmup done.")
 
 # ============================================================
