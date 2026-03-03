@@ -63,7 +63,6 @@ from .moe import (
     combine_fc2_backward,
     fc1_dispatch_backward,
     register_moe_dw_tasks,
-    recompute_fc1,
     router_backward,
     register_router_dw_task,
 )
@@ -78,7 +77,6 @@ from .attention import (
     output_projection_p2p_forward,
     # Backward - Region 3 & 4
     outproj_sp2hp_backward,
-    attention_score_backward,
     hp2sp_qkv_backward,
     output_projection_register_dw,
 )
@@ -130,7 +128,6 @@ __all__ = [
     "combine_fc2_backward",
     "fc1_dispatch_backward",
     "register_moe_dw_tasks",
-    "recompute_fc1",
     "router_backward",
     "register_router_dw_task",
     # Attention - Forward operations
@@ -139,7 +136,6 @@ __all__ = [
     "output_projection_p2p_forward",
     # Attention - Backward (Region 3 & 4)
     "outproj_sp2hp_backward",
-    "attention_score_backward",
     "hp2sp_qkv_backward",
     "output_projection_register_dw",
 
@@ -169,11 +165,13 @@ def print_status():
         print("\nScheduler Statistics:")
         print(f"  Total dW tasks: {stats['total_dw_tasks']}")
         print(f"  Completed dW tasks: {stats['completed_dw_tasks']}")
-        print(f"    - During overlap: {stats['overlap_completed_dw_tasks']}")
-        print(f"    - In finish_batch: {stats['finish_batch_completed_dw_tasks']}")
+        pending_at_finish = stats['pending_dw_at_finish_start']
+        overlap_completed = stats['completed_dw_tasks'] - pending_at_finish
+        print(f"    - During overlap: {overlap_completed}")
+        print(f"    - In finish_batch: {pending_at_finish}")
 
         if stats['total_dw_tasks'] > 0:
-            overlap_ratio = stats['overlap_completed_dw_tasks'] / stats['total_dw_tasks'] * 100
+            overlap_ratio = overlap_completed / stats['total_dw_tasks'] * 100
             print(f"  Overlap ratio: {overlap_ratio:.2f}%")
 
     print("=" * 60)

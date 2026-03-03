@@ -110,7 +110,13 @@ def outproj_sp2hp_backward(
     # Chunked path: dX computation overlapped with sp2hp AllToAll via comm thread
     # ========================================================================
     seq_chunk = seq_local // num_chunks
-    output_chunks = [None] * num_chunks
+    # Each sp2hp AllToAll chunk produces [seq_chunk * cp_size, batch, heads_local, head_dim]
+    seq_chunk_out = seq_chunk * cp_size
+    # Pre-allocate output to avoid torch.cat at the end
+    grad_attn_output = torch.empty(
+        seq_chunk_out * num_chunks, batch_size, heads_local, head_dim,
+        dtype=dtype, device=device,
+    )
     task_ids = []
 
     scheduler_enabled = scheduler.is_enabled()
@@ -119,25 +125,27 @@ def outproj_sp2hp_backward(
     for chunk_idx in range(num_chunks):
         s_start = chunk_idx * seq_chunk
         s_end = s_start + seq_chunk
+        o_start = chunk_idx * seq_chunk_out
+        o_end = o_start + seq_chunk_out
 
         grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
         grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
 
         if scheduler_enabled:
-            _chunk_idx = chunk_idx
             _grad_chunk = grad_chunk.contiguous()
 
-            def make_alltoall_fn(idx, data):
+            def make_alltoall_fn(data, o_s, o_e):
                 def do_alltoall():
                     result = _all_to_all_sp2hp_forward(data, cp_group)
-                    output_chunks[idx] = result
+                    grad_attn_output[o_s:o_e].copy_(result)
                     return result
                 return do_alltoall
 
-            task_id = scheduler.submit_alltoall(make_alltoall_fn(_chunk_idx, _grad_chunk))
+            task_id = scheduler.submit_alltoall(make_alltoall_fn(_grad_chunk, o_start, o_end))
             task_ids.append(task_id)
         else:
-            output_chunks[chunk_idx] = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
+            result = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
+            grad_attn_output[o_start:o_end].copy_(result)
 
     # ============================================
     # During AllToAll: dW tasks
@@ -150,61 +158,8 @@ def outproj_sp2hp_backward(
         if task_ids:
             scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids))
 
-    # Concatenate chunks
-    grad_attn_output = torch.cat(output_chunks, dim=0)
-
     return grad_attn_output
 
-
-
-# =============================================================================
-# Attention Score Backward (replaceable with FlashAttention)
-# =============================================================================
-
-def attention_score_backward(
-    grad_output: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute grad_Q, grad_K, grad_V via PyTorch native SDPA backward.
-
-    Uses torch.autograd.grad through F.scaled_dot_product_attention,
-    which automatically selects the best kernel (FlashAttention, etc.).
-    No manual recomputation needed - SDPA handles internally.
-
-    Args:
-        grad_output: [batch, heads_local, seq_full, head_dim]
-        query: [batch, heads_local, seq_full, head_dim]
-        key: [batch, heads_local, seq_full, head_dim]
-        value: [batch, heads_local, seq_full, head_dim]
-        scale: attention scale factor (1/sqrt(head_dim))
-
-    Returns:
-        grad_q: [batch, heads_local, seq_full, head_dim]
-        grad_k: [batch, heads_local, seq_full, head_dim]
-        grad_v: [batch, heads_local, seq_full, head_dim]
-    """
-    with torch.enable_grad():
-        q = query.detach().requires_grad_(True)
-        k = key.detach().requires_grad_(True)
-        v = value.detach().requires_grad_(True)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=True,
-            scale=scale,
-        )
-
-        grad_q, grad_k, grad_v = torch.autograd.grad(
-            attn_out, (q, k, v), grad_output, retain_graph=False
-        )
-
-    return grad_q, grad_k, grad_v
 
 
 # =============================================================================
@@ -227,19 +182,19 @@ def hp2sp_qkv_backward(
     """
     Region 4: hp2sp AllToAll + QKV dX (communication-first pipeline).
 
-    Takes grad_Q/K/V from attention_score_backward and performs:
-      1. GQA contraction + QKV reassembly in HP format
+    Takes grad_Q/K/V from SDPA autograd.grad and performs:
+      1. QKV reassembly in HP format (native GQA: K/V already have kv_heads shape)
       2. Submit hp2sp AllToAll chunks (chunked along seq dimension)
       3. As each chunk arrives (SP format): compute QKV dX for that chunk
       4. dW tasks overlap with AllToAll
 
     comm_thread: |A2A_0|A2A_1|A2A_2|A2A_3|
-    default:     |gqa+merge|dW|wait0+dx0|wait1+dx1|...|
+    default:     |merge|dW|wait0+dx0|wait1+dx1|...|
 
     Args:
-        grad_q: [batch, heads_local, seq_full, head_dim] gradient w.r.t. Q
-        grad_k: [batch, heads_local, seq_full, head_dim] gradient w.r.t. K
-        grad_v: [batch, heads_local, seq_full, head_dim] gradient w.r.t. V
+        grad_q: [batch, q_heads_local, seq_full, head_dim] gradient w.r.t. Q
+        grad_k: [batch, kv_heads_local, seq_full, head_dim] gradient w.r.t. K (native GQA)
+        grad_v: [batch, kv_heads_local, seq_full, head_dim] gradient w.r.t. V (native GQA)
         cp_group: context parallel process group
         tokens: [seq_local, batch, hidden] input tokens (for dW registration)
         weight_qkv: [total_proj, hidden] QKV weight
@@ -275,25 +230,18 @@ def hp2sp_qkv_backward(
         )
 
     # ============================================
-    # Step 1: GQA contraction + QKV reassembly in HP format
+    # Step 1: QKV reassembly in HP format (native GQA)
     # ============================================
     # Permute to [seq_full, batch, heads_local, head_dim]
-    grad_q_hp = grad_q.permute(2, 0, 1, 3)  # [seq_full, batch, heads_local, head_dim]
-    grad_k_hp = grad_k.permute(2, 0, 1, 3)
-    grad_v_hp = grad_v.permute(2, 0, 1, 3)
+    # Native GQA: grad_q has q_heads_local, grad_k/grad_v have kv_heads_local
+    grad_q_hp = grad_q.permute(2, 0, 1, 3)  # [seq_full, batch, q_heads_local, head_dim]
+    grad_k_hp = grad_k.permute(2, 0, 1, 3)  # [seq_full, batch, kv_heads_local, head_dim]
+    grad_v_hp = grad_v.permute(2, 0, 1, 3)  # [seq_full, batch, kv_heads_local, head_dim]
 
-    # GQA contraction for K/V: sum expanded heads back to kv_heads
-    if q_per_group > 1:
-        # grad_k_hp: [seq_full, batch, heads_local, head_dim]
-        # heads_local = num_heads // cp_size, need to sum to num_kv_heads // cp_size
-        kv_heads_local = num_kv_heads // cp_size
-        grad_k_hp = grad_k_hp.reshape(seq_full, batch, kv_heads_local, q_per_group, head_dim).sum(dim=3)
-        grad_v_hp = grad_v_hp.reshape(seq_full, batch, kv_heads_local, q_per_group, head_dim).sum(dim=3)
-        # Reshape Q to grouped form
-        grad_q_hp_grouped = grad_q_hp.reshape(seq_full, batch, kv_heads_local, q_per_group * head_dim)
-    else:
-        kv_heads_local = heads_local
-        grad_q_hp_grouped = grad_q_hp.reshape(seq_full, batch, kv_heads_local, head_dim)
+    # QKV reassembly (native GQA: K/V already have kv_heads shape, no contraction needed)
+    kv_heads_local = num_kv_heads // cp_size
+    # Reshape Q to grouped form: [seq_full, batch, kv_heads_local, q_per_group * head_dim]
+    grad_q_hp_grouped = grad_q_hp.reshape(seq_full, batch, kv_heads_local, q_per_group * head_dim)
 
     # Merge Q/K/V per group: [seq_full, batch, kv_heads_local, group_size]
     grad_qkv_hp = torch.cat([grad_q_hp_grouped, grad_k_hp, grad_v_hp], dim=-1)
@@ -405,15 +353,14 @@ def _qkv_dx_and_dw(
     grad_q, grad_k, grad_v, tokens, weight_qkv,
     num_heads, num_kv_heads, head_dim, layer_id, cp_size,
 ):
-    """Helper: GQA contraction + QKV reassembly + dX + dW for single-GPU case."""
+    """Helper: QKV reassembly + dX + dW for single-GPU case (native GQA)."""
     seq_local, batch, hidden_size = tokens.shape
     q_per_group = num_heads // num_kv_heads
 
-    if q_per_group > 1:
-        grad_k = grad_k.reshape(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
-        grad_v = grad_v.reshape(seq_local, batch, num_kv_heads, q_per_group, head_dim).sum(dim=3)
-
+    # Native GQA: grad_k/grad_v already have kv_heads shape, no contraction needed
+    # Reshape Q to grouped form: [seq_local, batch, num_kv_heads, q_per_group * head_dim]
     grad_q_grouped = grad_q.reshape(seq_local, batch, num_kv_heads, q_per_group * head_dim)
+    # grad_k/grad_v: [seq_local, batch, num_kv_heads, head_dim]
     grad_qkv = torch.cat([grad_q_grouped, grad_k, grad_v], dim=-1)
     grad_qkv = grad_qkv.view(seq_local, batch, -1)
 
@@ -438,7 +385,6 @@ def _register_qkv_dw(grad_qkv_flat, tokens, weight_qkv, hidden_size, layer_id):
             layer_name=f"qkv_layer{layer_id}",
             layer_id=layer_id,
             compute_fn=compute_dw_qkv,
-            priority=100,
             weight_param=weight_qkv,
         )
         return None
@@ -487,7 +433,6 @@ def output_projection_register_dw(
             layer_name=f"output_proj_layer{layer_id}",
             layer_id=layer_id,
             compute_fn=compute_dw_proj,
-            priority=99,
             weight_param=weight_proj_saved,
         )
         return None
@@ -501,7 +446,6 @@ def output_projection_register_dw(
 
 __all__ = [
     'outproj_sp2hp_backward',
-    'attention_score_backward',
     'hp2sp_qkv_backward',
     'output_projection_register_dw',
 ]

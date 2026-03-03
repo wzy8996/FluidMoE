@@ -29,7 +29,6 @@ from fluid.moe.forward import (
 # Import backward operations
 from fluid.attention.backward import (
     outproj_sp2hp_backward,
-    attention_score_backward,
     hp2sp_qkv_backward,
     output_projection_register_dw,
 )
@@ -121,31 +120,38 @@ class TransformerLayerFunction(torch.autograd.Function):
             cp_group, attn_overlap_ctx
         )
 
-        # GQA expansion if needed (expand K/V heads to match Q heads for attention)
-        kv_heads_local = num_kv_heads // cp_size
-        q_heads_local = num_heads // cp_size
-        if q_heads_local > kv_heads_local:
-            expand_ratio = q_heads_local // kv_heads_local
-            k_hp_expanded = k_hp.repeat_interleave(expand_ratio, dim=2)
-            v_hp_expanded = v_hp.repeat_interleave(expand_ratio, dim=2)
-        else:
-            k_hp_expanded = k_hp
-            v_hp_expanded = v_hp
-
         # Convert to batch-first format for attention: [seq, batch, heads, dim] -> [batch, heads, seq, dim]
         # Note: permute creates a view, matmul works with non-contiguous tensors
-        q_bf = q_hp.permute(1, 2, 0, 3)
-        k_bf = k_hp_expanded.permute(1, 2, 0, 3)
-        v_bf = v_hp_expanded.permute(1, 2, 0, 3)
+        q_bf = q_hp.permute(1, 2, 0, 3)  # [batch, q_heads_local, seq, head_dim]
+        k_bf = k_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
+        v_bf = v_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
 
         # Compute scale for attention
         scale = 1.0 / (head_dim ** 0.5)
 
-        # Scaled Dot-Product Attention
-        # Input/Output: [batch, heads, seq, head_dim]
-        attn_out_bf = scaled_dot_product_attention_forward(
-            q_bf, k_bf, v_bf, scale=scale, is_causal=True
-        )
+        # Check if GQA is needed (q_heads != kv_heads)
+        q_heads_local = num_heads // cp_size
+        kv_heads_local = num_kv_heads // cp_size
+        enable_gqa = (q_heads_local != kv_heads_local)
+
+        # Scaled Dot-Product Attention with native GQA support (PyTorch 2.5+)
+        # Input: Q [batch, q_heads, seq, dim], K/V [batch, kv_heads, seq, dim]
+        # Output: [batch, q_heads, seq, head_dim]
+        #
+        # Keep computation graph for backward: avoids redundant SDPA forward in backward.
+        # FlashAttention only stores logsumexp (O(seq) memory), not full attention matrix.
+        if needs_grad:
+            with torch.enable_grad():
+                q_for_attn = q_bf.detach().requires_grad_(True)
+                k_for_attn = k_bf.detach().requires_grad_(True)
+                v_for_attn = v_bf.detach().requires_grad_(True)
+                attn_out_bf = scaled_dot_product_attention_forward(
+                    q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
+                )
+        else:
+            attn_out_bf = scaled_dot_product_attention_forward(
+                q_bf, k_bf, v_bf, scale=scale, is_causal=True, enable_gqa=enable_gqa
+            )
 
         # Convert back to seq-first: [batch, heads, seq, dim] -> [seq, batch, heads, dim]
         # Need contiguous for output_projection_p2p_forward's P2P slicing
@@ -182,6 +188,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Dispatch + FC1 with P2P overlap (tokens_cpu built from P2P metadata)
         (local_tokens, local_act, recv_act_results, recv_buffers,
+         local_fc1, recv_fc1_results,
          moe_partners, recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
@@ -189,9 +196,11 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
-        (combined_output, local_fc2, all_expert_tokens,
-         all_tokens_per_expert, backward_indices) = fc2_combine_p2p_forward(
+        # Forward only keeps rank-major caches; merge/precompute is deferred to backward.
+        (combined_output, local_fc2, all_peer_tokens_rank_major,
+         all_peer_fc1_rank_major) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
+            local_fc1, recv_fc1_results,
             moe_w2_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, num_local_experts,
             moe_partners, tokens_cpu, needs_backward=needs_grad,
@@ -215,20 +224,45 @@ class TransformerLayerFunction(torch.autograd.Function):
             # Compute ffn_hidden for backward
             total_ffn_hidden = moe_w1.shape[-1]
             ffn_hidden = total_ffn_hidden // num_local_experts
+            local_fc1_rank_major = (
+                local_fc1
+                if local_fc1 is not None
+                else torch.empty(0, ffn_hidden, dtype=dtype, device=hidden_states.device)
+            )
+            peer_tokens_rank_major = (
+                all_peer_tokens_rank_major
+                if all_peer_tokens_rank_major is not None
+                else torch.empty(0, hidden_size, dtype=dtype, device=hidden_states.device)
+            )
+            peer_fc1_rank_major = (
+                all_peer_fc1_rank_major
+                if all_peer_fc1_rank_major is not None
+                else torch.empty(0, ffn_hidden, dtype=dtype, device=hidden_states.device)
+            )
 
             ctx.save_for_backward(
                 # Input and intermediate states
                 hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-                # Attention states (save before permute for consistency)
-                q_hp, k_hp, v_hp, attn_input_full,
+                # Attention states - only attn_input_full needed (q/k/v saved with graph below)
+                attn_input_full,
                 # MoE states
                 permuted_tokens, permuted_probs, restore_indices, sorted_indices,
-                router_probs, top_indices, all_expert_tokens, combined_output,
+                router_probs, top_indices,
+                local_tokens, peer_tokens_rank_major,
+                local_fc1_rank_major, peer_fc1_rank_major, tokens_cpu,
+                combined_output,
                 # Weights (detached)
                 ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                 qkv_weight.detach(), proj_weight.detach(),
                 router_weight.detach(), moe_w1.detach(), moe_w2.detach(),
             )
+            # Save SDPA computation graph (avoids redundant forward in backward)
+            # FlashAttention only stores logsumexp O(seq), not attention matrix O(seq²)
+            ctx._q_for_attn = q_for_attn
+            ctx._k_for_attn = k_for_attn
+            ctx._v_for_attn = v_for_attn
+            ctx._attn_out_bf = attn_out_bf
+            ctx._enable_gqa = enable_gqa
             # Store original weights for gradient assignment
             ctx._orig_ln1_weight = ln1_weight
             ctx._orig_ln1_bias = ln1_bias
@@ -261,8 +295,6 @@ class TransformerLayerFunction(torch.autograd.Function):
             # MoE routing info
             ctx.input_splits_list = input_splits_list
             ctx.output_splits_list = output_splits_list
-            ctx.backward_indices = backward_indices
-            ctx.all_tokens_per_expert = all_tokens_per_expert
 
             # Shape info
             ctx.seq_len = seq_len
@@ -284,12 +316,22 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Retrieve saved tensors
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-         q_hp, k_hp, v_hp, attn_input_full,
+         attn_input_full,
          permuted_tokens, permuted_probs, restore_indices, sorted_indices,
-         router_probs, top_indices, all_expert_tokens, combined_output,
+         router_probs, top_indices,
+         local_tokens_rank_major, all_peer_tokens_rank_major,
+         local_fc1_rank_major, all_peer_fc1_rank_major, tokens_cpu,
+         combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight,
          router_weight, moe_w1_2d, moe_w2_2d) = ctx.saved_tensors
+
+        # Retrieve SDPA computation graph for direct backward (no redundant forward)
+        q_for_attn = ctx._q_for_attn
+        k_for_attn = ctx._k_for_attn
+        v_for_attn = ctx._v_for_attn
+        attn_out_bf = ctx._attn_out_bf
+        enable_gqa = ctx._enable_gqa
 
         # Retrieve config
         cp_group = ctx.cp_group
@@ -311,8 +353,6 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         input_splits_list = ctx.input_splits_list
         output_splits_list = ctx.output_splits_list
-        backward_indices = ctx.backward_indices
-        all_tokens_per_expert = ctx.all_tokens_per_expert
 
         seq_len = ctx.seq_len
         batch_size = ctx.batch_size
@@ -355,8 +395,8 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Step 1: Backward through sum and restore
         grad_restored = grad_moe_output.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_size)
-        inverse_restore_indices = torch.argsort(restore_indices)
-        grad_weighted = grad_restored[inverse_restore_indices]
+        # restore_indices = argsort(sorted_indices), so inverse_restore_indices == sorted_indices.
+        grad_weighted = grad_restored[sorted_indices]
 
         # Step 2: Backward through prob weighting
         grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(grad_weighted.dtype)
@@ -365,21 +405,23 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Region 1: Combine AllToAll → FC2 dx (communication-first pipeline)
         # Chunked AllToAll submitted first, FC2 dx computed as each chunk arrives
         scheduler.begin_region('moe_combine')
-        grad_all_fc1, act_output, all_fc1, grad_all_fc2 = combine_fc2_backward(
+        (grad_all_fc1, act_output, all_fc1, grad_all_fc2,
+         all_expert_tokens, all_tokens_per_expert, backward_indices) = combine_fc2_backward(
             grad_combined, input_splits_list, output_splits_list, ep_group, layer_id,
             weight2=moe_w2,
             activation_func=activation_func,
             num_local_experts=num_local_experts,
-            all_tokens_per_expert=all_tokens_per_expert,
             num_chunks=moe_combine_chunks_actual,
-            all_expert_tokens=all_expert_tokens,
-            weight1=moe_w1,
-            backward_indices=backward_indices,
+            local_tokens_rank_major=local_tokens_rank_major,
+            all_peer_tokens_rank_major=all_peer_tokens_rank_major,
+            local_fc1_rank_major=local_fc1_rank_major,
+            all_peer_fc1_rank_major=all_peer_fc1_rank_major,
+            tokens_cpu=tokens_cpu,
         )
 
         scheduler.end_region()
         # Flush AR accumulated during Region 1
-        scheduler.flush_pending_ar()
+
 
         # Register dW tasks for MoE weights (between Region 1 and 2)
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
@@ -394,23 +436,24 @@ class TransformerLayerFunction(torch.autograd.Function):
         # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
         split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
         sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
+        row_idx_exp_to_rank = backward_indices.get('row_idx_exp_to_rank', None)
 
         scheduler.begin_region('moe_dispatch')
         grad_permuted_tokens = fc1_dispatch_backward(
             grad_all_fc1, moe_w1,
             num_local_experts, all_tokens_per_expert,
-            split_sizes_exp_major, sorted_idxs_exp_to_rank,
+            split_sizes_exp_major, sorted_idxs_exp_to_rank, row_idx_exp_to_rank,
             input_splits_list, output_splits_list, ep_group,
             layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
         )
 
         scheduler.end_region()
         # Flush AR accumulated during Region 2
-        scheduler.flush_pending_ar()
+
 
         # Step 8: Backward through sort/permute
-        grad_expanded_tokens = torch.zeros_like(grad_permuted_tokens)
-        grad_expanded_tokens[sorted_indices] = grad_permuted_tokens
+        # expanded = permuted[restore_indices]
+        grad_expanded_tokens = grad_permuted_tokens.index_select(0, restore_indices)
 
         # Step 9: Backward through expand (sum over top_k copies)
         grad_hidden_from_moe_tokens = grad_expanded_tokens.view(num_tokens, top_k, hidden_size).sum(dim=1)
@@ -493,24 +536,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_hidden_after_attn, attn_input_full, orig_proj_weight, layer_id
         )
 
-        # Prepare Q, K, V in attention format for recomputation overlap
-        q_perm = q_hp.permute(1, 2, 0, 3)  # [batch, heads_local, seq_full, head_dim]
-        k_perm = k_hp.permute(1, 2, 0, 3)
-        v_perm = v_hp.permute(1, 2, 0, 3)
-
-        # GQA expansion for attention recomputation (K/V have fewer heads than Q)
-        kv_heads_local = num_kv_heads // cp_size
-        q_heads_local = num_heads // cp_size
-        if q_heads_local > kv_heads_local:
-            expand_ratio = q_heads_local // kv_heads_local
-            k_perm_expanded = k_perm.repeat_interleave(expand_ratio, dim=1)
-            v_perm_expanded = v_perm.repeat_interleave(expand_ratio, dim=1)
-        else:
-            k_perm_expanded = k_perm
-            v_perm_expanded = v_perm
-
         # Step 15: Output projection backward (chunked dX + sp2hp AllToAll)
-        # SDPA handles attention recomputation internally during backward
         scheduler.begin_region('attn_proj')
         grad_attn_output = outproj_sp2hp_backward(
             grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group,
@@ -518,13 +544,14 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         scheduler.end_region()
-        # Flush AR accumulated during Region 3
-        scheduler.flush_pending_ar()
 
-        # Step 16: Attention score backward (SDPA, independent computation)
+        # Step 16: Attention score backward using saved computation graph
+        # Direct autograd.grad on saved SDPA output - no redundant forward pass
+        # FlashAttention internally does tiled recomputation (unavoidable by design)
         grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
-        grad_q, grad_k, grad_v = attention_score_backward(
-            grad_attn_hp, q_perm, k_perm_expanded, v_perm_expanded, scale,
+        grad_q, grad_k, grad_v = torch.autograd.grad(
+            attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
+            grad_attn_hp, retain_graph=False
         )
 
         # Region 4: hp2sp AllToAll → QKV dX (communication-first pipeline)
@@ -538,7 +565,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         scheduler.end_region()
         # Flush AR accumulated during Region 4
-        scheduler.flush_pending_ar()
+
 
         # Step 18: Residual backward - grad flows to hidden_states
         grad_hidden_states = grad_hidden_after_attn.clone()
@@ -741,8 +768,8 @@ class TransformerModel(nn.Module):
         top_k: int,
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
-        attn_proj_chunks: int = 4,
-        attn_qkv_chunks: int = 4,
+        attn_proj_chunks: int = 1,
+        attn_qkv_chunks: int = 1,
         moe_combine_chunks: int = 1,
         moe_dispatch_chunks: int = 1,
         activation_func: Optional[Callable] = None,

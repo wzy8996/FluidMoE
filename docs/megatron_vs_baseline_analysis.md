@@ -189,7 +189,7 @@ for exp_idx in range(num_local_experts):
 - 未使用 grouped GEMM
 
 ### Megatron+TE
-- 可能使用 **grouped GEMM** (如果 `moe_grouped_gemm=True`)
+- 使用标准专家 GEMM 路径
 - 或者类似的 for loop，但有 TE 的 Linear 优化
 
 **预计提升**: ~1-2ms (如果用 grouped GEMM)

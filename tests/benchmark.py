@@ -34,21 +34,23 @@ ffn_hidden = 14336
 num_experts = 8
 top_k = 4
 num_layers = 2
-seq_local = 2048
+seq_len = 4096  # 全局序列长度
 batch_size = 4
 
 # 各 region 分块数 (R1=moe_combine, R2=moe_dispatch, R3=attn_proj, R4=attn_qkv)
-moe_combine_chunks = 2
+moe_combine_chunks = 4
 moe_dispatch_chunks = 1
 attn_proj_chunks = 1
-attn_qkv_chunks = 2
+attn_qkv_chunks = 4
+
+seq_local = seq_len // world_size  # 本地序列长度
 
 p0("=" * 60)
 p0("FluidMoE Benchmark")
 p0("=" * 60)
 p0(f"Config: hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
 p0(f"        experts={num_experts}, top_k={top_k}, layers={num_layers}")
-p0(f"        seq_local={seq_local}, batch={batch_size}, GPUs={world_size}")
+p0(f"        seq_len={seq_len}, seq_local={seq_local}, batch={batch_size}, GPUs={world_size}")
 p0(f"        chunks: R1={moe_combine_chunks}, R2={moe_dispatch_chunks}, "
    f"R3={attn_proj_chunks}, R4={attn_qkv_chunks}")
 p0("=" * 60)
@@ -160,33 +162,6 @@ for _ in range(N):
 end_event.record()
 torch.cuda.synchronize()
 baseline_fwdbwd = start_event.elapsed_time(end_event) / N
-
-# FluidMoE + no AR (measure pure fwd+bwd cost)
-scheduler.clear_iteration()
-scheduler.ar_enabled = False
-orig_dp_world_size = scheduler.dp_world_size
-scheduler.dp_world_size = 1  # skip AR entirely
-for _ in range(2):
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-torch.cuda.synchronize()
-scheduler.clear_iteration()
-
-start_event.record()
-for _ in range(N):
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-end_event.record()
-torch.cuda.synchronize()
-fluidmoe_noar = start_event.elapsed_time(end_event) / N
-scheduler.clear_iteration()
-scheduler.dp_world_size = orig_dp_world_size
 
 # FluidMoE + sync AR (ar_enabled=False)
 scheduler.clear_iteration()

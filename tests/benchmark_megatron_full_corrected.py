@@ -117,7 +117,6 @@ for layer_id in range(num_layers):
         config=config,
         submodules=get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
-            moe_grouped_gemm=False,
             qk_layernorm=False,
         ).submodules,
         layer_number=layer_id + 1,

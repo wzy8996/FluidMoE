@@ -191,6 +191,7 @@ def scaled_dot_product_attention_forward(
     value: torch.Tensor,
     scale: Optional[float] = None,
     is_causal: bool = True,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """
     Scaled dot-product attention using PyTorch native SDPA.
@@ -200,14 +201,15 @@ def scaled_dot_product_attention_forward(
     No manual recomputation needed - SDPA handles this internally during backward.
 
     Args:
-        query: [batch, heads, seq, head_dim] - batch-first format
-        key: [batch, heads, seq, head_dim]
-        value: [batch, heads, seq, head_dim]
+        query: [batch, q_heads, seq, head_dim] - batch-first format
+        key: [batch, kv_heads, seq, head_dim] - can have fewer heads if enable_gqa=True
+        value: [batch, kv_heads, seq, head_dim] - can have fewer heads if enable_gqa=True
         scale: optional scale factor (default: 1/sqrt(head_dim))
         is_causal: whether to apply causal mask
+        enable_gqa: if True, use native GQA (PyTorch 2.5+), no need to expand K/V heads
 
     Returns:
-        output: [batch, heads, seq, head_dim] - same format as input
+        output: [batch, q_heads, seq, head_dim] - same format as query
     """
     head_dim = query.shape[-1]
     if scale is None:
@@ -219,6 +221,7 @@ def scaled_dot_product_attention_forward(
         dropout_p=0.0,
         is_causal=is_causal,
         scale=scale,
+        enable_gqa=enable_gqa,
     )
 
     return output

@@ -41,7 +41,6 @@ from .backward import (
     # Region 2: FC1 dx → dispatch AllToAll
     fc1_dispatch_backward,
     register_moe_dw_tasks,
-    recompute_fc1,
     router_backward,
     register_router_dw_task,
 )
@@ -58,7 +57,6 @@ __all__ = [
     # Region 2: FC1 dx → dispatch AllToAll (compute-first)
     'fc1_dispatch_backward',
     'register_moe_dw_tasks',
-    'recompute_fc1',
     'router_backward',
     'register_router_dw_task',
 ]

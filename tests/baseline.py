@@ -9,9 +9,59 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from contextlib import contextmanager
 from typing import Optional, Callable, List
 
 from fluid.attention.forward import scaled_dot_product_attention_forward  # noqa: F401 (used in forward)
+
+
+# ---------------------------------------------------------------------------
+# 可重叠计算计时基础设施 (由 no_overlap_time_analyzer 设置)
+# ---------------------------------------------------------------------------
+_g_compute_timer = None
+
+
+def set_compute_timer(timer) -> None:
+    """设置可重叠计算计时器 (timer 需有 fwd_overlap_ms / bwd_overlap_ms 属性)。"""
+    global _g_compute_timer
+    _g_compute_timer = timer
+
+
+@contextmanager
+def _timed_overlap(phase: str, key: str = ""):
+    """对一段可重叠计算块计时并累加到 timer。
+
+    phase: 'fwd' 或 'bwd'
+    key:   区域标识，对应 OverlapComputeTracker 的 {phase}_{key}_ms 字段。
+           前向: 'qkv' / 'proj' / 'fc1' / 'fc2'
+           后向: 'fc2_dx' / 'fc2_dw' / 'act_recomp' / 'act_bwd' /
+                 'fc1_dx' / 'fc1_dw' / 'router_dx' / 'router_dw' /
+                 'ln2_dw' / 'ln2_dx' / 'proj_dw' / 'proj_dx' /
+                 'sdpa_dx' / 'qkv_dw' / 'qkv_dx' / 'ln1_dw' / 'ln1_dx'
+    """
+    timer = _g_compute_timer
+    if timer is None:
+        yield
+        return
+    ev_s = torch.cuda.Event(enable_timing=True)
+    ev_e = torch.cuda.Event(enable_timing=True)
+    ev_s.record()
+    yield
+    ev_e.record()
+    ev_e.synchronize()
+    ms = ev_s.elapsed_time(ev_e)
+    attr = f"{phase}_{key}_ms"
+    setattr(timer, attr, getattr(timer, attr) + ms)
+    # 特殊追踪：反向第一层的 FC2 dX (R1, ÷n1) 和 FC1 dX (R2, ÷n2)，用于计算暴露计算量
+    if phase == "bwd":
+        if key == "fc2_dx":
+            timer._bwd_fc2_dx_count += 1
+            if timer._bwd_fc2_dx_count == 1:
+                timer.bwd_first_fc2_dx_ms += ms
+        elif key == "fc1_dx":
+            timer._bwd_fc1_dx_count += 1
+            if timer._bwd_fc1_dx_count == 1:
+                timer.bwd_first_fc1_dx_ms += ms
 
 
 class BaselineTransformerFunction(torch.autograd.Function):
@@ -43,7 +93,8 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         # ===================== Attention =====================
         ln1_out = F.layer_norm(hidden_states, (hidden_size,), ln1_weight, ln1_bias)
-        qkv = F.linear(ln1_out, qkv_weight)
+        with _timed_overlap("fwd", "qkv"):  # [可重叠] R4 QKV GEMM
+            qkv = F.linear(ln1_out, qkv_weight)
 
         # Reshape QKV
         q_per_kv = num_heads // num_kv_heads
@@ -64,32 +115,30 @@ class BaselineTransformerFunction(torch.autograd.Function):
         k_hp = qkv_hp[:, :, q_heads_local:q_heads_local + kv_heads_local, :]
         v_hp = qkv_hp[:, :, q_heads_local + kv_heads_local:, :]
 
-        # GQA expansion
-        kv_heads_local = num_kv_heads // cp_size
-        q_heads_local = num_heads // cp_size
-        if q_heads_local > kv_heads_local:
-            expand_ratio = q_heads_local // kv_heads_local
-            k_hp_expanded = k_hp.repeat_interleave(expand_ratio, dim=2)
-            v_hp_expanded = v_hp.repeat_interleave(expand_ratio, dim=2)
-        else:
-            k_hp_expanded = k_hp
-            v_hp_expanded = v_hp
+        # Attention with native GQA support (PyTorch 2.5+)
+        q_bf = q_hp.permute(1, 2, 0, 3)  # [batch, q_heads_local, seq, head_dim]
+        k_bf = k_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
+        v_bf = v_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
 
-        # Attention
-        seq_full = q_hp.shape[0]
-        q_bf = q_hp.permute(1, 2, 0, 3).contiguous()
-        k_bf = k_hp_expanded.permute(1, 2, 0, 3).contiguous()
-        v_bf = v_hp_expanded.permute(1, 2, 0, 3).contiguous()
-
+        enable_gqa = (q_heads_local != kv_heads_local)
         scale = 1.0 / (head_dim ** 0.5)
-        attn_out_bf = scaled_dot_product_attention_forward(q_bf, k_bf, v_bf, scale=scale, is_causal=True)
+
+        # Keep computation graph for backward (avoids redundant SDPA forward in backward)
+        with torch.enable_grad():
+            q_for_attn = q_bf.detach().requires_grad_(True)
+            k_for_attn = k_bf.detach().requires_grad_(True)
+            v_for_attn = v_bf.detach().requires_grad_(True)
+            attn_out_bf = scaled_dot_product_attention_forward(
+                q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
+            )
         attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
 
         # AllToAll: hp2sp
         attn_out_sp = _all_to_all_hp2sp(attn_out, cp_group)
 
         # Output projection
-        proj_out = F.linear(attn_out_sp.view(seq_len, batch_size, -1), proj_weight)
+        with _timed_overlap("fwd", "proj"):  # [可重叠] R3 OutProj GEMM
+            proj_out = F.linear(attn_out_sp.view(seq_len, batch_size, -1), proj_weight)
         hidden_after_attn = hidden_states + proj_out
 
         # ===================== MoE =====================
@@ -135,17 +184,20 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         tokens_per_local_expert = [sum(all_tpe[r][e] for r in range(ep_size)) for e in range(num_local_experts)]
 
-        # Expert compute
+        # Expert compute (保存 fc1 供反向使用，避免 FC1 recomp)
         total_recv = recv_tokens.shape[0]
         expert_output = torch.zeros(total_recv, hidden_size, dtype=dtype, device=device)
-
+        fc1_all = torch.empty(total_recv, moe_w1.shape[2], dtype=dtype, device=device)
         offset = 0
         for exp_idx in range(num_local_experts):
             n_tok = tokens_per_local_expert[exp_idx]
             if n_tok > 0:
-                fc1 = torch.matmul(recv_tokens[offset:offset + n_tok], moe_w1[exp_idx])
-                act = activation_func(fc1)
-                expert_output[offset:offset + n_tok] = torch.matmul(act, moe_w2[exp_idx])
+                with _timed_overlap("fwd", "fc1"):  # [可重叠] R2 FC1 GEMM + activation
+                    fc1 = torch.matmul(recv_tokens[offset:offset + n_tok], moe_w1[exp_idx])
+                    fc1_all[offset:offset + n_tok] = fc1
+                    act = activation_func(fc1)
+                with _timed_overlap("fwd", "fc2"):  # [可重叠] R1 FC2 GEMM
+                    expert_output[offset:offset + n_tok] = torch.matmul(act, moe_w2[exp_idx])
                 offset += n_tok
 
         # Combine AllToAll
@@ -160,15 +212,22 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         output = hidden_after_attn + moe_output
 
-        # Save for backward (attention recomputation - don't save attn_out)
+        # Save for backward
         ctx.save_for_backward(
             hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-            q_hp, k_hp, v_hp,  # Save Q, K, V for recomputation
             permuted_tokens, permuted_probs, restore_indices, sorted_indices,
             router_probs, top_indices, recv_tokens, combined_output,
             ln1_weight, ln1_bias, ln2_weight, ln2_bias,
             qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
+            fc1_all,
         )
+        # Save SDPA computation graph (avoids redundant forward in backward)
+        ctx._q_for_attn = q_for_attn
+        ctx._k_for_attn = k_for_attn
+        ctx._v_for_attn = v_for_attn
+        ctx._attn_out_bf = attn_out_bf
+        ctx._attn_out_sp = attn_out_sp  # Save SP format to avoid extra hp2sp in backward
+        ctx._enable_gqa = enable_gqa
         ctx.cp_group = cp_group
         ctx.ep_group = ep_group
         ctx.num_heads = num_heads
@@ -186,11 +245,19 @@ class BaselineTransformerFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-         q_hp, k_hp, v_hp,
          permuted_tokens, permuted_probs, restore_indices, sorted_indices,
          router_probs, top_indices, recv_tokens, combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
-         qkv_weight, proj_weight, router_weight, moe_w1, moe_w2) = ctx.saved_tensors
+         qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
+         fc1_all) = ctx.saved_tensors
+
+        # Retrieve SDPA computation graph
+        q_for_attn = ctx._q_for_attn
+        k_for_attn = ctx._k_for_attn
+        v_for_attn = ctx._v_for_attn
+        attn_out_bf = ctx._attn_out_bf
+        attn_out_sp = ctx._attn_out_sp
+        enable_gqa = ctx._enable_gqa
 
         cp_group = ctx.cp_group
         ep_group = ctx.ep_group
@@ -226,42 +293,110 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Combine AllToAll backward
         grad_expert_output = _moe_all_to_all(grad_combined, input_splits, output_splits, ep_group)
 
-        # Expert backward
+        # Expert backward: FC2 and FC1 timed separately (analogous to forward fwd_fc2/fwd_fc1)
         grad_recv_tokens = torch.zeros_like(recv_tokens)
         grad_moe_w1 = torch.zeros_like(moe_w1)
         grad_moe_w2 = torch.zeros_like(moe_w2)
 
-        offset = 0
+        # Pre-compute per-expert offsets
+        expert_offsets = []
+        off = 0
         for exp_idx in range(num_local_experts):
-            n_tok = tokens_per_local_expert[exp_idx]
-            if n_tok > 0:
-                tokens_slice = recv_tokens[offset:offset + n_tok]
-                grad_out_slice = grad_expert_output[offset:offset + n_tok]
+            expert_offsets.append(off)
+            off += tokens_per_local_expert[exp_idx]
 
-                # FC2 backward
-                fc1 = torch.matmul(tokens_slice, moe_w1[exp_idx])
-                act = activation_func(fc1)
-                grad_moe_w2[exp_idx] = torch.matmul(act.t(), grad_out_slice)
-                grad_act = torch.matmul(grad_out_slice, moe_w2[exp_idx].t())
+        # FC2 dX matmul (pipeline 关键路径, 暴露: 1/n1)
+        grad_act_per_expert = [None] * num_local_experts
+        with _timed_overlap("bwd", "fc2_dx"):
+            for exp_idx in range(num_local_experts):
+                n_tok = tokens_per_local_expert[exp_idx]
+                if n_tok > 0:
+                    o = expert_offsets[exp_idx]
+                    grad_act_per_expert[exp_idx] = torch.matmul(
+                        grad_expert_output[o:o + n_tok], moe_w2[exp_idx].t())
 
-                # Activation backward (GELU)
-                grad_fc1 = grad_act * _gelu_backward(fc1)
+        # Activation backward (AR 可重叠): single activation graph + autograd.grad
+        # Also reuse detached act output for FC2 dW to avoid duplicate activation compute.
+        with _timed_overlap("bwd", "act_bwd"):
+            if fc1_all.numel() == 0:
+                grad_fc1_all = torch.empty_like(fc1_all)
+                act_all_detached = torch.empty_like(fc1_all)
+            else:
+                grad_act_all = torch.zeros_like(fc1_all)
+                for exp_idx in range(num_local_experts):
+                    grad_act_slice = grad_act_per_expert[exp_idx]
+                    if grad_act_slice is None:
+                        continue
+                    o = expert_offsets[exp_idx]
+                    n_valid = grad_act_slice.shape[0]
+                    if n_valid > 0:
+                        grad_act_all[o:o + n_valid] = grad_act_slice
+                with torch.enable_grad():
+                    fc1_with_grad = fc1_all.detach().requires_grad_(True)
+                    act_all = activation_func(fc1_with_grad)
+                    grad_fc1_all, = torch.autograd.grad(
+                        act_all, fc1_with_grad, grad_act_all, retain_graph=False
+                    )
+                act_all_detached = act_all.detach()
 
-                # FC1 backward
-                grad_moe_w1[exp_idx] = torch.matmul(tokens_slice.t(), grad_fc1)
-                grad_recv_tokens[offset:offset + n_tok] = torch.matmul(grad_fc1, moe_w1[exp_idx].t())
+        # FC2 dW matmul (AllToAll 可重叠) - reuse activation output from act_bwd stage
+        with _timed_overlap("bwd", "fc2_dw"):
+            for exp_idx in range(num_local_experts):
+                n_tok = tokens_per_local_expert[exp_idx]
+                if n_tok > 0:
+                    o = expert_offsets[exp_idx]
+                    act_slice = act_all_detached[o:o + n_tok]
+                    grad_moe_w2[exp_idx] = torch.matmul(
+                        act_slice.t(), grad_expert_output[o:o + n_tok])
 
-                offset += n_tok
+        # FC1 dX matmul (pipeline 关键路径, 暴露: 1/n2)
+        with _timed_overlap("bwd", "fc1_dx"):
+            for exp_idx in range(num_local_experts):
+                n_tok = tokens_per_local_expert[exp_idx]
+                if n_tok > 0:
+                    o = expert_offsets[exp_idx]
+                    grad_fc1_slice = grad_fc1_all[o:o + n_tok]
+                    grad_recv_tokens[o:o + n_tok] = torch.matmul(
+                        grad_fc1_slice, moe_w1[exp_idx].t())
+
+        # FC1 dW matmul (AllToAll 可重叠)
+        with _timed_overlap("bwd", "fc1_dw"):
+            for exp_idx in range(num_local_experts):
+                n_tok = tokens_per_local_expert[exp_idx]
+                if n_tok > 0:
+                    o = expert_offsets[exp_idx]
+                    grad_fc1_slice = grad_fc1_all[o:o + n_tok]
+                    grad_moe_w1[exp_idx] = torch.matmul(
+                        recv_tokens[o:o + n_tok].t(), grad_fc1_slice)
 
         # Dispatch AllToAll backward
         grad_permuted_tokens = _moe_all_to_all(grad_recv_tokens, output_splits, input_splits, ep_group)
 
         # Unsort
         grad_expanded_tokens = grad_permuted_tokens[torch.argsort(sorted_indices)]
-        grad_ln2_flat = grad_expanded_tokens.view(num_tokens, top_k, hidden_size).sum(dim=1)
+        grad_ln2_flat_from_tokens = grad_expanded_tokens.view(num_tokens, top_k, hidden_size).sum(dim=1)
 
-        # Router backward (simplified)
-        grad_router_weight = torch.zeros_like(router_weight)
+        # Router backward dX (AR 可重叠)
+        with _timed_overlap("bwd", "router_dx"):
+            grad_permuted_probs = (grad_weighted * combined_output.to(dtype)).sum(dim=-1)
+            grad_expanded_probs = torch.zeros_like(grad_permuted_probs)
+            grad_expanded_probs[sorted_indices] = grad_permuted_probs
+            grad_top_probs = grad_expanded_probs.view(num_tokens, top_k)
+            top_probs_saved = permuted_probs[restore_indices].view(num_tokens, top_k)
+            grad_dot = (grad_top_probs * top_probs_saved).sum(dim=-1, keepdim=True)
+            grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs_saved) / top_probs_saved.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            grad_router_probs = torch.zeros_like(router_probs)
+            grad_router_probs.scatter_(1, top_indices, grad_raw_top_probs)
+            sum_grad_probs = (grad_router_probs * router_probs).sum(dim=-1, keepdim=True)
+            grad_router_logits = router_probs * (grad_router_probs - sum_grad_probs)
+            grad_ln2_flat_from_router = torch.matmul(grad_router_logits.float(), router_weight.t().float()).to(dtype)
+
+        # Router dW (AllToAll 可重叠)
+        with _timed_overlap("bwd", "router_dw"):
+            grad_router_weight = torch.matmul(ln2_flat.t().float(), grad_router_logits.float())
+
+        # Combine gradients from tokens and router
+        grad_ln2_flat = grad_ln2_flat_from_tokens + grad_ln2_flat_from_router
 
         # LayerNorm2 backward
         mean2 = hidden_after_attn.mean(dim=-1, keepdim=True)
@@ -270,58 +405,33 @@ class BaselineTransformerFunction(torch.autograd.Function):
         normalized2 = (hidden_after_attn - mean2) / std2
 
         grad_ln2_out = grad_ln2_flat.view(seq_len, batch_size, hidden_size)
-        grad_ln2_weight = (grad_ln2_out * normalized2).sum(dim=(0, 1))
-        grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
-        grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std2
+        with _timed_overlap("bwd", "ln2_dw"):  # LN2 dW (AllToAll 可重叠)
+            grad_ln2_weight = (grad_ln2_out * normalized2).sum(dim=(0, 1))
+            grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
+        with _timed_overlap("bwd", "ln2_dx"):  # LN2 dX (AR 可重叠)
+            grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std2
 
-        # ===================== Attention Backward (with recomputation) =====================
-        # GQA expansion for backward
-        kv_heads_local = num_kv_heads // cp_size
-        q_heads_local = num_heads // cp_size
-        if q_heads_local > kv_heads_local:
-            expand_ratio = q_heads_local // kv_heads_local
-            k_hp_expanded = k_hp.repeat_interleave(expand_ratio, dim=2)
-            v_hp_expanded = v_hp.repeat_interleave(expand_ratio, dim=2)
-        else:
-            k_hp_expanded = k_hp
-            v_hp_expanded = v_hp
-
-        # Recompute attention output via SDPA (for output projection dW)
-        q_bf = q_hp.permute(1, 2, 0, 3).contiguous()
-        k_bf = k_hp_expanded.permute(1, 2, 0, 3).contiguous()
-        v_bf = v_hp_expanded.permute(1, 2, 0, 3).contiguous()
-
-        with torch.enable_grad():
-            q_recomp = q_bf.detach().requires_grad_(True)
-            k_recomp = k_bf.detach().requires_grad_(True)
-            v_recomp = v_bf.detach().requires_grad_(True)
-            attn_out_bf = F.scaled_dot_product_attention(
-                q_recomp, k_recomp, v_recomp,
-                attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale,
-            )
-
-        attn_out = attn_out_bf.detach().permute(2, 0, 1, 3).contiguous()
-
-        # hp2sp for recomputed attention
-        attn_out_sp = _all_to_all_hp2sp(attn_out, cp_group)
-
-        # Output projection backward
+        # ===================== Attention Backward =====================
+        # OutProj dW (AllToAll 可重叠)
         grad_proj_out = grad_hidden_after_attn.view(seq_len, batch_size, hidden_size)
-        grad_proj_weight = torch.matmul(
-            grad_proj_out.view(-1, hidden_size).t(),
-            attn_out_sp.view(-1, num_heads * head_dim)
-        )
-        grad_attn_out_sp = torch.matmul(grad_proj_out.view(-1, hidden_size), proj_weight)
-        grad_attn_out_sp = grad_attn_out_sp.view(seq_len, batch_size, num_heads, head_dim)
+        with _timed_overlap("bwd", "proj_dw"):
+            grad_proj_weight = torch.matmul(
+                grad_proj_out.view(-1, hidden_size).t(),
+                attn_out_sp.view(-1, num_heads * head_dim)
+            )
+        # OutProj dX (pipeline 关键路径, 暴露: 1/n3)
+        with _timed_overlap("bwd", "proj_dx"):
+            grad_attn_out_sp = torch.matmul(grad_proj_out.view(-1, hidden_size), proj_weight)
+            grad_attn_out_sp = grad_attn_out_sp.view(seq_len, batch_size, num_heads, head_dim)
 
         # sp2hp AllToAll backward
         grad_attn_out = _all_to_all_sp2hp(grad_attn_out_sp, cp_group)
 
-        # Attention backward via SDPA autograd
+        # SDPA backward (AR 可重叠)
         grad_attn_bf = grad_attn_out.permute(1, 2, 0, 3)
-        with torch.enable_grad():
+        with _timed_overlap("bwd", "sdpa_dx"):
             grad_q_bf, grad_k_bf, grad_v_bf = torch.autograd.grad(
-                attn_out_bf, (q_recomp, k_recomp, v_recomp),
+                attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
                 grad_attn_bf, retain_graph=False,
             )
 
@@ -329,21 +439,14 @@ class BaselineTransformerFunction(torch.autograd.Function):
         grad_k_hp = grad_k_bf.permute(2, 0, 1, 3)
         grad_v_hp = grad_v_bf.permute(2, 0, 1, 3)
 
-        # GQA contraction
-        if q_heads_local > kv_heads_local:
-            grad_k_hp = grad_k_hp.view(grad_k_hp.shape[0], batch_size, kv_heads_local, expand_ratio, head_dim).sum(dim=3)
-            grad_v_hp = grad_v_hp.view(grad_v_hp.shape[0], batch_size, kv_heads_local, expand_ratio, head_dim).sum(dim=3)
-
         # hp2sp AllToAll backward (combined QKV)
         grad_qkv_hp = torch.cat([grad_q_hp, grad_k_hp, grad_v_hp], dim=2)
         grad_qkv_sp = _all_to_all_hp2sp(grad_qkv_hp, cp_group)
-        q_heads_local = num_heads // cp_size
-        kv_heads_local = num_kv_heads // cp_size
         grad_q_sp = grad_qkv_sp[:, :, :num_heads, :]
         grad_k_sp = grad_qkv_sp[:, :, num_heads:num_heads + num_kv_heads, :]
         grad_v_sp = grad_qkv_sp[:, :, num_heads + num_kv_heads:, :]
 
-        # QKV projection backward
+        # QKV reshape (shared setup)
         q_per_kv = num_heads // num_kv_heads
         grad_qkv = torch.zeros(seq_len, batch_size, num_kv_heads, (q_per_kv + 2) * head_dim,
                                dtype=dtype, device=device)
@@ -351,10 +454,14 @@ class BaselineTransformerFunction(torch.autograd.Function):
         grad_qkv[:, :, :, :q_dim] = grad_q_sp.view(seq_len, batch_size, num_kv_heads, q_dim)
         grad_qkv[:, :, :, q_dim:q_dim + head_dim] = grad_k_sp
         grad_qkv[:, :, :, q_dim + head_dim:] = grad_v_sp
-
         grad_qkv_flat = grad_qkv.view(seq_len * batch_size, -1)
-        grad_qkv_weight = torch.matmul(grad_qkv_flat.t(), ln1_out.view(-1, hidden_size))
-        grad_ln1_out = torch.matmul(grad_qkv_flat, qkv_weight).view(seq_len, batch_size, hidden_size)
+
+        # QKV dW (AllToAll 可重叠)
+        with _timed_overlap("bwd", "qkv_dw"):
+            grad_qkv_weight = torch.matmul(grad_qkv_flat.t(), ln1_out.view(-1, hidden_size))
+        # QKV dX (pipeline 关键路径, 暴露: 1/n4)
+        with _timed_overlap("bwd", "qkv_dx"):
+            grad_ln1_out = torch.matmul(grad_qkv_flat, qkv_weight).view(seq_len, batch_size, hidden_size)
 
         # Residual
         grad_hidden_states = grad_hidden_after_attn.clone()
@@ -365,9 +472,13 @@ class BaselineTransformerFunction(torch.autograd.Function):
         std1 = (var1 + 1e-5).sqrt()
         normalized1 = (hidden_states - mean1) / std1
 
-        grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
-        grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
-        grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
+        # LN1 dW (AllToAll 可重叠)
+        with _timed_overlap("bwd", "ln1_dw"):
+            grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
+            grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
+        # LN1 dX (AR 可重叠)
+        with _timed_overlap("bwd", "ln1_dx"):
+            grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
 
         return (
             grad_hidden_states,
@@ -379,13 +490,6 @@ class BaselineTransformerFunction(torch.autograd.Function):
             None, None,  # groups
             None, None, None, None, None,  # config
         )
-
-
-def _gelu_backward(x):
-    """GELU backward."""
-    cdf = 0.5 * (1.0 + torch.erf(x / 1.4142135623730951))
-    pdf = torch.exp(-0.5 * x * x) / 2.5066282746310002
-    return cdf + x * pdf
 
 
 def _all_to_all_sp2hp(x: torch.Tensor, group) -> torch.Tensor:
