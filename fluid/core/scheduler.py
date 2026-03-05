@@ -104,10 +104,10 @@ class BackwardScheduler:
         self.ar_enabled = False
         self.ar_safe_mode = False
         self.ar_lockstep = False
-        self.dp_group = None
+        self.shared_dp_group = None
         self.ar_group = None  # Independent NCCL communicator for AR
         self.ar_ctrl_group = None  # Optional Gloo control group for lockstep gating
-        self.dp_world_size = 1
+        self.shared_dp_world_size = 1
         self.ar_window_mode = "strict_window"
 
         # Stats
@@ -168,16 +168,22 @@ class BackwardScheduler:
     def is_enabled(self):
         return self.enabled
 
-    def configure_allreduce(self, enabled=True, dp_group=None, **kwargs):
-        """Configure AllReduce settings.
+    def configure_allreduce(self, enabled=True, shared_dp_group=None, **kwargs):
+        """Configure AllReduce settings for shared parameters.
+
+        Args:
+            shared_dp_group: Process group for shared parameter gradient AR.
+                This should include ALL ranks that hold identical shared params
+                (= all ranks across both dp and cp dimensions).
+                Expert params use a different group (dp subgroup only).
 
         Creates an independent NCCL communicator (ar_group) for AllReduce.
         AR runs on comm_stream (same as A2A) to prevent cross-communicator
         NCCL deadlocks via CUDA stream-level serialization.
         """
         self.ar_enabled = enabled
-        self.dp_group = dp_group
-        self.dp_world_size = dist.get_world_size(dp_group) if dp_group else (
+        self.shared_dp_group = shared_dp_group
+        self.shared_dp_world_size = dist.get_world_size(shared_dp_group) if shared_dp_group else (
             dist.get_world_size() if dist.is_initialized() else 1)
 
         mode_env = os.environ.get("FLUID_AR_WINDOW_MODE", "strict_window").lower()
@@ -204,15 +210,15 @@ class BackwardScheduler:
         elif lockstep_env in ("0", "false", "no", "off"):
             self.ar_lockstep = False
         else:
-            self.ar_lockstep = self.dp_world_size > 1
+            self.ar_lockstep = self.shared_dp_world_size > 1
         if self.ar_safe_mode:
             self.ar_lockstep = False
 
         # Create independent communicator for AR
-        if dp_group is not None and dist.is_initialized():
-            ranks = dist.get_process_group_ranks(dp_group)
+        if shared_dp_group is not None and dist.is_initialized():
+            ranks = dist.get_process_group_ranks(shared_dp_group)
             self.ar_group = dist.new_group(ranks)
-            if self.dp_world_size > 1 and self.ar_lockstep:
+            if self.shared_dp_world_size > 1 and self.ar_lockstep:
                 self.ar_ctrl_group = dist.new_group(ranks=ranks, backend="gloo")
             else:
                 self.ar_ctrl_group = None
@@ -386,7 +392,7 @@ class BackwardScheduler:
                         task.weight_param.grad.add_(grad_weight)
 
                     # AR handling (fallback)
-                    if task.needs_ar and self.dp_world_size > 1:
+                    if task.needs_ar and self.shared_dp_world_size > 1:
                         if self._use_interleaved_ar():
                             self._pending_ar_tensors.append(task.weight_param.grad)
                         else:
@@ -524,7 +530,7 @@ class BackwardScheduler:
            A2As have been waited for).  This is a deterministic condition
            that does NOT depend on timing.
         """
-        if not self._use_interleaved_ar() or self.dp_world_size <= 1:
+        if not self._use_interleaved_ar() or self.shared_dp_world_size <= 1:
             return
 
         # Check if there's anything to submit
@@ -540,7 +546,7 @@ class BackwardScheduler:
         if self._alltoall_results:
             return
 
-        ar_group = self.ar_group if self.ar_group is not None else self.dp_group
+        ar_group = self.ar_group if self.ar_group is not None else self.shared_dp_group
         region = self._region_name
         budget = self.ar_trickle_sizes.get(region, 0) if region else 0
 
@@ -649,7 +655,7 @@ class BackwardScheduler:
 
         self._a2a_idle.wait()
 
-        ar_group = self.ar_group if self.ar_group is not None else self.dp_group
+        ar_group = self.ar_group if self.ar_group is not None else self.shared_dp_group
 
         with torch.cuda.stream(self.comm_stream):
             # Ensure comm_stream sees all gradients written on default_stream
@@ -704,7 +710,7 @@ class BackwardScheduler:
 
     def flush_ar_pending(self, final: bool = False):
         """Submit all deferred AR tensors in deterministic order."""
-        if not self._use_interleaved_ar() or self.dp_world_size <= 1:
+        if not self._use_interleaved_ar() or self.shared_dp_world_size <= 1:
             self._pending_ar_tensors.clear()
             return
 
@@ -723,13 +729,13 @@ class BackwardScheduler:
         """Synchronously AllReduce all collected params and flat buffers."""
         # Flat buffer AR (all grads written by execute_dw_tasks)
         if self._ar_buffer_bf16 is not None:
-            dist.all_reduce(self._ar_buffer_bf16, group=self.dp_group)
+            dist.all_reduce(self._ar_buffer_bf16, group=self.shared_dp_group)
         if self._ar_buffer_fp32 is not None:
-            dist.all_reduce(self._ar_buffer_fp32, group=self.dp_group)
+            dist.all_reduce(self._ar_buffer_fp32, group=self.shared_dp_group)
         # Fallback: individual params (unregistered)
         for param in self._ar_params_for_sync:
             if param.grad is not None:
-                dist.all_reduce(param.grad, group=self.dp_group)
+                dist.all_reduce(param.grad, group=self.shared_dp_group)
         self._ar_params_for_sync.clear()
 
     # ========================================
@@ -806,7 +812,7 @@ class BackwardScheduler:
         self.execute_dw_tasks()
 
         # 2. Flush + wait for ALL AR before returning.
-        if self._use_interleaved_ar() and self.dp_world_size > 1:
+        if self._use_interleaved_ar() and self.shared_dp_world_size > 1:
             self.flush_ar_pending(final=True)
             self._wait_all_ar()
 
@@ -816,7 +822,7 @@ class BackwardScheduler:
         self._last_a2a_end_region = None
 
         # 3. In sync mode (ar_enabled=False) OR safe mode, do sync AR.
-        if (not self._use_interleaved_ar()) and self.dp_world_size > 1:
+        if (not self._use_interleaved_ar()) and self.shared_dp_world_size > 1:
             self._sync_allreduce_all_params()
 
         self._in_finish_batch = False

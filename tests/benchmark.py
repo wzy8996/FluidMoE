@@ -2,7 +2,8 @@
 FluidMoE Benchmark
 
 用法:
-    torchrun --nproc_per_node=2 tests/benchmark.py
+    torchrun --nproc_per_node=2 tests/benchmark.py   # dp=1, cp=2
+    torchrun --nproc_per_node=4 tests/benchmark.py   # dp=2, cp=2
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,16 +48,56 @@ ar_trickle_sizes = {
     'attn_qkv': 24 * 1024 * 1024,
 }
 
+# 并行度配置
+dp_size = 1   # 数据并行度，dp > 1 时专家参数也需要 AR
+cp_size = 2   # 上下文并行度（注意力 AllToAll）
+ep_size = 2   # 专家并行度（MoE AllToAll），当前要求 ep = cp
+num_gpus = dp_size * cp_size  # 参与的总 GPU 数
+
 N_WARMUP = 5
 N_ITER = 10
 
-seq_local = seq_len // world_size
+assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
+assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+seq_local = seq_len // cp_size
+
+# 多余的 rank 提前退出
+if rank >= num_gpus:
+    dist.barrier()
+    dist.destroy_process_group()
+    exit(0)
+
+# 创建进程组
+# all_group: 所有参与 rank（共享参数 AR 用，= dp + cp 两个维度的全集）
+# cp_group = ep_group: 同一 dp 副本内的 rank（注意力/MoE AllToAll 用）
+# dp_group: 持有相同专家分区的 rank（专家参数 AR 用，仅 dp > 1 时需要）
+if dp_size == 1 and num_gpus == world_size:
+    all_group = cp_group = ep_group = dp_group = dist.group.WORLD
+else:
+    # all_group: 所有参与的 rank
+    if num_gpus == world_size:
+        all_group = dist.group.WORLD
+    else:
+        all_group = dist.new_group(list(range(num_gpus)))
+    # cp_group = ep_group: 连续 cp_size 个 rank
+    for i in range(dp_size):
+        ranks = list(range(i * cp_size, (i + 1) * cp_size))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            cp_group = ep_group = g
+    # dp_group: 间隔 cp_size 的 rank（持有相同专家的 rank）
+    for i in range(cp_size):
+        ranks = list(range(i, num_gpus, cp_size))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            dp_group = g
 
 p0("=" * 60)
 p0("FluidMoE Benchmark")
 p0(f"  hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
 p0(f"  experts={num_experts}, top_k={top_k}, layers={num_layers}")
-p0(f"  seq={seq_len}, batch={batch_size}, GPUs={world_size}")
+p0(f"  seq={seq_len}, batch={batch_size}, GPUs={num_gpus}")
+p0(f"  dp={dp_size}, cp={cp_size}, ep={ep_size}")
 p0(f"  chunks: combine={moe_combine_chunks}, dispatch={moe_dispatch_chunks}, "
    f"proj={attn_proj_chunks}, qkv={attn_qkv_chunks}")
 p0("=" * 60)
@@ -70,7 +111,7 @@ baseline_model = BaselineTransformerModel(
     num_layers=num_layers, hidden_size=hidden_size,
     num_heads=num_heads, num_kv_heads=num_kv_heads,
     ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
-    cp_group=dist.group.WORLD, ep_group=dist.group.WORLD,
+    cp_group=cp_group, ep_group=ep_group,
     dtype=torch.bfloat16, device=device,
 )
 
@@ -78,7 +119,7 @@ fluidmoe_model = TransformerModel(
     num_layers=num_layers, hidden_size=hidden_size,
     num_heads=num_heads, num_kv_heads=num_kv_heads,
     ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
-    cp_group=dist.group.WORLD, ep_group=dist.group.WORLD,
+    cp_group=cp_group, ep_group=ep_group,
     attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
     moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
     ar_trickle_sizes=ar_trickle_sizes,
@@ -89,8 +130,7 @@ scheduler = get_backward_scheduler()
 scheduler.enable()
 scheduler.configure_allreduce(
     enabled=True,
-    dp_group=dist.group.WORLD,
-    ep_group=dist.group.WORLD,
+    shared_dp_group=all_group,
 )
 fluidmoe_model.setup_ar_buffer()
 
@@ -102,11 +142,18 @@ ev_e = torch.cuda.Event(enable_timing=True)
 
 def allreduce_grads(model):
     for layer in model.layers:
+        # 共享参数: 所有 rank 都持有，AR 跨全部 rank
         for name in ('qkv_weight', 'proj_weight', 'router_weight',
                      'ln1_weight', 'ln1_bias', 'ln2_weight', 'ln2_bias'):
             p = getattr(layer, name, None)
             if p is not None and p.grad is not None:
-                dist.all_reduce(p.grad, group=dist.group.WORLD)
+                dist.all_reduce(p.grad, group=all_group)
+        # 专家参数: 按 EP 分区，AR 仅跨持有相同专家的 dp rank
+        if dp_size > 1:
+            for name in ('moe_w1', 'moe_w2'):
+                p = getattr(layer, name, None)
+                if p is not None and p.grad is not None:
+                    dist.all_reduce(p.grad, group=dp_group)
 
 
 def run_baseline_bwd():
@@ -117,12 +164,24 @@ def run_baseline_bwd():
     allreduce_grads(baseline_model)
 
 
+def allreduce_expert_grads(model):
+    """AR expert params across dp subgroup (only needed when dp > 1)."""
+    if dp_size <= 1:
+        return
+    for layer in model.layers:
+        for name in ('moe_w1', 'moe_w2'):
+            p = getattr(layer, name, None)
+            if p is not None and p.grad is not None:
+                dist.all_reduce(p.grad, group=dp_group)
+
+
 def run_fluid_bwd():
     x_grad.grad = None
     for p in fluidmoe_model.parameters():
         p.grad = None
     fluidmoe_model(x_grad).sum().backward()
     scheduler.finish_batch()
+    allreduce_expert_grads(fluidmoe_model)
     scheduler.clear_iteration()
 
 
@@ -143,14 +202,14 @@ def bench(run_fn, warmup=N_WARMUP, iters=N_ITER):
 # ============================================================
 # Warmup
 # ============================================================
-p0("\nWarmup...")
+p0("Warmup...")
 for _ in range(N_WARMUP):
     with torch.no_grad():
         baseline_model(x)
         fluidmoe_model(x)
 torch.cuda.synchronize()
 dist.barrier()
-p0("Warmup done.\n")
+p0("Warmup done.")
 
 # ============================================================
 # Forward

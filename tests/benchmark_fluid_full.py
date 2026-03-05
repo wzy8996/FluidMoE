@@ -82,8 +82,7 @@ scheduler_nooverlap = get_backward_scheduler()
 scheduler_nooverlap.enable()
 scheduler_nooverlap.configure_allreduce(
     enabled=False,  # Disable AR interleaving
-    dp_group=dist.group.WORLD,
-    ep_group=ep_group,
+    shared_dp_group=dist.group.WORLD,
 )
 
 p0(f"✓ Model created (no overlap)")
@@ -181,8 +180,7 @@ scheduler_overlap = get_backward_scheduler()
 scheduler_overlap.enable()
 scheduler_overlap.configure_allreduce(
     enabled=True,  # Enable AR interleaving
-    dp_group=dist.group.WORLD,
-    ep_group=ep_group,
+    shared_dp_group=dist.group.WORLD,
 )
 
 p0(f"✓ Model created (with overlap)")

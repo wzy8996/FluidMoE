@@ -267,6 +267,7 @@ def register_moe_dw_tasks(
     layer_id: int,
     orig_weight1: torch.Tensor,
     orig_weight2: torch.Tensor,
+    needs_ar: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Register dW tasks for weight1 and weight2 to execute during AllToAll communication.
@@ -353,14 +354,14 @@ def register_moe_dw_tasks(
             layer_id=layer_id,
             compute_fn=compute_dw_weight2,
             weight_param=orig_weight2,
-            needs_ar=False,  # Expert params use EP, not DP
+            needs_ar=needs_ar,
         )
         scheduler.register_dw_task(
             layer_name=f"moe_weight1_L{layer_id}",
             layer_id=layer_id,
             compute_fn=compute_dw_weight1,
             weight_param=orig_weight1,
-            needs_ar=False,  # Expert params use EP, not DP
+            needs_ar=needs_ar,
         )
         return None, None
     else:

@@ -7,7 +7,8 @@ FluidMoE 完整参数搜索
   3. 网格搜索验证 BDP 预测
 
 用法:
-    torchrun --nproc_per_node=2 tools/tune.py
+    torchrun --nproc_per_node=2 tools/tune.py   # dp=1, cp=2
+    torchrun --nproc_per_node=4 tools/tune.py   # dp=2, cp=2
 """
 import sys, os, gc
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +39,12 @@ top_k = 4
 seq_local = 2048
 batch_size = 4
 
+# 并行度配置
+dp_size = 1   # 数据并行度，dp > 1 时专家参数也需要 AR
+cp_size = 2   # 上下文并行度（注意力 AllToAll）
+ep_size = 2   # 专家并行度（MoE AllToAll），当前要求 ep = cp
+num_gpus = dp_size * cp_size  # 参与的总 GPU 数
+
 # Chunk 搜索参数
 N_WARMUP = 5            # 预热轮数 (forward+backward)
 N_ITER = 10             # 测量轮数
@@ -47,6 +54,37 @@ STOP_MIN_SAVING_MS = 0.5  # 早停阈值 (ms)
 # AR 搜索参数
 N_AR_WARMUP = 5         # 预热轮数
 N_AR_ITER = 10          # 测量轮数
+
+assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
+assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+
+# 多余的 rank 提前退出
+if rank >= num_gpus:
+    dist.barrier()
+    dist.destroy_process_group()
+    exit(0)
+
+# 创建进程组
+# all_group: 所有参与 rank（共享参数 AR 用）
+# cp_group = ep_group: 同一 dp 副本内的 rank
+# dp_group: 持有相同专家分区的 rank（专家参数 AR 用）
+if dp_size == 1 and num_gpus == world_size:
+    all_group = cp_group = ep_group = dp_group = dist.group.WORLD
+else:
+    if num_gpus == world_size:
+        all_group = dist.group.WORLD
+    else:
+        all_group = dist.new_group(list(range(num_gpus)))
+    for i in range(dp_size):
+        ranks = list(range(i * cp_size, (i + 1) * cp_size))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            cp_group = ep_group = g
+    for i in range(cp_size):
+        ranks = list(range(i, num_gpus, cp_size))
+        g = dist.new_group(ranks)
+        if rank in ranks:
+            dp_group = g
 
 # ============================================================
 # 初始化
@@ -60,7 +98,8 @@ p0("FluidMoE 完整参数搜索")
 p0("=" * 60)
 p0(f"Config: hidden={hidden_size}, heads={num_heads}, kv_heads={num_kv_heads}")
 p0(f"        ffn={ffn_hidden}, experts={num_experts}, top_k={top_k}")
-p0(f"        seq_local={seq_local}, batch={batch_size}, GPUs={world_size}")
+p0(f"        seq_local={seq_local}, batch={batch_size}, GPUs={num_gpus}")
+p0(f"        dp={dp_size}, cp={cp_size}, ep={ep_size}")
 p0(f"Chunk 搜索: warmup={N_WARMUP}, iter={N_ITER}, max_C={MAX_C}, stop<{STOP_MIN_SAVING_MS} ms")
 p0(f"AR 搜索:    warmup={N_AR_WARMUP}, iter={N_AR_ITER}")
 p0("=" * 60)
@@ -69,7 +108,7 @@ model_kwargs = dict(
     num_layers=2, hidden_size=hidden_size,
     num_heads=num_heads, num_kv_heads=num_kv_heads,
     ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
-    cp_group=dist.group.WORLD, ep_group=dist.group.WORLD,
+    cp_group=cp_group, ep_group=ep_group,
 )
 
 # 固定输入 (所有步骤共用)
@@ -81,11 +120,12 @@ def get_valid_chunks(size, max_C=MAX_C):
 
 
 # 在任何训练开始前调用 configure_allreduce，创建 ar_group
-# (dist.new_group 是集合操作，必须在两个 rank 完全同步时调用一次)
-# enabled=False: Step 1 使用同步 AR 模式 (ar_enabled=False + dp_world_size=world_size)
+# (dist.new_group 是集合操作，必须在所有 rank 同步时调用一次)
+# shared_dp_group=all_group: 共享参数 AR 跨所有参与 rank (shared_dp_world_size=num_gpus)
+# enabled=False: Step 1 使用同步 AR 模式
 # Step 2/3 设 ar_enabled=True 切换为插入 AR 模式
 sched = get_backward_scheduler()
-sched.configure_allreduce(enabled=False, dp_group=dist.group.WORLD)
+sched.configure_allreduce(enabled=False, shared_dp_group=all_group)
 
 
 # ============================================================
@@ -106,7 +146,7 @@ chunk_model = TransformerModel(
     attn_proj_chunks=1, attn_qkv_chunks=1,
     dtype=torch.bfloat16, device=device,
 )
-sched.enable()  # ar_enabled=False + dp_world_size=world_size → 同步 AR 模式
+sched.enable()  # ar_enabled=False + shared_dp_world_size=num_gpus → 同步 AR 模式
 chunk_model.setup_ar_buffer()
 
 xg = x_input.clone().detach().requires_grad_(True)
@@ -244,7 +284,7 @@ REGION_GAP_DESC = {
 
 # --- 2a: 测量 AR 带宽 ---
 p0(f"\n  2a. 测量 AllReduce 带宽...")
-ar_group = sched.ar_group if sched.ar_group is not None else sched.dp_group
+ar_group = sched.ar_group if sched.ar_group is not None else sched.shared_dp_group
 bw_result = BackwardScheduler.measure_ar_bandwidth(
     ar_group=ar_group,
     sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),

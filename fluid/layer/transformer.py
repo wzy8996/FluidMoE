@@ -422,6 +422,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler.end_region()
 
         # Register dW tasks for MoE weights (between Region 1 and 2)
+        # Expert params use EP partitioning; AR handled separately when dp > 1
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
             moe_w1, moe_w2, all_expert_tokens, act_output,
             grad_all_fc2,
@@ -808,9 +809,13 @@ class TransformerModel(nn.Module):
     def setup_ar_buffer(self):
         """Set up flat AR buffer for zero-copy trickle slicing.
 
-        Registers all shared parameters (needing AllReduce) in backward
-        execution order (last layer first), then allocates contiguous
-        flat buffers on the scheduler.
+        Registers shared parameters (needing AllReduce across all ranks)
+        in backward execution order (last layer first), then allocates
+        contiguous flat buffers on the scheduler.
+
+        Expert params (moe_w1/w2) are NOT included here because they use
+        EP partitioning and need AR across a different group (dp subgroup)
+        when dp > 1.
         """
         sched = get_backward_scheduler()
         params = []

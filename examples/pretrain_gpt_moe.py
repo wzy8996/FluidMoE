@@ -169,9 +169,9 @@ def main():
     dp_group = parallel_state.get_data_parallel_group()
     dp_world_size = parallel_state.get_data_parallel_world_size()
     if dp_world_size > 1:
-        scheduler.configure_allreduce(enabled=True, dp_group=dp_group)
+        scheduler.configure_allreduce(enabled=True, shared_dp_group=dp_group)
     else:
-        scheduler.configure_allreduce(enabled=False, dp_group=dp_group)
+        scheduler.configure_allreduce(enabled=False, shared_dp_group=dp_group)
 
     num_params = sum(p.numel() for p in model.parameters())
     if rank == 0:

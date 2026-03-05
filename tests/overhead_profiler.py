@@ -354,7 +354,7 @@ p0("-" * 60)
 from fluid.core.scheduler import get_backward_scheduler
 scheduler = get_backward_scheduler()
 scheduler.enable()
-scheduler.configure_allreduce(enabled=False, dp_group=dist.group.WORLD, ep_group=dist.group.WORLD)
+scheduler.configure_allreduce(enabled=False, shared_dp_group=dist.group.WORLD)
 
 # 测量 submit + wait 的纯开销 (用空操作)
 dummy_result = [None]
