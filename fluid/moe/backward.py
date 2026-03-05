@@ -574,7 +574,8 @@ def combine_fc2_backward(
             grad_output.contiguous(),
             output_split_sizes=output_splits_list,
             input_split_sizes=input_splits_list,
-            group=ep_group
+            group=ep_group,
+            debug_tag="moe_combine_sync",
         )
         nvtx_range_pop()
 
@@ -619,7 +620,8 @@ def combine_fc2_backward(
                 grad_output_contig,
                 output_split_sizes=output_splits_list,
                 input_split_sizes=input_splits_list,
-                group=ep_group
+                group=ep_group,
+                debug_tag="moe_combine_async_c1",
             )
             return result_holder[0]
 
@@ -924,7 +926,8 @@ def fc1_dispatch_backward(
                     grad_dispatched_contig,
                     output_split_sizes=input_splits_list,
                     input_split_sizes=output_splits_list,
-                    group=ep_group
+                    group=ep_group,
+                    debug_tag="moe_dispatch_async_c1",
                 )
                 return result_holder[0]
 
@@ -939,7 +942,8 @@ def fc1_dispatch_backward(
                 grad_dispatched.contiguous(),
                 output_split_sizes=input_splits_list,
                 input_split_sizes=output_splits_list,
-                group=ep_group
+                group=ep_group,
+                debug_tag="moe_dispatch_sync",
             )
 
         nvtx_range_pop()  # fc1_dispatch_backward

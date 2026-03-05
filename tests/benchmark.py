@@ -3,16 +3,11 @@ FluidMoE Benchmark
 
 用法:
     torchrun --nproc_per_node=2 tests/benchmark.py
-
-配置说明:
-    - chunks: 反向传播分块数 (1=不分块, 2/4/8=分块重叠)
 """
-import sys
-import os
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 rank = int(os.environ.get('LOCAL_RANK', 0))
 device = torch.device(f'cuda:{rank}')
@@ -34,25 +29,36 @@ ffn_hidden = 14336
 num_experts = 8
 top_k = 4
 num_layers = 2
-seq_len = 4096  # 全局序列长度
+seq_len = 4096
 batch_size = 4
 
 # 各 region 分块数 (R1=moe_combine, R2=moe_dispatch, R3=attn_proj, R4=attn_qkv)
-moe_combine_chunks = 4
-moe_dispatch_chunks = 1
+moe_combine_chunks = 2
+moe_dispatch_chunks = 2
 attn_proj_chunks = 1
 attn_qkv_chunks = 4
 
-seq_local = seq_len // world_size  # 本地序列长度
+# Per-region AR trickle sizes (bytes), from tune.py BDP model.
+# 0 = unlimited (submit all pending). Set by tune.py output.
+ar_trickle_sizes = {
+    'moe_combine': 185 * 1024 * 1024,
+    'moe_dispatch': 147 * 1024 * 1024,
+    'attn_proj': 24 * 1024 * 1024,
+    'attn_qkv': 24 * 1024 * 1024,
+}
+
+N_WARMUP = 5
+N_ITER = 10
+
+seq_local = seq_len // world_size
 
 p0("=" * 60)
 p0("FluidMoE Benchmark")
-p0("=" * 60)
-p0(f"Config: hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
-p0(f"        experts={num_experts}, top_k={top_k}, layers={num_layers}")
-p0(f"        seq_len={seq_len}, seq_local={seq_local}, batch={batch_size}, GPUs={world_size}")
-p0(f"        chunks: R1={moe_combine_chunks}, R2={moe_dispatch_chunks}, "
-   f"R3={attn_proj_chunks}, R4={attn_qkv_chunks}")
+p0(f"  hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
+p0(f"  experts={num_experts}, top_k={top_k}, layers={num_layers}")
+p0(f"  seq={seq_len}, batch={batch_size}, GPUs={world_size}")
+p0(f"  chunks: combine={moe_combine_chunks}, dispatch={moe_dispatch_chunks}, "
+   f"proj={attn_proj_chunks}, qkv={attn_qkv_chunks}")
 p0("=" * 60)
 
 from fluid.layer import TransformerModel
@@ -75,50 +81,43 @@ fluidmoe_model = TransformerModel(
     cp_group=dist.group.WORLD, ep_group=dist.group.WORLD,
     attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
     moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
+    ar_trickle_sizes=ar_trickle_sizes,
     dtype=torch.bfloat16, device=device,
 )
 
-# 启用调度器
 scheduler = get_backward_scheduler()
 scheduler.enable()
-scheduler.ar_chunk_size = 16 * 1024 * 1024  # 16 MB (根据 ar_tune.py 测得的最优值)
 scheduler.configure_allreduce(
     enabled=True,
     dp_group=dist.group.WORLD,
     ep_group=dist.group.WORLD,
 )
+fluidmoe_model.setup_ar_buffer()
 
 x = torch.randn(seq_local, batch_size, hidden_size, dtype=torch.bfloat16, device=device)
 x_grad = x.clone().detach().requires_grad_(True)
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-N = 5
+ev_s = torch.cuda.Event(enable_timing=True)
+ev_e = torch.cuda.Event(enable_timing=True)
 
-# Baseline AR helper
-def allreduce_model_grads(model):
+
+def allreduce_grads(model):
     for layer in model.layers:
         for name in ('qkv_weight', 'proj_weight', 'router_weight',
                      'ln1_weight', 'ln1_bias', 'ln2_weight', 'ln2_bias'):
-            param = getattr(layer, name, None)
-            if param is not None and param.grad is not None:
-                dist.all_reduce(param.grad, group=dist.group.WORLD)
+            p = getattr(layer, name, None)
+            if p is not None and p.grad is not None:
+                dist.all_reduce(p.grad, group=dist.group.WORLD)
 
-# ============================================================
-# Warmup
-# ============================================================
-p0("\nWarmup...")
-for i in range(3):
-    with torch.no_grad():
-        baseline_model(x)
-        fluidmoe_model(x)
 
-for wi in range(2):
+def run_baseline_bwd():
     x_grad.grad = None
     for p in baseline_model.parameters():
         p.grad = None
     baseline_model(x_grad).sum().backward()
-    allreduce_model_grads(baseline_model)
+    allreduce_grads(baseline_model)
 
+
+def run_fluid_bwd():
     x_grad.grad = None
     for p in fluidmoe_model.parameters():
         p.grad = None
@@ -126,97 +125,70 @@ for wi in range(2):
     scheduler.finish_batch()
     scheduler.clear_iteration()
 
-torch.cuda.synchronize()
-dist.barrier()
-p0("Warmup done.")
+
+def bench(run_fn, warmup=N_WARMUP, iters=N_ITER):
+    for _ in range(warmup):
+        run_fn()
+    torch.cuda.synchronize()
+    scheduler.clear_iteration()
+    ev_s.record()
+    for _ in range(iters):
+        run_fn()
+    ev_e.record()
+    torch.cuda.synchronize()
+    scheduler.clear_iteration()
+    return ev_s.elapsed_time(ev_e) / iters
+
 
 # ============================================================
-# Forward Only
+# Warmup
 # ============================================================
-start_event.record()
-for _ in range(N):
+p0("\nWarmup...")
+for _ in range(N_WARMUP):
     with torch.no_grad():
         baseline_model(x)
-end_event.record()
+        fluidmoe_model(x)
 torch.cuda.synchronize()
-baseline_fwd = start_event.elapsed_time(end_event) / N
+dist.barrier()
+p0("Warmup done.\n")
 
-start_event.record()
-for _ in range(N):
+# ============================================================
+# Forward
+# ============================================================
+ev_s.record()
+for _ in range(N_ITER):
+    with torch.no_grad():
+        baseline_model(x)
+ev_e.record()
+torch.cuda.synchronize()
+baseline_fwd = ev_s.elapsed_time(ev_e) / N_ITER
+
+ev_s.record()
+for _ in range(N_ITER):
     with torch.no_grad():
         fluidmoe_model(x)
-end_event.record()
+ev_e.record()
 torch.cuda.synchronize()
-fluidmoe_fwd = start_event.elapsed_time(end_event) / N
+fluidmoe_fwd = ev_s.elapsed_time(ev_e) / N_ITER
 
 # ============================================================
-# Forward + Backward + AR
+# Backward + AR
 # ============================================================
-start_event.record()
-for _ in range(N):
-    x_grad.grad = None
-    for p in baseline_model.parameters():
-        p.grad = None
-    baseline_model(x_grad).sum().backward()
-    allreduce_model_grads(baseline_model)
-end_event.record()
-torch.cuda.synchronize()
-baseline_fwdbwd = start_event.elapsed_time(end_event) / N
+baseline_bwd = bench(run_baseline_bwd)
 
-# FluidMoE + sync AR (ar_enabled=False)
-scheduler.clear_iteration()
 scheduler.ar_enabled = False
-for _ in range(2):  # warmup
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-torch.cuda.synchronize()
-scheduler.clear_iteration()
+fluidmoe_sync = bench(run_fluid_bwd)
 
-start_event.record()
-for _ in range(N):
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-end_event.record()
-torch.cuda.synchronize()
-fluidmoe_sync = start_event.elapsed_time(end_event) / N
-scheduler.clear_iteration()
-
-# FluidMoE + interleaved AR (ar_enabled=True)
 scheduler.ar_enabled = True
-for _ in range(2):  # warmup
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-torch.cuda.synchronize()
-scheduler.clear_iteration()
-
-start_event.record()
-for _ in range(N):
-    x_grad.grad = None
-    for p in fluidmoe_model.parameters():
-        p.grad = None
-    fluidmoe_model(x_grad).sum().backward()
-    scheduler.finish_batch()
-end_event.record()
-torch.cuda.synchronize()
-fluidmoe_interleaved = start_event.elapsed_time(end_event) / N
-scheduler.clear_iteration()
+fluidmoe_interleaved = bench(run_fluid_bwd)
 
 # ============================================================
 # 输出
 # ============================================================
-p0(f"\nForward:     Baseline {baseline_fwd:.2f}ms  FluidMoE {fluidmoe_fwd:.2f}ms  Speedup {baseline_fwd/fluidmoe_fwd:.2f}x")
-p0(f"Fwd+Bwd+AR:  Baseline {baseline_fwdbwd:.2f}ms")
-p0(f"  sync AR:   FluidMoE {fluidmoe_sync:.2f}ms  Speedup {baseline_fwdbwd/fluidmoe_sync:.2f}x")
-p0(f"  interl AR: FluidMoE {fluidmoe_interleaved:.2f}ms  Speedup {baseline_fwdbwd/fluidmoe_interleaved:.2f}x")
+p0(f"Forward:     Baseline {baseline_fwd:.2f}ms  FluidMoE {fluidmoe_fwd:.2f}ms  Speedup {baseline_fwd/fluidmoe_fwd:.2f}x")
+p0(f"Fwd+Bwd+AR:  Baseline {baseline_bwd:.2f}ms")
+p0(f"  sync AR:   FluidMoE {fluidmoe_sync:.2f}ms  Speedup {baseline_bwd/fluidmoe_sync:.2f}x")
+p0(f"  interl AR: FluidMoE {fluidmoe_interleaved:.2f}ms  Speedup {baseline_bwd/fluidmoe_interleaved:.2f}x")
 
 dist.destroy_process_group()
 p0("Done!")

@@ -22,6 +22,7 @@ Example for 4 ranks:
     Round 2: (0,1), (2,3)
 """
 
+import os
 import torch
 import torch.distributed as dist
 from typing import List, Tuple, Optional
@@ -35,7 +36,8 @@ def _all_to_all(
     input: torch.Tensor,
     output_split_sizes: Optional[List[int]],
     input_split_sizes: Optional[List[int]],
-    group
+    group,
+    debug_tag: str = "",
 ) -> torch.Tensor:
     """
     Direct call to PyTorch all_to_all_single (bypass Megatron wrapper)
@@ -66,6 +68,15 @@ def _all_to_all(
             device=input.device,
         )
 
+    _debug_check_alltoallv_splits(
+        input_rows=int(input.size(0)),
+        output_rows=int(output.size(0)),
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+        group=group,
+        tag=debug_tag,
+    )
+
     dist.all_to_all_single(
         output, input,
         output_split_sizes=output_split_sizes,
@@ -73,6 +84,70 @@ def _all_to_all(
         group=group,
     )
     return output
+
+
+def _debug_check_alltoallv_splits(
+    input_rows: int,
+    output_rows: int,
+    input_split_sizes: Optional[List[int]],
+    output_split_sizes: Optional[List[int]],
+    group,
+    tag: str,
+) -> None:
+    """Debug-only consistency checks for AllToAll-v split matrices.
+
+    Enabled when FLUID_DEBUG_A2A_SPLITS=1.
+    """
+    if os.environ.get("FLUID_DEBUG_A2A_SPLITS", "0") != "1":
+        return
+    if input_split_sizes is None or output_split_sizes is None:
+        return
+
+    rank = dist.get_rank(group)
+    world = group.size()
+
+    in_splits = [int(x) for x in input_split_sizes]
+    out_splits = [int(x) for x in output_split_sizes]
+
+    if len(in_splits) != world or len(out_splits) != world:
+        raise RuntimeError(
+            f"[A2A:{tag}] rank{rank}: split len mismatch "
+            f"in={len(in_splits)} out={len(out_splits)} world={world}"
+        )
+    if sum(in_splits) != input_rows:
+        raise RuntimeError(
+            f"[A2A:{tag}] rank{rank}: sum(input_split_sizes)={sum(in_splits)} "
+            f"!= input_rows={input_rows}"
+        )
+    if sum(out_splits) != output_rows:
+        raise RuntimeError(
+            f"[A2A:{tag}] rank{rank}: sum(output_split_sizes)={sum(out_splits)} "
+            f"!= output_rows={output_rows}"
+        )
+
+    in_mat = [None for _ in range(world)]
+    out_mat = [None for _ in range(world)]
+    dist.all_gather_object(in_mat, in_splits, group=group)
+    dist.all_gather_object(out_mat, out_splits, group=group)
+
+    mismatch = None
+    for src in range(world):
+        for dst in range(world):
+            send = int(in_mat[src][dst])
+            recv = int(out_mat[dst][src])
+            if send != recv:
+                mismatch = (src, dst, send, recv)
+                break
+        if mismatch is not None:
+            break
+
+    if mismatch is not None:
+        src, dst, send, recv = mismatch
+        raise RuntimeError(
+            f"[A2A:{tag}] split matrix mismatch: "
+            f"send[{src}->{dst}]={send} != recv[{dst}<-{src}]={recv}; "
+            f"rank={rank}, in={in_splits}, out={out_splits}"
+        )
 
 
 def _all_to_all_sp2hp_forward(input_: torch.Tensor, group) -> torch.Tensor:

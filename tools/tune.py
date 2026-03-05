@@ -3,7 +3,8 @@ FluidMoE 完整参数搜索
 
 搜索顺序:
   1. 同步 AR，逐 region 贪心搜索最优分块数 (R1~R4)
-  2. 保持最优分块数，启用异步 AR，搜索最优 AR chunk size
+  2. BDP 模型自动计算最优 AR trickle size
+  3. 网格搜索验证 BDP 预测
 
 用法:
     torchrun --nproc_per_node=2 tools/tune.py
@@ -43,16 +44,16 @@ N_ITER = 10             # 测量轮数
 MAX_C = 8               # 最大分块数
 STOP_MIN_SAVING_MS = 0.5  # 早停阈值 (ms)
 
-# AR chunk size 搜索参数
+# AR 搜索参数
 N_AR_WARMUP = 5         # 预热轮数
-N_AR_ITER = 10           # 测量轮数
+N_AR_ITER = 10          # 测量轮数
 
 # ============================================================
 # 初始化
 # ============================================================
 from fluid.layer import TransformerModel
 from fluid.layer.transformer import TransformerLayerFunction
-from fluid.core.scheduler import get_backward_scheduler
+from fluid.core.scheduler import get_backward_scheduler, BackwardScheduler
 
 p0("=" * 60)
 p0("FluidMoE 完整参数搜索")
@@ -82,7 +83,7 @@ def get_valid_chunks(size, max_C=MAX_C):
 # 在任何训练开始前调用 configure_allreduce，创建 ar_group
 # (dist.new_group 是集合操作，必须在两个 rank 完全同步时调用一次)
 # enabled=False: Step 1 使用同步 AR 模式 (ar_enabled=False + dp_world_size=world_size)
-# Step 2 设 ar_enabled=True 切换为插入 AR 模式
+# Step 2/3 设 ar_enabled=True 切换为插入 AR 模式
 sched = get_backward_scheduler()
 sched.configure_allreduce(enabled=False, dp_group=dist.group.WORLD)
 
@@ -106,6 +107,7 @@ chunk_model = TransformerModel(
     dtype=torch.bfloat16, device=device,
 )
 sched.enable()  # ar_enabled=False + dp_world_size=world_size → 同步 AR 模式
+chunk_model.setup_ar_buffer()
 
 xg = x_input.clone().detach().requires_grad_(True)
 
@@ -132,7 +134,7 @@ def bench_chunk(mc, md, ap, aq):
         end.record()
         torch.cuda.synchronize()
         total += start.elapsed_time(end)
-    sched.clear_iteration()
+        sched.clear_iteration()
     return total / N_ITER
 
 
@@ -218,18 +220,44 @@ dist.barrier()  # 确保两个 rank 同步后再进入 Step 2
 
 
 # ============================================================
-# Step 2: 实测最优 AR chunk size (使用最优分块数)
+# Step 2: 分区域 BDP 模型计算最优 AR trickle size
 # ============================================================
 p0(f"\n{'=' * 60}")
-p0("Step 2: 实测最优 AR chunk size")
+p0("Step 2: 分区域 BDP 模型计算最优 AR trickle size")
 p0("=" * 60)
 p0(f"  (使用最优分块配置 C={best_chunks})")
 
-chunk_sizes_test = [1, 2, 4, 8, 16, 32, 64]
-ar_bench = []  # (chunk_mb, time_ms)
+REGION_ORDER = ['moe_combine', 'moe_dispatch', 'attn_proj', 'attn_qkv']
+REGION_LABELS = {
+    'moe_combine':  'R1 (moe_combine)',
+    'moe_dispatch': 'R2 (moe_dispatch)',
+    'attn_proj':    'R3 (attn_proj)',
+    'attn_qkv':     'R4 (attn_qkv)',
+}
+# Gap description: what compute fills the gap after each region
+REGION_GAP_DESC = {
+    'moe_combine':  'R1→R2: last FC2 dX + act_bwd + FC1 dX(c0)',
+    'moe_dispatch': 'R2→R3: permute + router + LN2 dX + proj dX(c0)',
+    'attn_proj':    'R3→R4: SDPA bwd + QKV reassemble',
+    'attn_qkv':     'R4→R1: last QKV dX + LN1 dX + next layer',
+}
 
-# 建一次模型，循环内只改 ar_chunk_size
-# ar_group 已在脚本开头创建，直接启用 AR 即可
+# --- 2a: 测量 AR 带宽 ---
+p0(f"\n  2a. 测量 AllReduce 带宽...")
+ar_group = sched.ar_group if sched.ar_group is not None else sched.dp_group
+bw_result = BackwardScheduler.measure_ar_bandwidth(
+    ar_group=ar_group,
+    sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),
+    warmup=5, repeat=20,
+)
+p0(f"  AR 带宽 profile:")
+for i, sz in enumerate(bw_result['sizes_mb']):
+    p0(f"    {sz:>4d} MB: {bw_result['bw_GBps'][i]:.2f} GB/s  "
+       f"(latency {bw_result['latency_ms'][i]:.3f} ms)")
+p0(f"  Peak BW: {bw_result['peak_bw_GBps']:.2f} GB/s")
+
+# --- 2b: Profile per-region trickle windows (无 AR，纯净 gap) ---
+p0(f"\n  2b. Profile 分区域 trickle windows (ar_enabled=False, 纯净 gap)...")
 sched.clear_iteration()
 ar_model = TransformerModel(
     **model_kwargs,
@@ -240,17 +268,94 @@ ar_model = TransformerModel(
     dtype=torch.bfloat16, device=device,
 )
 sched.enable()
-sched.ar_enabled = True
-sched.profiling = False
+sched.ar_enabled = False  # 无 AR，测纯净 gap
+sched.ar_trickle_sizes = {}
+ar_model.setup_ar_buffer()
 
 xg_ar = x_input.clone().detach().requires_grad_(True)
+
+# 预热
+for _ in range(N_AR_WARMUP):
+    xg_ar.grad = None
+    for p in ar_model.parameters():
+        p.grad = None
+    ar_model(xg_ar).sum().backward()
+    sched.finish_batch()
+    sched.clear_iteration()
+torch.cuda.synchronize()
+sched.reset_gap_times()
+
+# 采集 per-region gap times (CUDA events) — 无 AR 干扰
+for _ in range(N_AR_ITER):
+    xg_ar.grad = None
+    for p in ar_model.parameters():
+        p.grad = None
+    ar_model(xg_ar).sum().backward()
+    sched.finish_batch()
+    sched.clear_iteration()
+torch.cuda.synchronize()
+sched.process_gap_events()  # convert CUDA event pairs → gap_ms
+
+# --- 2c: 分区域 BDP 计算 (使用 size-dependent BW) ---
+bdp_result = sched.compute_bdp_trickle_size(
+    bw_profile=bw_result,
+    percentile=10.0,
+    safety_factor=0.9,
+)
+
+p0(f"\n  2c. 分区域 BDP 分析 (BW_AR = {bdp_result['bw_GBps']:.2f} GB/s, "
+   f"safety = {bdp_result['safety_factor']}):")
+p0(f"  {'Region':<22s} {'Gap description':<42s} {'T_p10':>8s} {'T_mean':>8s} {'BDP_MB':>8s} {'BW':>8s} {'n':>4s}")
+p0(f"  {'-'*22} {'-'*42} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*4}")
+
+bdp_per_region = {}  # region -> MB
+for region in REGION_ORDER:
+    rdata = bdp_result['per_region'].get(region)
+    if rdata is None:
+        p0(f"  {REGION_LABELS[region]:<22s} {'(no data)':<42s}")
+        bdp_per_region[region] = 0
+        continue
+    label = REGION_LABELS[region]
+    gap_desc = REGION_GAP_DESC[region]
+    T_pct = rdata['T_window_percentile_ms']
+    T_mean = rdata['T_window_mean_ms']
+    bdp_mb = rdata['trickle_size_MB']
+    bw_used = rdata.get('bw_GBps_used', bdp_result['bw_GBps'])
+    n = rdata['n_windows']
+    bdp_per_region[region] = bdp_mb
+    p0(f"  {label:<22s} {gap_desc:<42s} {T_pct:>7.3f}ms {T_mean:>7.3f}ms {bdp_mb:>7d}MB {bw_used:>6.2f}G {n:>4d}")
+
+# 也显示未预期的 region（如有）
+for region, rdata in bdp_result['per_region'].items():
+    if region not in REGION_ORDER:
+        p0(f"  {region:<22s} {'(unexpected)':<42s} "
+           f"{rdata['T_window_percentile_ms']:>7.3f}ms "
+           f"{rdata['T_window_mean_ms']:>7.3f}ms "
+           f"{rdata['trickle_size_MB']:>7d}MB "
+           f"{rdata['n_windows']:>4d}")
+        bdp_per_region[region] = rdata['trickle_size_MB']
+
+dist.barrier()
+
+
+# ============================================================
+# Step 3: 网格搜索验证 (per-region BDP)
+# ============================================================
+p0(f"\n{'=' * 60}")
+p0("Step 3: 网格搜索验证 (统一 trickle_size 对比 per-region BDP)")
+p0("=" * 60)
+
+grid_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 0]
+
+trickle_bench = []
 ev_s = torch.cuda.Event(enable_timing=True)
 ev_e = torch.cuda.Event(enable_timing=True)
 
-for chunk_mb in chunk_sizes_test:
-    sched.ar_chunk_size = chunk_mb * 1024 * 1024
-    sched.clear_iteration()
 
+def bench_ar(label, setup_fn):
+    """Benchmark a trickle configuration."""
+    setup_fn()
+    sched.clear_iteration()
     # 预热
     for _ in range(N_AR_WARMUP):
         xg_ar.grad = None
@@ -258,10 +363,9 @@ for chunk_mb in chunk_sizes_test:
             p.grad = None
         ar_model(xg_ar).sum().backward()
         sched.finish_batch()
+        sched.clear_iteration()
     torch.cuda.synchronize()
-    sched.clear_iteration()
-
-    # 测量 (与 bench_chunk 一致：forward 后开始计时，finish_batch 后停止)
+    # 测量
     total = 0.0
     for _ in range(N_AR_ITER):
         xg_ar.grad = None
@@ -274,22 +378,56 @@ for chunk_mb in chunk_sizes_test:
         ev_e.record()
         torch.cuda.synchronize()
         total += ev_s.elapsed_time(ev_e)
-    t = total / N_AR_ITER
-    sched.clear_iteration()
+        sched.clear_iteration()
+    return total / N_AR_ITER
 
-    ar_bench.append((chunk_mb, t))
-    p0(f"  AR chunk = {chunk_mb:>2d} MB: {t:.2f} ms")
+
+# 3a: 统一 trickle size 网格搜索
+p0(f"\n  3a. 统一 trickle_size 网格搜索:")
+for trickle_mb in grid_sizes:
+    def _setup(mb=trickle_mb):
+        b = mb * 1024 * 1024
+        sched.ar_trickle_sizes = {r: b for r in REGION_ORDER}
+    t = bench_ar(f"{trickle_mb}MB", _setup)
+    trickle_bench.append((trickle_mb, t))
+    label = "unlimited" if trickle_mb == 0 else f"{trickle_mb} MB"
+    p0(f"    trickle_size = {label:>12s}: {t:.2f} ms")
+
+grid_best_mb, grid_best_t = min(trickle_bench, key=lambda x: x[1])
+
+# 3b: Per-region BDP 配置
+p0(f"\n  3b. Per-region BDP 配置:")
+bdp_sizes_bytes = {r: mb * 1024 * 1024 for r, mb in bdp_per_region.items()}
+
+def _setup_bdp():
+    sched.ar_trickle_sizes = bdp_sizes_bytes
+
+t_bdp = bench_ar("per-region BDP", _setup_bdp)
+for region in REGION_ORDER:
+    mb = bdp_per_region.get(region, 0)
+    label = "unlimited" if mb == 0 else f"{mb} MB"
+    p0(f"    {REGION_LABELS[region]}: {label}")
+p0(f"    --> {t_bdp:.2f} ms")
 
 del ar_model, xg_ar
 gc.collect()
 torch.cuda.empty_cache()
 dist.barrier()
 
-best_ar_mb, best_ar_t = min(ar_bench, key=lambda x: x[1])
+# 汇总
 p0(f"\n  汇总:")
-for chunk_mb, t in ar_bench:
-    marker = " <-- best" if chunk_mb == best_ar_mb else ""
-    p0(f"    {chunk_mb:>2d} MB: {t:.2f} ms{marker}")
+p0(f"    {'Config':<30s} {'Time':>10s} {'vs best':>10s}")
+p0(f"    {'-'*30} {'-'*10} {'-'*10}")
+for trickle_mb, t in trickle_bench:
+    label = "unlimited" if trickle_mb == 0 else f"uniform {trickle_mb} MB"
+    delta = (t - grid_best_t) / grid_best_t * 100
+    marker = " <-- grid best" if trickle_mb == grid_best_mb else ""
+    p0(f"    {label:<30s} {t:>9.2f}ms {delta:>+9.1f}%{marker}")
+
+delta_bdp = (t_bdp - grid_best_t) / grid_best_t * 100
+p0(f"    {'per-region BDP':<30s} {t_bdp:>9.2f}ms {delta_bdp:>+9.1f}%")
+if abs(delta_bdp) < 2.0:
+    p0(f"    VALIDATED: per-region BDP 与网格搜索一致 (< 2%)")
 
 
 # ============================================================
@@ -303,16 +441,33 @@ p0(f"    Baseline C=(1,1,1,1): {T_baseline:.3f} ms")
 p0(f"    最优配置 C={best_chunks}: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
 for ri, name in enumerate(region_names):
     p0(f"    {name}: C={best_per_region[ri]}  (speedup={best_speedup_per_region[ri]:.4f}x)")
-p0(f"\n  AR chunk size:")
-p0(f"    实测最优: {best_ar_mb} MB ({best_ar_t:.2f} ms)")
+
+p0(f"\n  Per-region AR trickle size (BDP, size-dependent BW):")
+p0(f"    safety = {bdp_result['safety_factor']}")
+for region in REGION_ORDER:
+    rdata = bdp_result['per_region'].get(region)
+    mb = bdp_per_region.get(region, 0)
+    label = "unlimited" if mb == 0 else f"{mb} MB"
+    if rdata:
+        bw_used = rdata.get('bw_GBps_used', bdp_result['bw_GBps'])
+        p0(f"    {REGION_LABELS[region]}: {label}  (T_gap_p10={rdata['T_window_percentile_ms']:.3f}ms, BW={bw_used:.2f}GB/s)")
+    else:
+        p0(f"    {REGION_LABELS[region]}: {label}  (no data)")
+
+p0(f"\n  性能对比:")
+p0(f"    Grid best (uniform):   {grid_best_mb} MB → {grid_best_t:.2f} ms")
+p0(f"    Per-region BDP:        {t_bdp:.2f} ms (delta={delta_bdp:+.1f}%)")
+
 p0(f"\n  推荐设置:")
 p0(f"    moe_combine_chunks  = {best_chunks[0]}")
 p0(f"    moe_dispatch_chunks = {best_chunks[1]}")
 p0(f"    attn_proj_chunks    = {best_chunks[2]}")
 p0(f"    attn_qkv_chunks     = {best_chunks[3]}")
-p0(f"    scheduler.ar_chunk_size = {best_ar_mb} * 1024 * 1024")
-p0(f"  或环境变量:")
-p0(f"    export FLUID_AR_CHUNK_SIZE={best_ar_mb * 1024 * 1024}")
+p0(f"    scheduler.ar_trickle_sizes = {{")
+for region in REGION_ORDER:
+    mb = bdp_per_region.get(region, 0)
+    p0(f"        '{region}': {mb} * 1024 * 1024,  # {REGION_GAP_DESC[region]}")
+p0(f"    }}")
 
 dist.barrier()
 dist.destroy_process_group()

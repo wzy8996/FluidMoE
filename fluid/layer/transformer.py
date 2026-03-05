@@ -420,8 +420,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         scheduler.end_region()
-        # Flush AR accumulated during Region 1
-
 
         # Register dW tasks for MoE weights (between Region 1 and 2)
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
@@ -448,8 +446,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         scheduler.end_region()
-        # Flush AR accumulated during Region 2
-
 
         # Step 8: Backward through sort/permute
         # expanded = permuted[restore_indices]
@@ -564,8 +560,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         scheduler.end_region()
-        # Flush AR accumulated during Region 4
-
 
         # Step 18: Residual backward - grad flows to hidden_states
         grad_hidden_states = grad_hidden_after_attn.clone()
@@ -667,6 +661,7 @@ class TransformerLayer(nn.Module):
         attn_qkv_chunks: int = 4,
         moe_combine_chunks: int = 1,
         moe_dispatch_chunks: int = 1,
+        ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -687,6 +682,14 @@ class TransformerLayer(nn.Module):
         self.moe_combine_chunks = moe_combine_chunks
         self.moe_dispatch_chunks = moe_dispatch_chunks
         self.activation_func = activation_func or F.gelu
+
+        # Apply per-region AR trickle sizes to scheduler singleton
+        if ar_trickle_sizes is not None:
+            from fluid.core.scheduler import BackwardScheduler
+            sched = BackwardScheduler()
+            sched.ar_trickle_sizes = {
+                r: sz if sz > 0 else 0 for r, sz in ar_trickle_sizes.items()
+            }
 
         self.cp_group = cp_group
         self.ep_group = ep_group
@@ -772,6 +775,7 @@ class TransformerModel(nn.Module):
         attn_qkv_chunks: int = 1,
         moe_combine_chunks: int = 1,
         moe_dispatch_chunks: int = 1,
+        ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -793,12 +797,32 @@ class TransformerModel(nn.Module):
                 attn_qkv_chunks=attn_qkv_chunks,
                 moe_combine_chunks=moe_combine_chunks,
                 moe_dispatch_chunks=moe_dispatch_chunks,
+                ar_trickle_sizes=ar_trickle_sizes if i == 0 else None,  # set once
                 activation_func=activation_func,
                 dtype=dtype,
                 device=device,
             )
             for i in range(num_layers)
         ])
+
+    def setup_ar_buffer(self):
+        """Set up flat AR buffer for zero-copy trickle slicing.
+
+        Registers all shared parameters (needing AllReduce) in backward
+        execution order (last layer first), then allocates contiguous
+        flat buffers on the scheduler.
+        """
+        sched = get_backward_scheduler()
+        params = []
+        for layer in reversed(self.layers):
+            params.extend([
+                layer.router_weight,
+                layer.ln2_weight, layer.ln2_bias,
+                layer.proj_weight,
+                layer.qkv_weight,
+                layer.ln1_weight, layer.ln1_bias,
+            ])
+        sched.setup_ar_buffer(params)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:

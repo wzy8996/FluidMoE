@@ -3,21 +3,25 @@ FluidMoE Backward Scheduler
 
 Design:
 - dW overlaps with AllToAll (dW on default_stream, AllToAll on comm_stream)
-- comm_thread handles both AllToAll and AR tasks (all NCCL in one thread)
-- AR is interleaved into AllToAll idle gaps (AllToAll has absolute priority)
-- AR tensors are chunked (default 2MB) to avoid blocking AllToAll
-- AR is submitted at synchronization points to guarantee consistent order across ranks
+- comm_thread handles AllToAll dispatch
+- AR is enqueued inline by the main thread on comm_stream at flush points
+- Both A2A and AR share comm_stream → CUDA stream ordering prevents
+  cross-communicator NCCL deadlocks (no concurrent GPU kernels from
+  different PGs)
+- Deterministic ordering: main thread controls when AR goes onto comm_stream,
+  and the backward execution order is the same on all ranks
 """
 
 import os
 import torch
 import torch.distributed as dist
-from typing import Optional, Callable, Any, List, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, Callable, Any
+from dataclasses import dataclass
 import threading
 import queue
 import time
 from collections import deque
+from datetime import timedelta
 
 
 
@@ -36,28 +40,9 @@ class AllToAllTask:
     """AllToAll communication task."""
     task_id: int
     comm_fn: Callable
+    input_event: Any  # CUDA event from default_stream (sync point)
     done_event: threading.Event
-    result_holder: list  # [result, cuda_event]
-
-
-@dataclass
-class ARTask:
-    """AllReduce communication task."""
-    task_id: int
-    tensor: torch.Tensor
-    group: Any
-    done_event: threading.Event
-    input_event: Optional[Any] = None   # CUDA event: wait for grad data on default_stream
-    cuda_event: Optional[Any] = None    # CUDA event: signal AR completion on comm_stream
-    a2a_event_snapshot: Optional[Any] = None  # Snapshot of _last_a2a_event at dispatch time
-
-
-@dataclass(order=True)
-class PrioritizedTask:
-    """Wrapper for priority queue ordering."""
-    priority: int
-    seq_num: int = field(compare=True)  # For FIFO within same priority
-    task: Any = field(compare=False)
+    result_holder: list  # [result, end_event, start_event]
 
 
 class BackwardScheduler:
@@ -82,19 +67,12 @@ class BackwardScheduler:
 
         # dW queue
         self._dw_queue = deque()
-        self._debug_dw = False
         self._ar_params_for_sync = []  # params needing AR when ar_enabled=False
 
         # AllToAll: comm_thread + comm_stream
         self._alltoall_queue = queue.Queue()
         self._comm_thread = None
         self._comm_thread_stop = False
-
-        # AR: ar_thread + ar_stream (independent from AllToAll)
-        self._ar_queue = queue.Queue()
-        self._ar_thread = None
-        self._ar_thread_stop = False
-        self.ar_stream = None
 
         # AllToAll tracking
         self._alltoall_task_id = 0
@@ -104,18 +82,33 @@ class BackwardScheduler:
         self._a2a_lock = threading.Lock()
         self._a2a_idle = threading.Event()  # Set when no AllToAll in flight
         self._a2a_idle.set()
-        self._last_a2a_event = None  # Last AllToAll cuda_event for GPU-side AR dependency
+        self._last_a2a_event = None  # Last AllToAll cuda_event
 
-        # AR tracking
-        self._ar_task_id = 0
-        self._ar_results = {}  # task_id -> ARTask
+        # AR tracking (inline execution from main thread on comm_stream)
+        self._pending_ar_tensors = deque()  # grads collected during dW (fallback)
+        self._ar_task_count = 0       # total AR ops executed this iteration
+        self._last_ar_cuda_event = None  # last AR completion event on comm_stream
+        # Pre-allocated CUDA event for AR completion tracking (avoids cudaEventCreate per flush)
+        self._ar_done_event = None
+
+        # Flat AR buffer (DDP-style zero-copy trickle)
+        self._ar_param_map = {}       # param → (buffer, offset, numel)
+        self._ar_buffer_bf16 = None   # flat contiguous buffer for bf16 grads
+        self._ar_buffer_fp32 = None   # flat contiguous buffer for fp32 grads
+        self._ar_read_cursor_bf16 = 0   # how far AR has been submitted
+        self._ar_write_cursor_bf16 = 0  # how far dW has written grads
+        self._ar_read_cursor_fp32 = 0
+        self._ar_write_cursor_fp32 = 0
 
         # AR config
         self.ar_enabled = False
+        self.ar_safe_mode = False
+        self.ar_lockstep = False
         self.dp_group = None
-        self.ar_group = None  # Independent communicator for AR (avoids NCCL deadlock with AllToAll)
+        self.ar_group = None  # Independent NCCL communicator for AR
+        self.ar_ctrl_group = None  # Optional Gloo control group for lockstep gating
         self.dp_world_size = 1
-        self.ar_chunk_size = int(os.environ.get('FLUID_AR_CHUNK_SIZE', 16 * 1024 * 1024))  # 16MB default
+        self.ar_window_mode = "strict_window"
 
         # Stats
         self.total_dw = 0
@@ -126,8 +119,18 @@ class BackwardScheduler:
         self.ar_submitted_during_bwd = 0
         self.ar_submitted_during_finish = 0
         self._in_finish_batch = False
-        self._gap_times = []  # Track AllToAll gap durations
-        self._gap_start_time = 0
+
+        # BDP: per-region gap on comm_stream (via CUDA events)
+        # T_gap[R] = comm_stream time from last A2A end (region R) to first A2A start (region R+1)
+        # This is the exact window on comm_stream available for AR.
+        self._last_a2a_end_event = None     # comm_stream event: last A2A completion in region
+        self._last_a2a_end_region = None    # region name of that last A2A
+        self._first_a2a_in_region = True    # flag: next A2A is the first in current region
+        self._gap_event_pairs = []          # [(region, end_event, start_event), ...]
+        self._region_gaps = {}              # region_name -> [gap_ms, ...] (filled after sync)
+        # Per-region trickle sizes (bytes). Set by tune.py after BDP profiling.
+        # Budget is per-REGION (accumulated across all trickle calls within a region).
+        self.ar_trickle_sizes = {}  # per-region override
 
         # Profiling: per-region timing
         self.profiling = False
@@ -151,7 +154,8 @@ class BackwardScheduler:
             # Use StreamManager's comm_stream to share with forward P2P operations
             from fluid.core.stream import get_stream_manager
             self.comm_stream = get_stream_manager().comm_stream
-            self.ar_stream = torch.cuda.Stream(device=current_device)
+            # Pre-allocate reusable CUDA event (avoids cudaEventCreate per flush)
+            self._ar_done_event = torch.cuda.Event()
 
     def enable(self):
         self.enabled = True
@@ -161,35 +165,113 @@ class BackwardScheduler:
         if self._comm_thread is None:
             self._start_comm_thread()
 
-        # Start AR thread
-        if self._ar_thread is None:
-            self._start_ar_thread()
-
-    def disable(self):
-        self.enabled = False
-
     def is_enabled(self):
         return self.enabled
 
     def configure_allreduce(self, enabled=True, dp_group=None, **kwargs):
         """Configure AllReduce settings.
 
-        Creates an independent NCCL communicator (ar_group) for AllReduce,
-        so AR and AllToAll never conflict even when dp_group == ep_group.
+        Creates an independent NCCL communicator (ar_group) for AllReduce.
+        AR runs on comm_stream (same as A2A) to prevent cross-communicator
+        NCCL deadlocks via CUDA stream-level serialization.
         """
         self.ar_enabled = enabled
         self.dp_group = dp_group
         self.dp_world_size = dist.get_world_size(dp_group) if dp_group else (
             dist.get_world_size() if dist.is_initialized() else 1)
 
+        mode_env = os.environ.get("FLUID_AR_WINDOW_MODE", "strict_window").lower()
+        if mode_env in ("strict", "strict_window", "strict-window"):
+            self.ar_window_mode = "strict_window"
+        elif mode_env in ("relaxed", "relaxed_window", "relaxed-window"):
+            self.ar_window_mode = "relaxed_window"
+        else:
+            self.ar_window_mode = "strict_window"
+
+        # Safe mode policy
+        safe_env = os.environ.get("FLUID_AR_SAFE_MODE", "auto").lower()
+        if safe_env in ("1", "true", "yes", "on"):
+            self.ar_safe_mode = True
+        elif safe_env in ("0", "false", "no", "off"):
+            self.ar_safe_mode = False
+        else:
+            self.ar_safe_mode = False
+
+        # Lockstep: Gloo barrier at flush points for cross-rank synchronization
+        lockstep_env = os.environ.get("FLUID_AR_LOCKSTEP", "auto").lower()
+        if lockstep_env in ("1", "true", "yes", "on"):
+            self.ar_lockstep = True
+        elif lockstep_env in ("0", "false", "no", "off"):
+            self.ar_lockstep = False
+        else:
+            self.ar_lockstep = self.dp_world_size > 1
+        if self.ar_safe_mode:
+            self.ar_lockstep = False
+
         # Create independent communicator for AR
         if dp_group is not None and dist.is_initialized():
             ranks = dist.get_process_group_ranks(dp_group)
             self.ar_group = dist.new_group(ranks)
+            if self.dp_world_size > 1 and self.ar_lockstep:
+                self.ar_ctrl_group = dist.new_group(ranks=ranks, backend="gloo")
+            else:
+                self.ar_ctrl_group = None
         else:
             self.ar_group = None
+            self.ar_ctrl_group = None
 
         self._init_cuda(force_reinit=True)
+
+    def setup_ar_buffer(self, params):
+        """Set up flat AR buffer from parameters in backward execution order.
+
+        Allocates contiguous buffers (one per dtype) and maps each parameter
+        to a segment.  During backward, execute_dw_tasks() writes grads
+        directly into the buffer; _trickle_ar() advances a cursor with a
+        single dist.all_reduce() call per trickle — zero copy, zero alloc.
+
+        Args:
+            params: list of nn.Parameter in the order dW tasks will execute
+                    (i.e. backward execution order: last layer first).
+        """
+        self._ar_param_map = {}
+
+        # Group by dtype
+        bf16_params = [(p, p.numel()) for p in params if p.dtype == torch.bfloat16]
+        fp32_params = [(p, p.numel()) for p in params if p.dtype == torch.float32]
+
+        device = params[0].device if params else torch.cuda.current_device()
+
+        # Allocate bf16 buffer
+        if bf16_params:
+            total = sum(n for _, n in bf16_params)
+            self._ar_buffer_bf16 = torch.zeros(total, dtype=torch.bfloat16, device=device)
+            offset = 0
+            for p, n in bf16_params:
+                self._ar_param_map[p] = (self._ar_buffer_bf16, offset, n)
+                offset += n
+        else:
+            self._ar_buffer_bf16 = None
+
+        # Allocate fp32 buffer
+        if fp32_params:
+            total = sum(n for _, n in fp32_params)
+            self._ar_buffer_fp32 = torch.zeros(total, dtype=torch.float32, device=device)
+            offset = 0
+            for p, n in fp32_params:
+                self._ar_param_map[p] = (self._ar_buffer_fp32, offset, n)
+                offset += n
+        else:
+            self._ar_buffer_fp32 = None
+
+        self._ar_read_cursor_bf16 = 0
+        self._ar_write_cursor_bf16 = 0
+        self._ar_read_cursor_fp32 = 0
+        self._ar_write_cursor_fp32 = 0
+
+    def _use_interleaved_ar(self) -> bool:
+        """Whether interleaved AR submission is allowed in current mode."""
+        return self.ar_enabled and (not self.ar_safe_mode)
 
     def _start_comm_thread(self):
         """Start AllToAll communication thread."""
@@ -203,8 +285,10 @@ class BackwardScheduler:
     def _comm_thread_worker(self):
         """Comm thread: handles AllToAll only (on comm_stream).
 
-        After completing an AllToAll, signals _a2a_idle so the AR thread
-        can start AR tasks immediately without waiting for the main thread.
+        IMPORTANT: _a2a_idle and _last_a2a_event are updated BEFORE
+        done_event.set() so that the main thread sees _a2a_idle==True
+        immediately when it wakes from wait_alltoall().  This enables
+        safe AR trickling from the main thread.
         """
         if self._device is not None:
             torch.cuda.set_device(self._device)
@@ -215,87 +299,42 @@ class BackwardScheduler:
                 if task is None:
                     break
                 self._execute_alltoall(task)
-                # Signal idle immediately after AllToAll completes on comm_stream
                 with self._a2a_lock:
+                    self._last_a2a_event = task.result_holder[1]
                     self._a2a_completed += 1
                     if self._a2a_completed >= self._a2a_submitted:
                         self._a2a_idle.set()
-                        self._gap_start_time = time.perf_counter()
-            except queue.Empty:
-                pass
-
-    def _start_ar_thread(self):
-        """Start AR communication thread (independent from AllToAll)."""
-        self._ar_thread_stop = False
-        self._ar_thread = threading.Thread(
-            target=self._ar_thread_worker,
-            daemon=True
-        )
-        self._ar_thread.start()
-
-    def _ar_thread_worker(self):
-        """AR thread: handles AllReduce only (on ar_stream, ar_group).
-
-        Waits for _a2a_idle before executing AR tasks to avoid NVLink contention.
-        Uses a double-check under _a2a_lock to close the TOCTOU window where a
-        new AllToAll could be submitted between _a2a_idle.wait() returning and
-        reading _last_a2a_event.
-        """
-        if self._device is not None:
-            torch.cuda.set_device(self._device)
-
-        while not self._ar_thread_stop:
-            try:
-                task = self._ar_queue.get(timeout=0.001)
-                if task is None:
-                    break
-                # Atomically confirm idle and snapshot last A2A event.
-                # Loop handles the race: _a2a_idle cleared between wait() and lock.
-                while True:
-                    self._a2a_idle.wait()
-                    with self._a2a_lock:
-                        if self._a2a_idle.is_set():
-                            task.a2a_event_snapshot = self._last_a2a_event
-                            break
-                    # A new A2A was submitted between wait() and lock — retry
-                self._execute_ar(task)
+                # Signal AFTER _a2a_idle update
+                task.done_event.set()
             except queue.Empty:
                 pass
 
     def _execute_alltoall(self, task: AllToAllTask):
-        """Execute AllToAll task on comm_stream."""
+        """Execute AllToAll task on comm_stream.
+
+        NOTE: done_event is NOT set here.  The caller (_comm_thread_worker)
+        sets it AFTER updating _a2a_idle so that the main thread can see
+        _a2a_idle==True immediately when done_event unblocks wait_alltoall().
+
+        Records start_event on comm_stream AFTER wait_event(input_event) resolves
+        but BEFORE the actual A2A runs.  This gives the exact A2A start time on
+        comm_stream for BDP gap measurement.
+        """
         with torch.cuda.stream(self.comm_stream):
-            if self.profiling:
-                start_evt = torch.cuda.Event(enable_timing=True)
-                start_evt.record(self.comm_stream)
+            # Wait for default_stream to reach the submit point
+            self.comm_stream.wait_event(task.input_event)
+            # Record A2A start on comm_stream (after wait_event, before A2A)
+            start_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record(self.comm_stream)
+            # Execute the actual AllToAll
             result = task.comm_fn()
-            cuda_event = torch.cuda.Event(enable_timing=True) if self.profiling else torch.cuda.Event()
-            cuda_event.record(self.comm_stream)
+            # Record A2A end on comm_stream
+            end_evt = torch.cuda.Event(enable_timing=True)
+            end_evt.record(self.comm_stream)
 
         task.result_holder[0] = result
-        task.result_holder[1] = cuda_event
-        if self.profiling:
-            task.result_holder.append(start_evt)  # [2] = start event for timing
-        self._last_a2a_event = cuda_event
-        task.done_event.set()
-
-    def _execute_ar(self, task: ARTask):
-        """Execute AllReduce task on ar_stream (independent from comm_stream)."""
-        with torch.cuda.stream(self.ar_stream):
-            # Wait for gradient data to be ready on default_stream
-            if task.input_event is not None:
-                self.ar_stream.wait_event(task.input_event)
-            # Wait for last AllToAll to finish on GPU
-            last_event = task.a2a_event_snapshot
-            if last_event is not None:
-                self.ar_stream.wait_event(last_event)
-            dist.all_reduce(task.tensor, group=task.group)
-            cuda_event = torch.cuda.Event()
-            cuda_event.record(self.ar_stream)
-
-        task.cuda_event = cuda_event
-        task.done_event.set()
-        self.ar_during_overlap += 1
+        task.result_holder[1] = end_evt    # [1] = end event (used by wait_alltoall)
+        task.result_holder.append(start_evt)  # [2] = start event (used by BDP gap)
 
     # ========================================
     # dW Tasks
@@ -319,20 +358,39 @@ class BackwardScheduler:
             grad_weight = task.compute_fn()
 
             if task.weight_param is not None and grad_weight is not None:
-                # Ensure grad dtype matches param dtype (e.g. LayerNorm produces float32 grads for bf16 params)
                 if grad_weight.dtype != task.weight_param.dtype:
                     grad_weight = grad_weight.to(task.weight_param.dtype)
-                if task.weight_param.grad is None:
-                    task.weight_param.grad = grad_weight
-                else:
-                    task.weight_param.grad.add_(grad_weight)
 
-                # AR handling
-                if task.needs_ar and self.dp_world_size > 1:
-                    if self.ar_enabled:
-                        self._submit_ar_chunked(task.weight_param)
+                if task.weight_param in self._ar_param_map:
+                    # Flat buffer path: write grad into pre-allocated buffer
+                    buf, offset, numel = self._ar_param_map[task.weight_param]
+                    flat_grad = grad_weight.view(-1)
+                    if task.weight_param.grad is None:
+                        buf[offset:offset+numel].copy_(flat_grad)
                     else:
-                        self._ar_params_for_sync.append(task.weight_param)
+                        buf[offset:offset+numel].add_(flat_grad)
+                    task.weight_param.grad = buf[offset:offset+numel].view(task.weight_param.shape)
+                    # Advance write cursor
+                    end = offset + numel
+                    if buf.dtype == torch.bfloat16:
+                        if end > self._ar_write_cursor_bf16:
+                            self._ar_write_cursor_bf16 = end
+                    else:
+                        if end > self._ar_write_cursor_fp32:
+                            self._ar_write_cursor_fp32 = end
+                else:
+                    # Original path for unregistered params
+                    if task.weight_param.grad is None:
+                        task.weight_param.grad = grad_weight
+                    else:
+                        task.weight_param.grad.add_(grad_weight)
+
+                    # AR handling (fallback)
+                    if task.needs_ar and self.dp_world_size > 1:
+                        if self._use_interleaved_ar():
+                            self._pending_ar_tensors.append(task.weight_param.grad)
+                        else:
+                            self._ar_params_for_sync.append(task.weight_param)
 
             self.completed_dw += 1
 
@@ -354,37 +412,37 @@ class BackwardScheduler:
     # AllToAll
     # ========================================
     def submit_alltoall(self, comm_fn: Callable) -> int:
-        """Submit AllToAll to comm thread."""
+        """Submit AllToAll to comm thread.
+
+        Since AR is now enqueued inline on comm_stream by the main thread at
+        flush points, and A2A is enqueued by comm_thread on comm_stream, the
+        CUDA stream ordering guarantees A2A kernels only run after any
+        preceding AR kernels complete on comm_stream.  No explicit lock or
+        wait is needed.
+        """
         if not self.enabled:
             return comm_fn()
 
         task_id = self._alltoall_task_id
         self._alltoall_task_id += 1
 
-        # Record event on default_stream
+        # Record event on default_stream (sync point for comm_stream)
         input_event = torch.cuda.Event()
         input_event.record(self.default_stream)
 
         done_event = threading.Event()
         result_holder = [None, None]
 
-        def wrapped_fn():
-            # Wait for data to be ready
-            self.comm_stream.wait_event(input_event)
-            return comm_fn()
-
         task = AllToAllTask(
             task_id=task_id,
-            comm_fn=wrapped_fn,
+            comm_fn=comm_fn,
+            input_event=input_event,
             done_event=done_event,
             result_holder=result_holder,
         )
 
-        # Mark AllToAll submitted (AR thread will yield)
+        # Mark AllToAll submitted
         with self._a2a_lock:
-            if self._a2a_submitted == self._a2a_completed and self._gap_start_time > 0:
-                gap = time.perf_counter() - self._gap_start_time
-                self._gap_times.append(gap * 1000)  # ms
             self._a2a_submitted += 1
             self._a2a_idle.clear()
 
@@ -394,11 +452,7 @@ class BackwardScheduler:
         return task_id
 
     def wait_alltoall(self, task_id: int, num_tasks: int = 1) -> Any:
-        """Wait for AllToAll to complete.
-
-        For chunked AllToAll, only need to wait for the last one since NCCL ops
-        on the same stream are serialized. Use num_tasks to clean up earlier tasks.
-        """
+        """Wait for AllToAll to complete."""
         if not self.enabled:
             return None
 
@@ -407,114 +461,272 @@ class BackwardScheduler:
             return None
 
         done_event, result_holder = task_data
+
         done_event.wait()
 
         result = result_holder[0]
-        cuda_event = result_holder[1]
+        end_evt = result_holder[1]   # A2A end on comm_stream
+        start_evt = result_holder[2] if len(result_holder) > 2 else None  # A2A start on comm_stream
+
+        # BDP: pair first A2A's start_event with previous region's last A2A end_event
+        if self._first_a2a_in_region and start_evt is not None:
+            if self._last_a2a_end_event is not None:
+                self._gap_event_pairs.append((
+                    self._last_a2a_end_region,
+                    self._last_a2a_end_event,  # comm_stream: last A2A end
+                    start_evt,                  # comm_stream: first A2A start
+                ))
+                self._last_a2a_end_event = None
+                self._last_a2a_end_region = None
+            self._first_a2a_in_region = False
 
         # Collect per-AllToAll comm time for profiling
-        if self.profiling and len(result_holder) > 2:
-            start_evt = result_holder[2]
+        if self.profiling and start_evt is not None:
             torch.cuda.synchronize()
-            comm_ms = start_evt.elapsed_time(cuda_event)
+            comm_ms = start_evt.elapsed_time(end_evt)
             if self._region_name:
                 self._region_a2a_times.append(comm_ms)
 
         # Wait for comm_stream completion on default_stream
-        if cuda_event is not None:
-            self.default_stream.wait_event(cuda_event)
+        if end_evt is not None:
+            self.default_stream.wait_event(end_evt)
 
         # Clean up this task and all earlier tasks in the batch
         first_task_id = task_id - num_tasks + 1
         for tid in range(first_task_id, task_id + 1):
             self._alltoall_results.pop(tid, None)
 
-        # Note: _a2a_idle is now set by comm_thread after AllToAll completion,
-        # removing the CPU latency between GPU completion and AR thread unblocking.
+        # BDP: if this was the last A2A in the region, save end_event
+        if not self._alltoall_results:
+            self._last_a2a_end_event = end_evt
+            self._last_a2a_end_region = self._region_name
+
+        # Trickle one AR chunk onto comm_stream while it's idle
+        self._trickle_ar()
 
         return result
 
     # ========================================
-    # AllReduce
+    # AllReduce (inline on comm_stream)
     # ========================================
-    def _submit_ar(self, tensor: torch.Tensor, input_event: Optional[Any] = None) -> int:
-        """Submit a single AllReduce chunk to comm thread."""
-        task_id = self._ar_task_id
-        self._ar_task_id += 1
+    def _trickle_ar(self):
+        """Trickle AR onto comm_stream using flat buffer cursor or fallback queue.
 
-        # Record event on default_stream so comm_stream waits for grad data
-        if input_event is None:
-            input_event = torch.cuda.Event()
-            input_event.record(self.default_stream)
+        With flat buffer: advances read cursor by up to budget bytes in one
+        dist.all_reduce() call — zero copy, zero allocation.
 
-        done_event = threading.Event()
+        Without flat buffer (fallback): submits whole tensors from pending queue.
 
-        task = ARTask(
-            task_id=task_id,
-            tensor=tensor,
-            group=self.ar_group if self.ar_group is not None else self.dp_group,
-            done_event=done_event,
-            input_event=input_event,
-        )
-
-        self._ar_queue.put(task)
-        self._ar_results[task_id] = task
-        self.total_ar += 1
-        if self._in_finish_batch:
-            self.ar_submitted_during_finish += 1
-        else:
-            self.ar_submitted_during_bwd += 1
-
-        return task_id
-
-    def _submit_ar_chunked(self, param: torch.nn.Parameter):
-        """Submit AR for a parameter, chunked into small pieces.
-
-        Small chunks allow AR to fit into narrow AllToAll idle gaps without
-        blocking subsequent AllToAll operations.
+        Determinism guarantee:
+        1. execute_dw_tasks() always drains the full dW queue, so buffer
+           write cursors and _pending_ar_tensors are identical on all ranks.
+        2. We only trickle when _alltoall_results is empty (all submitted
+           A2As have been waited for).  This is a deterministic condition
+           that does NOT depend on timing.
         """
-        grad = param.grad
-        if grad is None:
+        if not self._use_interleaved_ar() or self.dp_world_size <= 1:
             return
 
-        chunk_bytes = self.ar_chunk_size
-        num_elements_per_chunk = chunk_bytes // grad.element_size()
-
-        # Record a single input event for all chunks of this param to reduce
-        # CUDA event allocation/record overhead.
-        input_event = torch.cuda.Event()
-        input_event.record(self.default_stream)
-
-        if num_elements_per_chunk <= 0 or grad.numel() <= num_elements_per_chunk:
-            # Small enough: submit as single AR
-            self._submit_ar(grad, input_event=input_event)
+        # Check if there's anything to submit
+        has_buffer = (
+            (self._ar_buffer_bf16 is not None and self._ar_read_cursor_bf16 < self._ar_write_cursor_bf16) or
+            (self._ar_buffer_fp32 is not None and self._ar_read_cursor_fp32 < self._ar_write_cursor_fp32)
+        )
+        if not has_buffer and not self._pending_ar_tensors:
             return
 
-        # Split into chunks and submit each
-        flat = grad.view(-1)
-        for start in range(0, flat.numel(), num_elements_per_chunk):
-            end = min(start + num_elements_per_chunk, flat.numel())
-            chunk = flat[start:end]
-            self._submit_ar(chunk, input_event=input_event)
+        # Deterministic check: only trickle when ALL submitted A2As have
+        # been waited for.
+        if self._alltoall_results:
+            return
+
+        ar_group = self.ar_group if self.ar_group is not None else self.dp_group
+        region = self._region_name
+        budget = self.ar_trickle_sizes.get(region, 0) if region else 0
+
+        # Pre-compute what to submit BEFORE touching comm_stream
+        bf16_start = bf16_end = 0
+        if self._ar_buffer_bf16 is not None:
+            cursor = self._ar_read_cursor_bf16
+            write_end = self._ar_write_cursor_bf16
+            if cursor < write_end:
+                if budget > 0:
+                    budget_numel = budget // self._ar_buffer_bf16.element_size()
+                    bf16_end = min(cursor + budget_numel, write_end)
+                else:
+                    bf16_end = write_end
+                bf16_start = cursor
+
+        fp32_start = fp32_end = 0
+        if self._ar_buffer_fp32 is not None:
+            cursor32 = self._ar_read_cursor_fp32
+            write_end32 = self._ar_write_cursor_fp32
+            if cursor32 < write_end32:
+                fp32_start = cursor32
+                fp32_end = write_end32
+
+        # Skip trickle if available data per dtype is too small — NCCL launch
+        # overhead exceeds the overlap benefit for tiny transfers.  Data
+        # accumulates and will be submitted at the next trickle point or flush.
+        # Threshold is deterministic (cursors are identical across ranks).
+        _MIN_TRICKLE_NUMEL = 512 * 1024  # ~1 MB for bf16
+        bf16_ok = (bf16_end - bf16_start) >= _MIN_TRICKLE_NUMEL
+        fp32_ok = (fp32_end - fp32_start) >= _MIN_TRICKLE_NUMEL
+        has_work = bf16_ok or fp32_ok or bool(self._pending_ar_tensors)
+        if not has_work:
+            return
+
+        # Only now touch comm_stream
+        self._a2a_idle.wait()
+
+        with torch.cuda.stream(self.comm_stream):
+            # Ensure comm_stream sees all gradients written on default_stream
+            self.comm_stream.wait_stream(self.default_stream)
+
+            # --- Flat buffer: bf16 ---
+            if bf16_start < bf16_end and (bf16_end - bf16_start) >= _MIN_TRICKLE_NUMEL:
+                dist.all_reduce(self._ar_buffer_bf16[bf16_start:bf16_end], group=ar_group)
+                self._ar_read_cursor_bf16 = bf16_end
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                if self._in_finish_batch:
+                    self.ar_submitted_during_finish += 1
+                else:
+                    self.ar_submitted_during_bwd += 1
+
+            # --- Flat buffer: fp32 ---
+            if fp32_start < fp32_end and (fp32_end - fp32_start) >= _MIN_TRICKLE_NUMEL:
+                dist.all_reduce(self._ar_buffer_fp32[fp32_start:fp32_end], group=ar_group)
+                self._ar_read_cursor_fp32 = fp32_end
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                if self._in_finish_batch:
+                    self.ar_submitted_during_finish += 1
+                else:
+                    self.ar_submitted_during_bwd += 1
+
+            # --- Fallback: pending tensors ---
+            bytes_submitted = 0
+            while self._pending_ar_tensors:
+                if budget > 0 and bytes_submitted >= budget:
+                    break
+                grad = self._pending_ar_tensors.popleft()
+                if grad is None:
+                    continue
+                dist.all_reduce(grad, group=ar_group)
+                bytes_submitted += grad.numel() * grad.element_size()
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                if self._in_finish_batch:
+                    self.ar_submitted_during_finish += 1
+                else:
+                    self.ar_submitted_during_bwd += 1
+
+            # No need to record a done event here — _flush_ar_pending_strict()
+            # will record the final event before _wait_all_ar() reads it.
+
+    def _flush_ar_pending_strict(self, final: bool = False):
+        """Flush AR: drain all remaining buffer and pending tensors.
+
+        Used by finish_batch() to ensure all AR completes before
+        optimizer.step().  No budget limit — submits everything remaining.
+        """
+        has_buffer_remaining = (
+            (self._ar_buffer_bf16 is not None and self._ar_read_cursor_bf16 < self._ar_buffer_bf16.numel()) or
+            (self._ar_buffer_fp32 is not None and self._ar_read_cursor_fp32 < self._ar_buffer_fp32.numel())
+        )
+        if not self._pending_ar_tensors and not has_buffer_remaining:
+            if self.ar_lockstep and self.ar_ctrl_group is not None:
+                timeout_s = int(os.environ.get("FLUID_AR_LOCKSTEP_TIMEOUT_SEC", "120"))
+                dist.monitored_barrier(
+                    group=self.ar_ctrl_group,
+                    timeout=timedelta(seconds=timeout_s),
+                )
+            return
+
+        self._a2a_idle.wait()
+
+        ar_group = self.ar_group if self.ar_group is not None else self.dp_group
+
+        with torch.cuda.stream(self.comm_stream):
+            # Ensure comm_stream sees all gradients written on default_stream
+            self.comm_stream.wait_stream(self.default_stream)
+
+            # Flush bf16 buffer remainder
+            if self._ar_buffer_bf16 is not None:
+                buf = self._ar_buffer_bf16
+                cursor = self._ar_read_cursor_bf16
+                total = buf.numel()
+                if cursor < total:
+                    dist.all_reduce(buf[cursor:total], group=ar_group)
+                    self._ar_read_cursor_bf16 = total
+                    self._ar_task_count += 1
+                    self.total_ar += 1
+                    self.ar_during_overlap += 1
+                    self.ar_submitted_during_finish += 1
+
+            # Flush fp32 buffer remainder
+            if self._ar_buffer_fp32 is not None:
+                buf32 = self._ar_buffer_fp32
+                cursor32 = self._ar_read_cursor_fp32
+                total32 = buf32.numel()
+                if cursor32 < total32:
+                    dist.all_reduce(buf32[cursor32:total32], group=ar_group)
+                    self._ar_read_cursor_fp32 = total32
+                    self._ar_task_count += 1
+                    self.total_ar += 1
+                    self.ar_during_overlap += 1
+                    self.ar_submitted_during_finish += 1
+
+            # Flush pending tensors (unregistered params)
+            while self._pending_ar_tensors:
+                grad = self._pending_ar_tensors.popleft()
+                if grad is None:
+                    continue
+                dist.all_reduce(grad, group=ar_group)
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                self.ar_submitted_during_finish += 1
+
+            self._ar_done_event.record(self.comm_stream)
+            self._last_ar_cuda_event = self._ar_done_event
+
+        if self.ar_lockstep and self.ar_ctrl_group is not None:
+            timeout_s = int(os.environ.get("FLUID_AR_LOCKSTEP_TIMEOUT_SEC", "120"))
+            dist.monitored_barrier(
+                group=self.ar_ctrl_group,
+                timeout=timedelta(seconds=timeout_s),
+            )
+
+    def flush_ar_pending(self, final: bool = False):
+        """Submit all deferred AR tensors in deterministic order."""
+        if not self._use_interleaved_ar() or self.dp_world_size <= 1:
+            self._pending_ar_tensors.clear()
+            return
+
+        self._flush_ar_pending_strict(final=final)
 
     def _wait_all_ar(self):
-        """Wait for all pending AR tasks to complete."""
-        if not self._ar_results:
+        """Wait for all enqueued AR to complete on comm_stream."""
+        if self._last_ar_cuda_event is None:
             return
-        # AR tasks are executed by a single thread on a single stream in FIFO order.
-        # Waiting for the last submitted task implies all earlier tasks are complete.
-        tasks = list(self._ar_results.values())
-        last_task = tasks[-1]
-        last_task.done_event.wait()
-        last_event = last_task.cuda_event
-        self.completed_ar += len(tasks)
-        # Only need one wait_event for the last cuda_event (comm_stream is serialized)
-        if last_event is not None:
-            self.default_stream.wait_event(last_event)
-        self._ar_results.clear()
+        # All AR chunks were enqueued on comm_stream in FIFO order.
+        # Waiting for the last event implies all are done.
+        self.default_stream.wait_event(self._last_ar_cuda_event)
+        self.completed_ar = self._ar_task_count
 
     def _sync_allreduce_all_params(self):
-        """Synchronously AllReduce all collected params on default_stream."""
+        """Synchronously AllReduce all collected params and flat buffers."""
+        # Flat buffer AR (all grads written by execute_dw_tasks)
+        if self._ar_buffer_bf16 is not None:
+            dist.all_reduce(self._ar_buffer_bf16, group=self.dp_group)
+        if self._ar_buffer_fp32 is not None:
+            dist.all_reduce(self._ar_buffer_fp32, group=self.dp_group)
+        # Fallback: individual params (unregistered)
         for param in self._ar_params_for_sync:
             if param.grad is not None:
                 dist.all_reduce(param.grad, group=self.dp_group)
@@ -524,64 +736,51 @@ class BackwardScheduler:
     # Iteration management
     # ========================================
     def clear_iteration(self):
-        """Clear state for new iteration, defensively draining all in-flight tasks.
-
-        Normal path (called after finish_batch): queues are already drained,
-        so steps 1-4 are fast no-ops and this reduces to the counter reset.
-
-        Abnormal path (exception / early exit): waits for every in-flight
-        AllToAll and AR task before touching shared state, preventing
-        comm_thread / ar_thread from writing to dicts we have already reset.
-        """
+        """Clear state for new iteration, defensively draining all in-flight tasks."""
         # 1. Wait for all AllToAll tasks that were submitted but not yet waited.
-        #    done_event is set only after comm_thread executes the op, so this
-        #    blocks until the task is off the queue and comm_stream has the op.
         for done_event, result_holder in list(self._alltoall_results.values()):
             done_event.wait()
             cuda_event = result_holder[1]
             if cuda_event is not None:
-                # Propagate comm_stream completion to default_stream so GPU work
-                # from the previous iteration finishes before we reset anything.
                 self.default_stream.wait_event(cuda_event)
 
-        # 2. Wait for all AR tasks that were submitted but not yet waited.
-        #    _wait_all_ar() iterates _ar_results, waits for each done_event,
-        #    syncs the last cuda_event to default_stream, and clears _ar_results.
+        # 2. Wait for all AR on comm_stream
         self._wait_all_ar()
 
         # 3. GPU synchronize only when pending work existed.
         had_pending = (
             bool(self._alltoall_results)
-            or bool(self._ar_results)
+            or self._last_ar_cuda_event is not None
             or (not self._alltoall_queue.empty())
-            or (not self._ar_queue.empty())
         )
         if had_pending and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        # 4. Belt-and-suspenders: drain leftover items from both queues.
-        #    Under normal operation both queues are empty after steps 1-2.
-        #    This covers corner cases (e.g. tasks submitted but thread not yet
-        #    scheduled) without relying on queue internals.
-        for q in (self._alltoall_queue, self._ar_queue):
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+        # 4. Drain leftover items from alltoall queue.
+        while True:
+            try:
+                self._alltoall_queue.get_nowait()
+            except queue.Empty:
+                break
 
         # 5. Clear accounting state.
         self._dw_queue.clear()
         self._alltoall_results.clear()
-        # _ar_results was already cleared by _wait_all_ar().
+        self._pending_ar_tensors.clear()
         self._ar_params_for_sync.clear()
-        self._last_a2a_event = None   # Don't let stale events leak into next iter
+        self._last_a2a_event = None
+        self._last_ar_cuda_event = None
         self._alltoall_task_id = 0
-        self._ar_task_id = 0
+        self._ar_task_count = 0
         self._a2a_submitted = 0
         self._a2a_completed = 0
         self._a2a_idle.set()
         self._in_finish_batch = False
+        # Reset flat buffer cursors (buffer contents will be overwritten by next dW)
+        self._ar_read_cursor_bf16 = 0
+        self._ar_write_cursor_bf16 = 0
+        self._ar_read_cursor_fp32 = 0
+        self._ar_write_cursor_fp32 = 0
 
         # 6. Reset per-iteration stats.
         self.total_dw = 0
@@ -602,46 +801,22 @@ class BackwardScheduler:
             return
 
         self._in_finish_batch = True
-        self._pending_dw_at_finish_start = len(self._dw_queue)
-        n_ar_at_finish_start = len(self._ar_results)
 
-        # 1. Execute any remaining dW tasks.
-        #    Let previously submitted AR keep running in parallel on ar_stream.
-        #    For AR-enabled mode, submit AR immediately after each dW so AR can
-        #    overlap with subsequent dW computations in finish_batch.
-        while self._dw_queue:
-            task = self._dw_queue.popleft()
-            grad_weight = task.compute_fn()
+        # 1. Execute any remaining dW tasks (uses flat buffer path if configured).
+        self.execute_dw_tasks()
 
-            if task.weight_param is not None and grad_weight is not None:
-                if grad_weight.dtype != task.weight_param.dtype:
-                    grad_weight = grad_weight.to(task.weight_param.dtype)
-                if task.weight_param.grad is None:
-                    task.weight_param.grad = grad_weight
-                else:
-                    task.weight_param.grad.add_(grad_weight)
-
-                if task.needs_ar and self.dp_world_size > 1:
-                    if self.ar_enabled:
-                        # Submit this param's AR right away to maximize overlap
-                        # with later finish_batch dW tasks.
-                        self._submit_ar(task.weight_param.grad)
-                    else:
-                        self._ar_params_for_sync.append(task.weight_param)
-
-            self.completed_dw += 1
-
-        # 2. Wait for ALL AR (existing + newly submitted) before returning.
-        # This ensures optimizer.step() sees fully allreduced gradients and
-        # avoids data races between comm_thread (in-place allreduce) and optimizer.
-        t0 = time.perf_counter()
-        if self.ar_enabled and self.dp_world_size > 1:
+        # 2. Flush + wait for ALL AR before returning.
+        if self._use_interleaved_ar() and self.dp_world_size > 1:
+            self.flush_ar_pending(final=True)
             self._wait_all_ar()
-        self._wait_prev_ar_time = time.perf_counter() - t0
-        self._prev_ar_count = n_ar_at_finish_start
 
-        # 3. If ar_enabled=False, do sync AR for all params that need it
-        if not self.ar_enabled and self.dp_world_size > 1:
+        # Prevent cross-iteration gap measurement
+        # (last R4 end → next iteration's first R1 start is not a valid gap)
+        self._last_a2a_end_event = None
+        self._last_a2a_end_region = None
+
+        # 3. In sync mode (ar_enabled=False) OR safe mode, do sync AR.
+        if (not self._use_interleaved_ar()) and self.dp_world_size > 1:
             self._sync_allreduce_all_params()
 
         self._in_finish_batch = False
@@ -651,11 +826,12 @@ class BackwardScheduler:
     # ========================================
     def begin_region(self, name: str):
         """Mark start of a backward region for profiling."""
+        # Always track region name (used by BDP per-region trickle)
+        self._region_name = name
+        self._first_a2a_in_region = True  # next A2A is the first in this region
         if not self.profiling:
             return
-        # Sync to get clean boundary
         torch.cuda.synchronize()
-        self._region_name = name
         self._region_a2a_times = []
         self._region_dw_time = 0.0
         self._region_wall_start = time.perf_counter()
@@ -663,6 +839,7 @@ class BackwardScheduler:
     def end_region(self):
         """Mark end of a backward region."""
         if not self.profiling or self._region_name is None:
+            self._region_name = None
             return
         torch.cuda.synchronize()
         T_region = (time.perf_counter() - self._region_wall_start) * 1000
@@ -692,8 +869,6 @@ class BackwardScheduler:
             T_region = p['T_region'] / n
             T_comm = p['T_comm'] / n
             T_dW = p['T_dW'] / n
-            # T_comp = T_region - max(T_comm, T_dW) for pipelined execution
-            # This works because: T_region ≈ max(T_comm, T_dW) + T_comp (pipeline)
             T_comp = max(0, T_region - max(T_comm, T_dW))
             result[name] = {
                 'T_region': T_region,
@@ -703,6 +878,172 @@ class BackwardScheduler:
                 'n_a2a': p['n_a2a'] // n,
             }
         return result
+
+    # ========================================
+    # BDP-based AR trickle size computation
+    # ========================================
+    def reset_gap_times(self):
+        """Clear accumulated gap/window times for fresh profiling."""
+        self._gap_event_pairs = []
+        self._region_gaps = {}
+        self._last_a2a_end_event = None
+        self._last_a2a_end_region = None
+        self._first_a2a_in_region = True
+
+    def process_gap_events(self):
+        """Process recorded CUDA event pairs into gap times.
+
+        Must be called after torch.cuda.synchronize() to ensure all events
+        have been recorded on the GPU.
+        """
+        for region, end_evt, submit_evt in self._gap_event_pairs:
+            gap_ms = end_evt.elapsed_time(submit_evt)
+            if region not in self._region_gaps:
+                self._region_gaps[region] = []
+            self._region_gaps[region].append(gap_ms)
+        self._gap_event_pairs = []
+
+    @staticmethod
+    def measure_ar_bandwidth(
+        ar_group=None,
+        sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),
+        warmup=5,
+        repeat=20,
+        dtype=torch.bfloat16,
+    ) -> dict:
+        """Measure AllReduce bandwidth at various message sizes.
+
+        Returns dict with sizes_mb, bw_GBps, latency_ms, peak_bw_GBps.
+        """
+        device = torch.cuda.current_device()
+        results = {'sizes_mb': [], 'bw_GBps': [], 'latency_ms': []}
+
+        for size_mb in sizes_mb:
+            elem_size = 2 if dtype == torch.bfloat16 else 4
+            numel = int(size_mb * 1024 * 1024 / elem_size)
+            tensor = torch.randn(numel, dtype=dtype, device=device)
+
+            for _ in range(warmup):
+                dist.all_reduce(tensor, group=ar_group)
+            torch.cuda.synchronize()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(repeat):
+                dist.all_reduce(tensor, group=ar_group)
+            end.record()
+            torch.cuda.synchronize()
+
+            latency_ms = start.elapsed_time(end) / repeat
+            size_bytes = numel * elem_size
+            bw_GBps = (size_bytes / 1e9) / (latency_ms / 1e3) if latency_ms > 0 else 0
+
+            results['sizes_mb'].append(size_mb)
+            results['bw_GBps'].append(bw_GBps)
+            results['latency_ms'].append(latency_ms)
+
+            del tensor
+
+        results['peak_bw_GBps'] = max(results['bw_GBps']) if results['bw_GBps'] else 0
+        return results
+
+    def compute_bdp_trickle_size(
+        self,
+        bw_GBps: float = 0.0,
+        percentile: float = 10.0,
+        safety_factor: float = 0.9,
+        bw_profile: dict = None,
+    ) -> dict:
+        """Compute per-region optimal AR trickle size using Bandwidth-Delay Product.
+
+        For each region R, the gap from R's trickle to the next region's first
+        submit_alltoall() determines how much AR can run without delaying A2A.
+
+        optimal_trickle_size[R] = T_gap[R] * BW_AR(size) * safety_factor
+
+        Args:
+            bw_GBps: Fixed bandwidth (used if bw_profile is None).
+            percentile: Gap time percentile (conservative = lower).
+            safety_factor: Multiply BDP by this factor (< 1.0 for margin).
+            bw_profile: Output of measure_ar_bandwidth(). When provided,
+                        uses size-dependent bandwidth: iteratively estimates
+                        the trickle size, looks up BW at that size, and
+                        recomputes until convergence.
+
+        Returns dict with per-region results and overall summary.
+        """
+        if not self._region_gaps:
+            raise RuntimeError(
+                "No region gaps recorded. Run profiling iterations first "
+                "(with ar_enabled=True)."
+            )
+
+        def _calc_percentile(sorted_vals, pct):
+            n = len(sorted_vals)
+            idx = pct / 100.0 * (n - 1)
+            lo = int(idx)
+            hi = min(lo + 1, n - 1)
+            frac = idx - lo
+            return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+        def _bw_at_size_mb(size_mb):
+            """Interpolate BW from profile at given message size."""
+            if bw_profile is None:
+                return bw_GBps
+            sizes = bw_profile['sizes_mb']
+            bws = bw_profile['bw_GBps']
+            if size_mb <= sizes[0]:
+                return bws[0]
+            if size_mb >= sizes[-1]:
+                return bws[-1]
+            for i in range(len(sizes) - 1):
+                if sizes[i] <= size_mb <= sizes[i + 1]:
+                    frac = (size_mb - sizes[i]) / (sizes[i + 1] - sizes[i])
+                    return bws[i] + frac * (bws[i + 1] - bws[i])
+            return bws[-1]
+
+        effective_bw = bw_GBps  # for summary output
+
+        per_region = {}
+        for region, windows in self._region_gaps.items():
+            ws = sorted(windows)
+            n = len(ws)
+            T_min = ws[0]
+            T_mean = sum(ws) / n
+            T_pct = _calc_percentile(ws, percentile)
+
+            if bw_profile is not None:
+                # Iterative: estimate size → look up BW → recompute size
+                bw = _bw_at_size_mb(64)  # initial guess
+                for _ in range(5):
+                    bdp_bytes = (T_pct / 1000.0) * (bw * 1e9) * safety_factor
+                    size_mb = bdp_bytes / (1024 * 1024)
+                    bw = _bw_at_size_mb(size_mb)
+                effective_bw = bw
+            else:
+                bw = bw_GBps
+                bdp_bytes = (T_pct / 1000.0) * (bw * 1e9) * safety_factor
+
+            bdp_MB = int(bdp_bytes / (1024 * 1024))
+
+            per_region[region] = {
+                'trickle_size_bytes': bdp_MB * 1024 * 1024,
+                'trickle_size_MB': bdp_MB,
+                'trickle_size_bytes_exact': bdp_bytes,
+                'T_window_min_ms': T_min,
+                'T_window_percentile_ms': T_pct,
+                'T_window_mean_ms': T_mean,
+                'n_windows': n,
+                'bw_GBps_used': bw,
+            }
+
+        return {
+            'per_region': per_region,
+            'bw_GBps': effective_bw,
+            'safety_factor': safety_factor,
+            'percentile': percentile,
+        }
 
     def get_stats(self):
         """Get scheduler statistics."""
@@ -716,12 +1057,8 @@ class BackwardScheduler:
             'ar_submitted_during_finish': self.ar_submitted_during_finish,
             'pending_dw_at_finish': len(self._dw_queue),
             'wait_prev_ar_ms': getattr(self, '_wait_prev_ar_time', 0) * 1000,
-            'prev_ar_count': getattr(self, '_prev_ar_count', 0),
-            'pending_dw_at_finish_start': getattr(self, '_pending_dw_at_finish_start', 0),
-            'pending_ar_params_at_finish_start': getattr(self, '_pending_ar_params_at_finish_start', 0),
-            'gap_times': self._gap_times[-20:] if self._gap_times else [],
-            'gap_count': len(self._gap_times),
-            'gap_total_ms': sum(self._gap_times) if self._gap_times else 0,
+            'region_gaps': dict(self._region_gaps),
+            'ar_window_mode': self.ar_window_mode,
         }
 
     @classmethod
