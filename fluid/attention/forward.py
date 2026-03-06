@@ -67,6 +67,8 @@ def qkv_projection_p2p_forward(
     seq_local, batch, hidden_size = tokens.shape
     cp_size = cp_group.size()
     my_rank = cp_group.rank()
+    # Build local-to-global rank mapping for P2P ops
+    global_ranks = dist.get_process_group_ranks(cp_group)
     device = tokens.device
     dtype = tokens.dtype
 
@@ -144,9 +146,10 @@ def qkv_projection_p2p_forward(
         # GPU sync: comm_stream waits for send_data to be ready
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_event(send_data_event)  # GPU sync instead of CPU sync
+            global_partner = global_ranks[partner]
             p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffer, partner, group=cp_group),
-                dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
+                dist.P2POp(dist.irecv, recv_buffer, global_partner, group=cp_group),
+                dist.P2POp(dist.isend, send_data_dict[partner], global_partner, group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
             all_reqs.extend(reqs)
@@ -257,6 +260,8 @@ def output_projection_p2p_forward(
     """
     cp_size = cp_group.size()
     my_rank = cp_group.rank()
+    # Build local-to-global rank mapping for P2P ops
+    global_ranks = dist.get_process_group_ranks(cp_group)
     device = attn_output.device
     dtype = attn_output.dtype
 
@@ -329,9 +334,10 @@ def output_projection_p2p_forward(
         with torch.cuda.stream(comm_stream):
             if round_idx == 0:
                 comm_stream.wait_stream(default_stream)  # Wait for send_data preparation
+            global_partner = global_ranks[partner]
             p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffers[partner], partner, group=cp_group),
-                dist.P2POp(dist.isend, send_data_dict[partner], partner, group=cp_group),
+                dist.P2POp(dist.irecv, recv_buffers[partner], global_partner, group=cp_group),
+                dist.P2POp(dist.isend, send_data_dict[partner], global_partner, group=cp_group),
             ]
             curr_reqs = dist.batch_isend_irecv(p2p_ops)
 

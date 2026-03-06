@@ -131,6 +131,7 @@ scheduler.enable()
 scheduler.configure_allreduce(
     enabled=True,
     shared_dp_group=all_group,
+    expert_dp_group=dp_group if dp_size > 1 else None,
 )
 fluidmoe_model.setup_ar_buffer()
 
@@ -164,24 +165,12 @@ def run_baseline_bwd():
     allreduce_grads(baseline_model)
 
 
-def allreduce_expert_grads(model):
-    """AR expert params across dp subgroup (only needed when dp > 1)."""
-    if dp_size <= 1:
-        return
-    for layer in model.layers:
-        for name in ('moe_w1', 'moe_w2'):
-            p = getattr(layer, name, None)
-            if p is not None and p.grad is not None:
-                dist.all_reduce(p.grad, group=dp_group)
-
-
 def run_fluid_bwd():
     x_grad.grad = None
     for p in fluidmoe_model.parameters():
         p.grad = None
     fluidmoe_model(x_grad).sum().backward()
     scheduler.finish_batch()
-    allreduce_expert_grads(fluidmoe_model)
     scheduler.clear_iteration()
 
 

@@ -422,13 +422,14 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler.end_region()
 
         # Register dW tasks for MoE weights (between Region 1 and 2)
-        # Expert params use EP partitioning; AR handled separately when dp > 1
+        moe_needs_ar = scheduler.expert_dp_world_size > 1
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
             moe_w1, moe_w2, all_expert_tokens, act_output,
             grad_all_fc2,
             grad_all_fc1,
             num_local_experts, all_tokens_per_expert, layer_id,
             orig_moe_w1, orig_moe_w2,
+            needs_ar=moe_needs_ar,
         )
 
         # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
@@ -807,27 +808,29 @@ class TransformerModel(nn.Module):
         ])
 
     def setup_ar_buffer(self):
-        """Set up flat AR buffer for zero-copy trickle slicing.
+        """Set up flat AR buffers for zero-copy trickle slicing.
 
-        Registers shared parameters (needing AllReduce across all ranks)
-        in backward execution order (last layer first), then allocates
-        contiguous flat buffers on the scheduler.
-
-        Expert params (moe_w1/w2) are NOT included here because they use
-        EP partitioning and need AR across a different group (dp subgroup)
-        when dp > 1.
+        Registers shared parameters in backward execution order on the
+        shared AR buffer, and expert parameters on the expert AR buffer
+        (separate NCCL group for dp subgroup AR when dp > 1).
         """
         sched = get_backward_scheduler()
-        params = []
+        shared_params = []
+        expert_params = []
         for layer in reversed(self.layers):
-            params.extend([
+            # Expert params first (they execute earlier in MoE backward)
+            expert_params.extend([layer.moe_w2, layer.moe_w1])
+            # Then shared params
+            shared_params.extend([
                 layer.router_weight,
                 layer.ln2_weight, layer.ln2_bias,
                 layer.proj_weight,
                 layer.qkv_weight,
                 layer.ln1_weight, layer.ln1_bias,
             ])
-        sched.setup_ar_buffer(params)
+        sched.setup_ar_buffer(shared_params)
+        if sched.expert_dp_world_size > 1:
+            sched.setup_expert_ar_buffer(expert_params)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:

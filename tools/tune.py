@@ -125,7 +125,8 @@ def get_valid_chunks(size, max_C=MAX_C):
 # enabled=False: Step 1 使用同步 AR 模式
 # Step 2/3 设 ar_enabled=True 切换为插入 AR 模式
 sched = get_backward_scheduler()
-sched.configure_allreduce(enabled=False, shared_dp_group=all_group)
+sched.configure_allreduce(enabled=False, shared_dp_group=all_group,
+                         expert_dp_group=dp_group if dp_size > 1 else None)
 
 
 # ============================================================

@@ -552,6 +552,8 @@ def dispatch_fc1_p2p_forward(
     nvtx_range_push("dispatch_fc1_p2p")
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
+    # Build local-to-global rank mapping for P2P ops
+    global_ranks = dist.get_process_group_ranks(ep_group)
     device = tokens.device
     dtype = tokens.dtype
     hidden_size = tokens.shape[-1]
@@ -671,10 +673,11 @@ def dispatch_fc1_p2p_forward(
             if round_idx == 0:
                 comm_stream.wait_stream(default_stream)  # Wait for send_chunks preparation
             p2p_ops = []
+            global_partner = global_ranks[partner]
             if partner in recv_buffers_with_metadata:
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_buffers_with_metadata[partner], partner, group=ep_group))
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_buffers_with_metadata[partner], global_partner, group=ep_group))
             if partner in send_chunks:
-                p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], partner, group=ep_group))
+                p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], global_partner, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
         nvtx_range_pop()
 
@@ -799,6 +802,8 @@ def fc2_combine_p2p_forward(
     nvtx_range_push("fc2_combine_p2p")
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
+    # Build local-to-global rank mapping for P2P ops
+    global_ranks = dist.get_process_group_ranks(ep_group)
     device = local_tokens.device
     dtype = local_tokens.dtype
     hidden_size = weight2.shape[-1]
@@ -854,11 +859,12 @@ def fc2_combine_p2p_forward(
             if has_pending_fc2:
                 comm_stream.wait_event(fc2_event)
             p2p_ops = []
+            global_partner = global_ranks[partner]
             if input_splits[partner] > 0:
                 p2p_ops.append(dist.P2POp(dist.irecv,
-                    combined_output[input_offsets[partner]:input_offsets[partner+1]], partner, group=ep_group))
+                    combined_output[input_offsets[partner]:input_offsets[partner+1]], global_partner, group=ep_group))
             if partner in peer_fc2_results:
-                p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], partner, group=ep_group))
+                p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], global_partner, group=ep_group))
             if p2p_ops:
                 all_combine_reqs.extend(dist.batch_isend_irecv(p2p_ops))
         nvtx_range_pop()

@@ -91,7 +91,7 @@ class BackwardScheduler:
         # Pre-allocated CUDA event for AR completion tracking (avoids cudaEventCreate per flush)
         self._ar_done_event = None
 
-        # Flat AR buffer (DDP-style zero-copy trickle)
+        # Flat AR buffer (DDP-style zero-copy trickle) — shared params
         self._ar_param_map = {}       # param → (buffer, offset, numel)
         self._ar_buffer_bf16 = None   # flat contiguous buffer for bf16 grads
         self._ar_buffer_fp32 = None   # flat contiguous buffer for fp32 grads
@@ -100,14 +100,26 @@ class BackwardScheduler:
         self._ar_read_cursor_fp32 = 0
         self._ar_write_cursor_fp32 = 0
 
+        # Flat AR buffer — expert params (separate group, separate buffer)
+        self._expert_ar_param_map = {}
+        self._expert_ar_buffer_bf16 = None
+        self._expert_ar_buffer_fp32 = None
+        self._expert_ar_read_cursor_bf16 = 0
+        self._expert_ar_write_cursor_bf16 = 0
+        self._expert_ar_read_cursor_fp32 = 0
+        self._expert_ar_write_cursor_fp32 = 0
+
         # AR config
         self.ar_enabled = False
         self.ar_safe_mode = False
         self.ar_lockstep = False
         self.shared_dp_group = None
-        self.ar_group = None  # Independent NCCL communicator for AR
+        self.ar_group = None  # Independent NCCL communicator for shared param AR
         self.ar_ctrl_group = None  # Optional Gloo control group for lockstep gating
         self.shared_dp_world_size = 1
+        self.expert_dp_group = None
+        self.expert_ar_group = None  # Independent NCCL communicator for expert param AR
+        self.expert_dp_world_size = 1
         self.ar_window_mode = "strict_window"
 
         # Stats
@@ -168,16 +180,18 @@ class BackwardScheduler:
     def is_enabled(self):
         return self.enabled
 
-    def configure_allreduce(self, enabled=True, shared_dp_group=None, **kwargs):
-        """Configure AllReduce settings for shared parameters.
+    def configure_allreduce(self, enabled=True, shared_dp_group=None, expert_dp_group=None, **kwargs):
+        """Configure AllReduce settings for shared and expert parameters.
 
         Args:
             shared_dp_group: Process group for shared parameter gradient AR.
                 This should include ALL ranks that hold identical shared params
                 (= all ranks across both dp and cp dimensions).
-                Expert params use a different group (dp subgroup only).
+            expert_dp_group: Process group for expert parameter gradient AR.
+                This should include only ranks holding the same expert partition
+                (= dp subgroup). None means no expert AR (dp=1).
 
-        Creates an independent NCCL communicator (ar_group) for AllReduce.
+        Creates independent NCCL communicators for AllReduce.
         AR runs on comm_stream (same as A2A) to prevent cross-communicator
         NCCL deadlocks via CUDA stream-level serialization.
         """
@@ -185,6 +199,8 @@ class BackwardScheduler:
         self.shared_dp_group = shared_dp_group
         self.shared_dp_world_size = dist.get_world_size(shared_dp_group) if shared_dp_group else (
             dist.get_world_size() if dist.is_initialized() else 1)
+        self.expert_dp_group = expert_dp_group
+        self.expert_dp_world_size = dist.get_world_size(expert_dp_group) if expert_dp_group else 1
 
         mode_env = os.environ.get("FLUID_AR_WINDOW_MODE", "strict_window").lower()
         if mode_env in ("strict", "strict_window", "strict-window"):
@@ -214,7 +230,7 @@ class BackwardScheduler:
         if self.ar_safe_mode:
             self.ar_lockstep = False
 
-        # Create independent communicator for AR
+        # Create independent communicator for shared param AR
         if shared_dp_group is not None and dist.is_initialized():
             ranks = dist.get_process_group_ranks(shared_dp_group)
             self.ar_group = dist.new_group(ranks)
@@ -225,6 +241,13 @@ class BackwardScheduler:
         else:
             self.ar_group = None
             self.ar_ctrl_group = None
+
+        # Create independent communicator for expert param AR
+        if expert_dp_group is not None and dist.is_initialized() and self.expert_dp_world_size > 1:
+            expert_ranks = dist.get_process_group_ranks(expert_dp_group)
+            self.expert_ar_group = dist.new_group(expert_ranks)
+        else:
+            self.expert_ar_group = None
 
         self._init_cuda(force_reinit=True)
 
@@ -274,6 +297,47 @@ class BackwardScheduler:
         self._ar_write_cursor_bf16 = 0
         self._ar_read_cursor_fp32 = 0
         self._ar_write_cursor_fp32 = 0
+
+    def setup_expert_ar_buffer(self, params):
+        """Set up flat AR buffer for expert parameters (uses expert_dp_group).
+
+        Same mechanism as setup_ar_buffer but uses a separate buffer and
+        AR group for expert params that are partitioned by EP.
+        """
+        self._expert_ar_param_map = {}
+        if not params:
+            self._expert_ar_buffer_bf16 = None
+            self._expert_ar_buffer_fp32 = None
+            return
+
+        bf16_params = [(p, p.numel()) for p in params if p.dtype == torch.bfloat16]
+        fp32_params = [(p, p.numel()) for p in params if p.dtype == torch.float32]
+        device = params[0].device
+
+        if bf16_params:
+            total = sum(n for _, n in bf16_params)
+            self._expert_ar_buffer_bf16 = torch.zeros(total, dtype=torch.bfloat16, device=device)
+            offset = 0
+            for p, n in bf16_params:
+                self._expert_ar_param_map[p] = (self._expert_ar_buffer_bf16, offset, n)
+                offset += n
+        else:
+            self._expert_ar_buffer_bf16 = None
+
+        if fp32_params:
+            total = sum(n for _, n in fp32_params)
+            self._expert_ar_buffer_fp32 = torch.zeros(total, dtype=torch.float32, device=device)
+            offset = 0
+            for p, n in fp32_params:
+                self._expert_ar_param_map[p] = (self._expert_ar_buffer_fp32, offset, n)
+                offset += n
+        else:
+            self._expert_ar_buffer_fp32 = None
+
+        self._expert_ar_read_cursor_bf16 = 0
+        self._expert_ar_write_cursor_bf16 = 0
+        self._expert_ar_read_cursor_fp32 = 0
+        self._expert_ar_write_cursor_fp32 = 0
 
     def _use_interleaved_ar(self) -> bool:
         """Whether interleaved AR submission is allowed in current mode."""
@@ -368,7 +432,7 @@ class BackwardScheduler:
                     grad_weight = grad_weight.to(task.weight_param.dtype)
 
                 if task.weight_param in self._ar_param_map:
-                    # Flat buffer path: write grad into pre-allocated buffer
+                    # Shared flat buffer path
                     buf, offset, numel = self._ar_param_map[task.weight_param]
                     flat_grad = grad_weight.view(-1)
                     if task.weight_param.grad is None:
@@ -384,6 +448,22 @@ class BackwardScheduler:
                     else:
                         if end > self._ar_write_cursor_fp32:
                             self._ar_write_cursor_fp32 = end
+                elif task.weight_param in self._expert_ar_param_map:
+                    # Expert flat buffer path
+                    buf, offset, numel = self._expert_ar_param_map[task.weight_param]
+                    flat_grad = grad_weight.view(-1)
+                    if task.weight_param.grad is None:
+                        buf[offset:offset+numel].copy_(flat_grad)
+                    else:
+                        buf[offset:offset+numel].add_(flat_grad)
+                    task.weight_param.grad = buf[offset:offset+numel].view(task.weight_param.shape)
+                    end = offset + numel
+                    if buf.dtype == torch.bfloat16:
+                        if end > self._expert_ar_write_cursor_bf16:
+                            self._expert_ar_write_cursor_bf16 = end
+                    else:
+                        if end > self._expert_ar_write_cursor_fp32:
+                            self._expert_ar_write_cursor_fp32 = end
                 else:
                     # Original path for unregistered params
                     if task.weight_param.grad is None:
@@ -518,10 +598,8 @@ class BackwardScheduler:
     def _trickle_ar(self):
         """Trickle AR onto comm_stream using flat buffer cursor or fallback queue.
 
-        With flat buffer: advances read cursor by up to budget bytes in one
-        dist.all_reduce() call — zero copy, zero allocation.
-
-        Without flat buffer (fallback): submits whole tensors from pending queue.
+        Handles both shared param buffer (ar_group) and expert param buffer
+        (expert_ar_group) in a single comm_stream submission.
 
         Determinism guarantee:
         1. execute_dw_tasks() always drains the full dW queue, so buffer
@@ -530,15 +608,26 @@ class BackwardScheduler:
            A2As have been waited for).  This is a deterministic condition
            that does NOT depend on timing.
         """
-        if not self._use_interleaved_ar() or self.shared_dp_world_size <= 1:
+        if not self._use_interleaved_ar():
             return
 
-        # Check if there's anything to submit
-        has_buffer = (
+        has_shared = self.shared_dp_world_size > 1
+        has_expert = self.expert_dp_world_size > 1
+
+        if not has_shared and not has_expert:
+            return
+
+        # Check if there's anything to submit (shared)
+        has_shared_buffer = has_shared and (
             (self._ar_buffer_bf16 is not None and self._ar_read_cursor_bf16 < self._ar_write_cursor_bf16) or
             (self._ar_buffer_fp32 is not None and self._ar_read_cursor_fp32 < self._ar_write_cursor_fp32)
         )
-        if not has_buffer and not self._pending_ar_tensors:
+        # Check if there's anything to submit (expert)
+        has_expert_buffer = has_expert and (
+            (self._expert_ar_buffer_bf16 is not None and self._expert_ar_read_cursor_bf16 < self._expert_ar_write_cursor_bf16) or
+            (self._expert_ar_buffer_fp32 is not None and self._expert_ar_read_cursor_fp32 < self._expert_ar_write_cursor_fp32)
+        )
+        if not has_shared_buffer and not has_expert_buffer and not self._pending_ar_tensors:
             return
 
         # Deterministic check: only trickle when ALL submitted A2As have
@@ -546,13 +635,13 @@ class BackwardScheduler:
         if self._alltoall_results:
             return
 
-        ar_group = self.ar_group if self.ar_group is not None else self.shared_dp_group
         region = self._region_name
         budget = self.ar_trickle_sizes.get(region, 0) if region else 0
+        _MIN_TRICKLE_NUMEL = 512 * 1024  # ~1 MB for bf16
 
-        # Pre-compute what to submit BEFORE touching comm_stream
+        # --- Pre-compute shared buffer ranges ---
         bf16_start = bf16_end = 0
-        if self._ar_buffer_bf16 is not None:
+        if has_shared and self._ar_buffer_bf16 is not None:
             cursor = self._ar_read_cursor_bf16
             write_end = self._ar_write_cursor_bf16
             if cursor < write_end:
@@ -564,33 +653,54 @@ class BackwardScheduler:
                 bf16_start = cursor
 
         fp32_start = fp32_end = 0
-        if self._ar_buffer_fp32 is not None:
+        if has_shared and self._ar_buffer_fp32 is not None:
             cursor32 = self._ar_read_cursor_fp32
             write_end32 = self._ar_write_cursor_fp32
             if cursor32 < write_end32:
                 fp32_start = cursor32
                 fp32_end = write_end32
 
-        # Skip trickle if available data per dtype is too small — NCCL launch
-        # overhead exceeds the overlap benefit for tiny transfers.  Data
-        # accumulates and will be submitted at the next trickle point or flush.
-        # Threshold is deterministic (cursors are identical across ranks).
-        _MIN_TRICKLE_NUMEL = 512 * 1024  # ~1 MB for bf16
+        # --- Pre-compute expert buffer ranges ---
+        exp_bf16_start = exp_bf16_end = 0
+        if has_expert and self._expert_ar_buffer_bf16 is not None:
+            cursor = self._expert_ar_read_cursor_bf16
+            write_end = self._expert_ar_write_cursor_bf16
+            if cursor < write_end:
+                if budget > 0:
+                    budget_numel = budget // self._expert_ar_buffer_bf16.element_size()
+                    exp_bf16_end = min(cursor + budget_numel, write_end)
+                else:
+                    exp_bf16_end = write_end
+                exp_bf16_start = cursor
+
+        exp_fp32_start = exp_fp32_end = 0
+        if has_expert and self._expert_ar_buffer_fp32 is not None:
+            cursor32 = self._expert_ar_read_cursor_fp32
+            write_end32 = self._expert_ar_write_cursor_fp32
+            if cursor32 < write_end32:
+                exp_fp32_start = cursor32
+                exp_fp32_end = write_end32
+
+        # Check minimum size thresholds
         bf16_ok = (bf16_end - bf16_start) >= _MIN_TRICKLE_NUMEL
         fp32_ok = (fp32_end - fp32_start) >= _MIN_TRICKLE_NUMEL
-        has_work = bf16_ok or fp32_ok or bool(self._pending_ar_tensors)
+        exp_bf16_ok = (exp_bf16_end - exp_bf16_start) >= _MIN_TRICKLE_NUMEL
+        exp_fp32_ok = (exp_fp32_end - exp_fp32_start) >= _MIN_TRICKLE_NUMEL
+        has_work = bf16_ok or fp32_ok or exp_bf16_ok or exp_fp32_ok or bool(self._pending_ar_tensors)
         if not has_work:
             return
 
         # Only now touch comm_stream
         self._a2a_idle.wait()
+        ar_group = self.ar_group if self.ar_group is not None else self.shared_dp_group
+        expert_ar_group = self.expert_ar_group if self.expert_ar_group is not None else self.expert_dp_group
 
         with torch.cuda.stream(self.comm_stream):
             # Ensure comm_stream sees all gradients written on default_stream
             self.comm_stream.wait_stream(self.default_stream)
 
-            # --- Flat buffer: bf16 ---
-            if bf16_start < bf16_end and (bf16_end - bf16_start) >= _MIN_TRICKLE_NUMEL:
+            # --- Shared flat buffer: bf16 ---
+            if bf16_ok:
                 dist.all_reduce(self._ar_buffer_bf16[bf16_start:bf16_end], group=ar_group)
                 self._ar_read_cursor_bf16 = bf16_end
                 self._ar_task_count += 1
@@ -601,8 +711,8 @@ class BackwardScheduler:
                 else:
                     self.ar_submitted_during_bwd += 1
 
-            # --- Flat buffer: fp32 ---
-            if fp32_start < fp32_end and (fp32_end - fp32_start) >= _MIN_TRICKLE_NUMEL:
+            # --- Shared flat buffer: fp32 ---
+            if fp32_ok:
                 dist.all_reduce(self._ar_buffer_fp32[fp32_start:fp32_end], group=ar_group)
                 self._ar_read_cursor_fp32 = fp32_end
                 self._ar_task_count += 1
@@ -613,7 +723,31 @@ class BackwardScheduler:
                 else:
                     self.ar_submitted_during_bwd += 1
 
-            # --- Fallback: pending tensors ---
+            # --- Expert flat buffer: bf16 ---
+            if exp_bf16_ok:
+                dist.all_reduce(self._expert_ar_buffer_bf16[exp_bf16_start:exp_bf16_end], group=expert_ar_group)
+                self._expert_ar_read_cursor_bf16 = exp_bf16_end
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                if self._in_finish_batch:
+                    self.ar_submitted_during_finish += 1
+                else:
+                    self.ar_submitted_during_bwd += 1
+
+            # --- Expert flat buffer: fp32 ---
+            if exp_fp32_ok:
+                dist.all_reduce(self._expert_ar_buffer_fp32[exp_fp32_start:exp_fp32_end], group=expert_ar_group)
+                self._expert_ar_read_cursor_fp32 = exp_fp32_end
+                self._ar_task_count += 1
+                self.total_ar += 1
+                self.ar_during_overlap += 1
+                if self._in_finish_batch:
+                    self.ar_submitted_during_finish += 1
+                else:
+                    self.ar_submitted_during_bwd += 1
+
+            # --- Fallback: pending tensors (shared group) ---
             bytes_submitted = 0
             while self._pending_ar_tensors:
                 if budget > 0 and bytes_submitted >= budget:
@@ -639,12 +773,17 @@ class BackwardScheduler:
 
         Used by finish_batch() to ensure all AR completes before
         optimizer.step().  No budget limit — submits everything remaining.
+        Handles both shared and expert buffers.
         """
-        has_buffer_remaining = (
+        has_shared_remaining = (
             (self._ar_buffer_bf16 is not None and self._ar_read_cursor_bf16 < self._ar_buffer_bf16.numel()) or
             (self._ar_buffer_fp32 is not None and self._ar_read_cursor_fp32 < self._ar_buffer_fp32.numel())
         )
-        if not self._pending_ar_tensors and not has_buffer_remaining:
+        has_expert_remaining = (
+            (self._expert_ar_buffer_bf16 is not None and self._expert_ar_read_cursor_bf16 < self._expert_ar_buffer_bf16.numel()) or
+            (self._expert_ar_buffer_fp32 is not None and self._expert_ar_read_cursor_fp32 < self._expert_ar_buffer_fp32.numel())
+        )
+        if not self._pending_ar_tensors and not has_shared_remaining and not has_expert_remaining:
             if self.ar_lockstep and self.ar_ctrl_group is not None:
                 timeout_s = int(os.environ.get("FLUID_AR_LOCKSTEP_TIMEOUT_SEC", "120"))
                 dist.monitored_barrier(
@@ -656,12 +795,13 @@ class BackwardScheduler:
         self._a2a_idle.wait()
 
         ar_group = self.ar_group if self.ar_group is not None else self.shared_dp_group
+        expert_ar_group = self.expert_ar_group if self.expert_ar_group is not None else self.expert_dp_group
 
         with torch.cuda.stream(self.comm_stream):
             # Ensure comm_stream sees all gradients written on default_stream
             self.comm_stream.wait_stream(self.default_stream)
 
-            # Flush bf16 buffer remainder
+            # --- Shared: flush bf16 ---
             if self._ar_buffer_bf16 is not None:
                 buf = self._ar_buffer_bf16
                 cursor = self._ar_read_cursor_bf16
@@ -674,7 +814,7 @@ class BackwardScheduler:
                     self.ar_during_overlap += 1
                     self.ar_submitted_during_finish += 1
 
-            # Flush fp32 buffer remainder
+            # --- Shared: flush fp32 ---
             if self._ar_buffer_fp32 is not None:
                 buf32 = self._ar_buffer_fp32
                 cursor32 = self._ar_read_cursor_fp32
@@ -687,7 +827,33 @@ class BackwardScheduler:
                     self.ar_during_overlap += 1
                     self.ar_submitted_during_finish += 1
 
-            # Flush pending tensors (unregistered params)
+            # --- Expert: flush bf16 ---
+            if self._expert_ar_buffer_bf16 is not None and expert_ar_group is not None:
+                buf = self._expert_ar_buffer_bf16
+                cursor = self._expert_ar_read_cursor_bf16
+                total = buf.numel()
+                if cursor < total:
+                    dist.all_reduce(buf[cursor:total], group=expert_ar_group)
+                    self._expert_ar_read_cursor_bf16 = total
+                    self._ar_task_count += 1
+                    self.total_ar += 1
+                    self.ar_during_overlap += 1
+                    self.ar_submitted_during_finish += 1
+
+            # --- Expert: flush fp32 ---
+            if self._expert_ar_buffer_fp32 is not None and expert_ar_group is not None:
+                buf32 = self._expert_ar_buffer_fp32
+                cursor32 = self._expert_ar_read_cursor_fp32
+                total32 = buf32.numel()
+                if cursor32 < total32:
+                    dist.all_reduce(buf32[cursor32:total32], group=expert_ar_group)
+                    self._expert_ar_read_cursor_fp32 = total32
+                    self._ar_task_count += 1
+                    self.total_ar += 1
+                    self.ar_during_overlap += 1
+                    self.ar_submitted_during_finish += 1
+
+            # Flush pending tensors (unregistered params, shared group)
             while self._pending_ar_tensors:
                 grad = self._pending_ar_tensors.popleft()
                 if grad is None:
@@ -710,7 +876,7 @@ class BackwardScheduler:
 
     def flush_ar_pending(self, final: bool = False):
         """Submit all deferred AR tensors in deterministic order."""
-        if not self._use_interleaved_ar() or self.shared_dp_world_size <= 1:
+        if not self._use_interleaved_ar() or (self.shared_dp_world_size <= 1 and self.expert_dp_world_size <= 1):
             self._pending_ar_tensors.clear()
             return
 
@@ -727,11 +893,17 @@ class BackwardScheduler:
 
     def _sync_allreduce_all_params(self):
         """Synchronously AllReduce all collected params and flat buffers."""
-        # Flat buffer AR (all grads written by execute_dw_tasks)
-        if self._ar_buffer_bf16 is not None:
+        # Shared flat buffer AR
+        if self._ar_buffer_bf16 is not None and self.shared_dp_world_size > 1:
             dist.all_reduce(self._ar_buffer_bf16, group=self.shared_dp_group)
-        if self._ar_buffer_fp32 is not None:
+        if self._ar_buffer_fp32 is not None and self.shared_dp_world_size > 1:
             dist.all_reduce(self._ar_buffer_fp32, group=self.shared_dp_group)
+        # Expert flat buffer AR
+        expert_ar_group = self.expert_ar_group if self.expert_ar_group is not None else self.expert_dp_group
+        if self._expert_ar_buffer_bf16 is not None and self.expert_dp_world_size > 1 and expert_ar_group is not None:
+            dist.all_reduce(self._expert_ar_buffer_bf16, group=expert_ar_group)
+        if self._expert_ar_buffer_fp32 is not None and self.expert_dp_world_size > 1 and expert_ar_group is not None:
+            dist.all_reduce(self._expert_ar_buffer_fp32, group=expert_ar_group)
         # Fallback: individual params (unregistered)
         for param in self._ar_params_for_sync:
             if param.grad is not None:
@@ -787,6 +959,10 @@ class BackwardScheduler:
         self._ar_write_cursor_bf16 = 0
         self._ar_read_cursor_fp32 = 0
         self._ar_write_cursor_fp32 = 0
+        self._expert_ar_read_cursor_bf16 = 0
+        self._expert_ar_write_cursor_bf16 = 0
+        self._expert_ar_read_cursor_fp32 = 0
+        self._expert_ar_write_cursor_fp32 = 0
 
         # 6. Reset per-iteration stats.
         self.total_dw = 0
@@ -812,7 +988,8 @@ class BackwardScheduler:
         self.execute_dw_tasks()
 
         # 2. Flush + wait for ALL AR before returning.
-        if self._use_interleaved_ar() and self.shared_dp_world_size > 1:
+        needs_ar = self.shared_dp_world_size > 1 or self.expert_dp_world_size > 1
+        if self._use_interleaved_ar() and needs_ar:
             self.flush_ar_pending(final=True)
             self._wait_all_ar()
 
@@ -822,7 +999,7 @@ class BackwardScheduler:
         self._last_a2a_end_region = None
 
         # 3. In sync mode (ar_enabled=False) OR safe mode, do sync AR.
-        if (not self._use_interleaved_ar()) and self.shared_dp_world_size > 1:
+        if (not self._use_interleaved_ar()) and needs_ar:
             self._sync_allreduce_all_params()
 
         self._in_finish_batch = False
