@@ -91,14 +91,6 @@ from .layer import (
 )
 
 # =============================================================================
-# Distributed module (SP + EP parallel)
-# =============================================================================
-def _lazy_import_distributed():
-    """Lazy import distributed module."""
-    from . import distributed
-    return distributed
-
-# =============================================================================
 # Public API
 # =============================================================================
 __all__ = [
@@ -148,33 +140,6 @@ __all__ = [
     "wrap_optimizer",
     "FluidOptimizerWrapper",
 ]
-
-
-def print_status():
-    """Print FluidMoE status and statistics"""
-    scheduler = get_backward_scheduler()
-
-    print("=" * 60)
-    print("FluidMoE Status")
-    print("=" * 60)
-    print(f"Version: {__version__}")
-    print(f"Scheduler enabled: {scheduler.is_enabled()}")
-
-    if scheduler.is_enabled():
-        stats = scheduler.get_stats()
-        print("\nScheduler Statistics:")
-        print(f"  Total dW tasks: {stats['total_dw_tasks']}")
-        print(f"  Completed dW tasks: {stats['completed_dw_tasks']}")
-        pending_at_finish = stats['pending_dw_at_finish_start']
-        overlap_completed = stats['completed_dw_tasks'] - pending_at_finish
-        print(f"    - During overlap: {overlap_completed}")
-        print(f"    - In finish_batch: {pending_at_finish}")
-
-        if stats['total_dw_tasks'] > 0:
-            overlap_ratio = overlap_completed / stats['total_dw_tasks'] * 100
-            print(f"  Overlap ratio: {overlap_ratio:.2f}%")
-
-    print("=" * 60)
 
 
 # =============================================================================

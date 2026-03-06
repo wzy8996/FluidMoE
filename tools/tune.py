@@ -7,8 +7,9 @@ FluidMoE 完整参数搜索
   3. 网格搜索验证 BDP 预测
 
 用法:
-    torchrun --nproc_per_node=2 tools/tune.py   # dp=1, cp=2
-    torchrun --nproc_per_node=4 tools/tune.py   # dp=2, cp=2
+    1) 在本文件中手动设置 dp_size/cp_size/ep_size
+    2) 再运行:
+       torchrun --nproc_per_node=<world_size> tools/tune.py
 """
 import sys, os, gc
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,14 +37,18 @@ num_kv_heads = 32
 ffn_hidden = 14336
 num_experts = 8
 top_k = 4
-seq_local = 2048
+seq_len = 4096
 batch_size = 4
 
-# 并行度配置
-dp_size = 1   # 数据并行度，dp > 1 时专家参数也需要 AR
-cp_size = 2   # 上下文并行度（注意力 AllToAll）
-ep_size = 2   # 专家并行度（MoE AllToAll），当前要求 ep = cp
-num_gpus = dp_size * cp_size  # 参与的总 GPU 数
+# 并行度配置（手动指定）
+dp_size = 1
+cp_size = 2
+ep_size = 2
+
+assert dp_size > 0, f"dp_size 必须 > 0, 但 dp_size={dp_size}"
+assert cp_size > 0, f"cp_size 必须 > 0, 但 cp_size={cp_size}"
+assert ep_size > 0, f"ep_size 必须 > 0, 但 ep_size={ep_size}"
+num_gpus = dp_size * cp_size
 
 # Chunk 搜索参数
 N_WARMUP = 5            # 预热轮数 (forward+backward)
@@ -57,6 +62,7 @@ N_AR_ITER = 10          # 测量轮数
 
 assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
 assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+seq_local = seq_len // cp_size
 
 # 多余的 rank 提前退出
 if rank >= num_gpus:
@@ -98,7 +104,7 @@ p0("FluidMoE 完整参数搜索")
 p0("=" * 60)
 p0(f"Config: hidden={hidden_size}, heads={num_heads}, kv_heads={num_kv_heads}")
 p0(f"        ffn={ffn_hidden}, experts={num_experts}, top_k={top_k}")
-p0(f"        seq_local={seq_local}, batch={batch_size}, GPUs={num_gpus}")
+p0(f"        seq={seq_len}, seq_local={seq_local}, batch={batch_size}, GPUs={num_gpus}")
 p0(f"        dp={dp_size}, cp={cp_size}, ep={ep_size}")
 p0(f"Chunk 搜索: warmup={N_WARMUP}, iter={N_ITER}, max_C={MAX_C}, stop<{STOP_MIN_SAVING_MS} ms")
 p0(f"AR 搜索:    warmup={N_AR_WARMUP}, iter={N_AR_ITER}")
@@ -154,7 +160,11 @@ xg = x_input.clone().detach().requires_grad_(True)
 
 
 def bench_chunk(mc, md, ap, aq):
-    """测量一个 chunk 配置的 backward 时间 (完整 forward+backward，固定输入)。"""
+    """测量一个 chunk 配置的 backward 时间 (完整 forward+backward，固定输入)。
+
+    Returns rank 0's timing broadcast to all ranks, ensuring deterministic
+    early-stop decisions across ranks (avoids NCCL deadlock from divergent paths).
+    """
     # 直接修改模型各层的 chunk 属性，forward 时会传入 ctx 供 backward 使用
     for layer in chunk_model.layers:
         layer.moe_combine_chunks = mc
@@ -176,7 +186,10 @@ def bench_chunk(mc, md, ap, aq):
         torch.cuda.synchronize()
         total += start.elapsed_time(end)
         sched.clear_iteration()
-    return total / N_ITER
+    # AllReduce 取均值，确保所有 rank 做出相同的早停决策
+    t_tensor = torch.tensor([total / N_ITER], device=device)
+    dist.all_reduce(t_tensor, op=dist.ReduceOp.AVG)
+    return t_tensor.item()
 
 
 # 预热
@@ -394,7 +407,10 @@ ev_e = torch.cuda.Event(enable_timing=True)
 
 
 def bench_ar(label, setup_fn):
-    """Benchmark a trickle configuration."""
+    """Benchmark a trickle configuration.
+
+    Returns rank 0's timing broadcast to all ranks for consistency.
+    """
     setup_fn()
     sched.clear_iteration()
     # 预热
@@ -420,7 +436,10 @@ def bench_ar(label, setup_fn):
         torch.cuda.synchronize()
         total += ev_s.elapsed_time(ev_e)
         sched.clear_iteration()
-    return total / N_AR_ITER
+    # AllReduce 取均值，确保所有 rank 一致
+    t_tensor = torch.tensor([total / N_AR_ITER], device=device)
+    dist.all_reduce(t_tensor, op=dist.ReduceOp.AVG)
+    return t_tensor.item()
 
 
 # 3a: 统一 trickle size 网格搜索

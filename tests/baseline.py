@@ -64,6 +64,17 @@ def _timed_overlap(phase: str, key: str = ""):
                 timer.bwd_first_fc1_dx_ms += ms
 
 
+_baseline_fc1_buf = {}  # (cols, dtype, device_idx) -> Tensor, grow-only
+
+def _get_fc1_buf(rows: int, cols: int, dtype, device):
+    key = (cols, dtype, device.index)
+    buf = _baseline_fc1_buf.get(key)
+    if buf is None or buf.shape[0] < rows:
+        buf = torch.empty(rows, cols, dtype=dtype, device=device)
+        _baseline_fc1_buf[key] = buf
+    return buf[:rows]
+
+
 class BaselineTransformerFunction(torch.autograd.Function):
     """Baseline transformer with attention recomputation (fair comparison with FluidMoE)."""
 
@@ -184,17 +195,15 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         tokens_per_local_expert = [sum(all_tpe[r][e] for r in range(ep_size)) for e in range(num_local_experts)]
 
-        # Expert compute (保存 fc1 供反向使用，避免 FC1 recomp)
+        # Expert compute (fc1 不再保存，反向重算)
         total_recv = recv_tokens.shape[0]
         expert_output = torch.zeros(total_recv, hidden_size, dtype=dtype, device=device)
-        fc1_all = torch.empty(total_recv, moe_w1.shape[2], dtype=dtype, device=device)
         offset = 0
         for exp_idx in range(num_local_experts):
             n_tok = tokens_per_local_expert[exp_idx]
             if n_tok > 0:
                 with _timed_overlap("fwd", "fc1"):  # [可重叠] R2 FC1 GEMM + activation
                     fc1 = torch.matmul(recv_tokens[offset:offset + n_tok], moe_w1[exp_idx])
-                    fc1_all[offset:offset + n_tok] = fc1
                     act = activation_func(fc1)
                 with _timed_overlap("fwd", "fc2"):  # [可重叠] R1 FC2 GEMM
                     expert_output[offset:offset + n_tok] = torch.matmul(act, moe_w2[exp_idx])
@@ -219,7 +228,6 @@ class BaselineTransformerFunction(torch.autograd.Function):
             router_probs, top_indices, recv_tokens, combined_output,
             ln1_weight, ln1_bias, ln2_weight, ln2_bias,
             qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
-            fc1_all,
         )
         # Save SDPA computation graph (avoids redundant forward in backward)
         ctx._q_for_attn = q_for_attn
@@ -249,7 +257,7 @@ class BaselineTransformerFunction(torch.autograd.Function):
          router_probs, top_indices, recv_tokens, combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
-         fc1_all) = ctx.saved_tensors
+         ) = ctx.saved_tensors
 
         # Retrieve SDPA computation graph
         q_for_attn = ctx._q_for_attn
@@ -304,6 +312,23 @@ class BaselineTransformerFunction(torch.autograd.Function):
         for exp_idx in range(num_local_experts):
             expert_offsets.append(off)
             off += tokens_per_local_expert[exp_idx]
+
+        # FC1 recomputation (no longer saved from forward)
+        with _timed_overlap("bwd", "fc1_recomp"):
+            total = recv_tokens.shape[0]
+            ffn = moe_w1.shape[2]
+            if total == 0:
+                fc1_all = torch.empty(0, ffn, dtype=dtype, device=device)
+            else:
+                fc1_all = _get_fc1_buf(total, ffn, dtype, device)
+                if num_local_experts == 1:
+                    torch.mm(recv_tokens, moe_w1[0], out=fc1_all)
+                else:
+                    for exp_idx in range(num_local_experts):
+                        n_tok = tokens_per_local_expert[exp_idx]
+                        if n_tok > 0:
+                            o = expert_offsets[exp_idx]
+                            torch.mm(recv_tokens[o:o + n_tok], moe_w1[exp_idx], out=fc1_all[o:o + n_tok])
 
         # FC2 dX matmul (pipeline 关键路径, 暴露: 1/n1)
         grad_act_per_expert = [None] * num_local_experts

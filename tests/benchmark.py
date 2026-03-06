@@ -2,8 +2,9 @@
 FluidMoE Benchmark
 
 用法:
-    torchrun --nproc_per_node=2 tests/benchmark.py   # dp=1, cp=2
-    torchrun --nproc_per_node=4 tests/benchmark.py   # dp=2, cp=2
+    1) 在本文件中手动设置 dp_size/cp_size/ep_size
+    2) 再运行:
+       torchrun --nproc_per_node=<world_size> tests/benchmark.py
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,28 +38,33 @@ batch_size = 4
 moe_combine_chunks = 2
 moe_dispatch_chunks = 2
 attn_proj_chunks = 1
-attn_qkv_chunks = 4
+attn_qkv_chunks = 2
 
 # Per-region AR trickle sizes (bytes), from tune.py BDP model.
 # 0 = unlimited (submit all pending). Set by tune.py output.
 ar_trickle_sizes = {
-    'moe_combine': 185 * 1024 * 1024,
-    'moe_dispatch': 147 * 1024 * 1024,
+    'moe_combine': 220 * 1024 * 1024,
+    'moe_dispatch': 142 * 1024 * 1024,
     'attn_proj': 24 * 1024 * 1024,
-    'attn_qkv': 24 * 1024 * 1024,
+    'attn_qkv': 26 * 1024 * 1024,
 }
 
-# 并行度配置
-dp_size = 1   # 数据并行度，dp > 1 时专家参数也需要 AR
-cp_size = 2   # 上下文并行度（注意力 AllToAll）
-ep_size = 2   # 专家并行度（MoE AllToAll），当前要求 ep = cp
-num_gpus = dp_size * cp_size  # 参与的总 GPU 数
+# 并行度配置（手动指定）
+dp_size = 1
+cp_size = 2
+ep_size = 2
+
+assert dp_size > 0, f"dp_size 必须 > 0, 但 dp_size={dp_size}"
+assert cp_size > 0, f"cp_size 必须 > 0, 但 cp_size={cp_size}"
+assert ep_size > 0, f"ep_size 必须 > 0, 但 ep_size={ep_size}"
+num_gpus = dp_size * cp_size
 
 N_WARMUP = 5
-N_ITER = 10
+N_ITER = 20
 
 assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
 assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+assert seq_len % cp_size == 0, f"seq_len={seq_len} 不能被 cp_size={cp_size} 整除"
 seq_local = seq_len // cp_size
 
 # 多余的 rank 提前退出
@@ -189,20 +195,15 @@ def bench(run_fn, warmup=N_WARMUP, iters=N_ITER):
 
 
 # ============================================================
-# Warmup
+# Baseline (先跑完再释放，避免两个模型同时占显存)
 # ============================================================
-p0("Warmup...")
+p0("Baseline warmup...")
 for _ in range(N_WARMUP):
     with torch.no_grad():
         baseline_model(x)
-        fluidmoe_model(x)
 torch.cuda.synchronize()
 dist.barrier()
-p0("Warmup done.")
 
-# ============================================================
-# Forward
-# ============================================================
 ev_s.record()
 for _ in range(N_ITER):
     with torch.no_grad():
@@ -211,6 +212,22 @@ ev_e.record()
 torch.cuda.synchronize()
 baseline_fwd = ev_s.elapsed_time(ev_e) / N_ITER
 
+baseline_bwd = bench(run_baseline_bwd)
+
+# 释放 baseline 模型显存
+del baseline_model
+torch.cuda.empty_cache()
+
+# ============================================================
+# FluidMoE
+# ============================================================
+p0("FluidMoE warmup...")
+for _ in range(N_WARMUP):
+    with torch.no_grad():
+        fluidmoe_model(x)
+torch.cuda.synchronize()
+dist.barrier()
+
 ev_s.record()
 for _ in range(N_ITER):
     with torch.no_grad():
@@ -218,11 +235,6 @@ for _ in range(N_ITER):
 ev_e.record()
 torch.cuda.synchronize()
 fluidmoe_fwd = ev_s.elapsed_time(ev_e) / N_ITER
-
-# ============================================================
-# Backward + AR
-# ============================================================
-baseline_bwd = bench(run_baseline_bwd)
 
 scheduler.ar_enabled = False
 fluidmoe_sync = bench(run_fluid_bwd)

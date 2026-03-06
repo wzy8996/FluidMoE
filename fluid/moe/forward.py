@@ -40,7 +40,7 @@ import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
 from fluid.core.comm import MultiCardOverlapContext
-from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop, nvtx_mark, Colors
+from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop
 
 _LAYOUT_IDX_CACHE = {}
 
@@ -229,99 +229,14 @@ def merge_tokens_expert_major(
     local_tokens: torch.Tensor,
     all_peer_tokens: torch.Tensor,
     num_local_experts: int,
-    tokens_cpu: torch.Tensor,
-    my_rank: int,
-    ep_size: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, List[int]]:
-    """
-    Merge local and peer tokens into expert-major order.
-
-    Args:
-        local_tokens: [local_count, hidden_size] local tokens (in expert order)
-        all_peer_tokens: [peer_count, hidden_size] all peer tokens (cat in rank order)
-        num_local_experts: Number of local experts
-        tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor of token counts
-        my_rank: Current rank
-        ep_size: Expert parallel world size
-        device: Torch device
-
-    Returns:
-        all_expert_tokens: [total, hidden_size] expert-major order
-        all_tokens_per_expert: [num_local_experts] token count per expert
-    """
-    hidden_size = local_tokens.shape[-1] if local_tokens.numel() > 0 else all_peer_tokens.shape[-1]
-    dtype = local_tokens.dtype if local_tokens.numel() > 0 else all_peer_tokens.dtype
-
-    # Convert to list once for efficient iteration
-    tokens_list = tokens_cpu.tolist()  # [ep_size][num_local_experts]
-
-    # Compute total token count per expert
-    all_tokens_per_expert = []
-    for exp_idx in range(num_local_experts):
-        total = sum(tokens_list[rank][exp_idx] for rank in range(ep_size))
-        all_tokens_per_expert.append(total)
-
-    total_tokens = sum(all_tokens_per_expert)
-
-    if total_tokens == 0:
-        return (torch.empty(0, hidden_size, dtype=dtype, device=device),
-                all_tokens_per_expert)
-
-    all_expert_tokens = torch.zeros(total_tokens, hidden_size, dtype=dtype, device=device)
-
-    # Precompute start offset for each rank in all_peer_tokens
-    peer_rank_offsets = {}
-    offset = 0
-    for rank in range(ep_size):
-        if rank == my_rank:
-            continue
-        peer_rank_offsets[rank] = offset
-        for exp_idx in range(num_local_experts):
-            offset += tokens_list[rank][exp_idx]
-
-    # Fill in expert-major order
-    write_offset = 0
-    for exp_idx in range(num_local_experts):
-        for rank in range(ep_size):
-            n_tok = tokens_list[rank][exp_idx]
-            if n_tok == 0:
-                continue
-
-            if rank == my_rank:
-                # Extract from local (local is in expert order)
-                local_exp_offset = sum(tokens_list[my_rank][e] for e in range(exp_idx))
-                all_expert_tokens[write_offset:write_offset + n_tok] = \
-                    local_tokens[local_exp_offset:local_exp_offset + n_tok]
-            else:
-                # Extract from peer (peer is cat in rank order, each rank in expert order)
-                peer_base = peer_rank_offsets[rank]
-                peer_exp_offset = sum(tokens_list[rank][e] for e in range(exp_idx))
-                src_offset = peer_base + peer_exp_offset
-                all_expert_tokens[write_offset:write_offset + n_tok] = \
-                    all_peer_tokens[src_offset:src_offset + n_tok]
-
-            write_offset += n_tok
-
-    return all_expert_tokens, all_tokens_per_expert
-
-
-def merge_tokens_and_fc1_expert_major(
-    local_tokens: torch.Tensor,
-    all_peer_tokens: torch.Tensor,
-    local_fc1: torch.Tensor,
-    all_peer_fc1: torch.Tensor,
-    num_local_experts: int,
     tokens_list,
     my_rank: int,
     ep_size: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-    """Merge tokens/FC1 to expert-major with one rank-major concat + one index_select."""
+) -> Tuple[torch.Tensor, List[int]]:
+    """Merge tokens to expert-major with one rank-major concat + one index_select."""
     hidden_size = local_tokens.shape[-1] if local_tokens.numel() > 0 else all_peer_tokens.shape[-1]
-    ffn_hidden = local_fc1.shape[-1] if local_fc1.numel() > 0 else all_peer_fc1.shape[-1]
     tok_dtype = local_tokens.dtype if local_tokens.numel() > 0 else all_peer_tokens.dtype
-    fc1_dtype = local_fc1.dtype if local_fc1.numel() > 0 else all_peer_fc1.dtype
 
     if torch.is_tensor(tokens_list):
         tokens_2d = tokens_list.to(device=device, dtype=torch.int64)
@@ -334,28 +249,25 @@ def merge_tokens_and_fc1_expert_major(
     if total_tokens == 0:
         return (
             torch.empty(0, hidden_size, dtype=tok_dtype, device=device),
-            torch.empty(0, ffn_hidden, dtype=fc1_dtype, device=device),
             all_tokens_per_expert,
         )
 
-    # 1) Build rank-major tensors once: [R0(E0..E{e-1}), R1(...), ...]
-    # local_* is this-rank segment in rank-major view; peer_* is peers concatenated in rank order.
+    # 1) Build rank-major tokens: [R0(E0..E{e-1}), R1(...), ...]
     rank_counts = tokens_2d.sum(dim=1).tolist()
     expected_local = rank_counts[my_rank]
     expected_peer = total_tokens - expected_local
-    if local_tokens.shape[0] != expected_local or local_fc1.shape[0] != expected_local:
+    if local_tokens.shape[0] != expected_local:
         raise RuntimeError(
-            f"merge_tokens_and_fc1_expert_major local shape mismatch: "
-            f"expected {expected_local}, got tokens={local_tokens.shape[0]}, fc1={local_fc1.shape[0]}"
+            f"merge_tokens_expert_major local shape mismatch: "
+            f"expected {expected_local}, got tokens={local_tokens.shape[0]}"
         )
-    if all_peer_tokens.shape[0] != expected_peer or all_peer_fc1.shape[0] != expected_peer:
+    if all_peer_tokens.shape[0] != expected_peer:
         raise RuntimeError(
-            f"merge_tokens_and_fc1_expert_major peer shape mismatch: "
-            f"expected {expected_peer}, got tokens={all_peer_tokens.shape[0]}, fc1={all_peer_fc1.shape[0]}"
+            f"merge_tokens_expert_major peer shape mismatch: "
+            f"expected {expected_peer}, got tokens={all_peer_tokens.shape[0]}"
         )
 
     tokens_parts = []
-    fc1_parts = []
     peer_offset = 0
     for rank in range(ep_size):
         n_tok = rank_counts[rank]
@@ -363,19 +275,14 @@ def merge_tokens_and_fc1_expert_major(
             continue
         if rank == my_rank:
             tokens_parts.append(local_tokens)
-            fc1_parts.append(local_fc1)
         else:
-            peer_slice = slice(peer_offset, peer_offset + n_tok)
-            tokens_parts.append(all_peer_tokens[peer_slice])
-            fc1_parts.append(all_peer_fc1[peer_slice])
+            tokens_parts.append(all_peer_tokens[peer_offset:peer_offset + n_tok])
             peer_offset += n_tok
 
     if len(tokens_parts) == 1:
         rank_major_tokens = tokens_parts[0]
-        rank_major_fc1 = fc1_parts[0]
     else:
         rank_major_tokens = torch.cat(tokens_parts, dim=0)
-        rank_major_fc1 = torch.cat(fc1_parts, dim=0)
 
     # 2) Build row permutation for rank-major -> expert-major once.
     split_sizes_rank_major = tokens_2d.reshape(-1).contiguous()
@@ -390,10 +297,9 @@ def merge_tokens_and_fc1_expert_major(
         device=device,
     )
 
-    # 3) Single reorder per tensor.
+    # 3) Single reorder.
     all_expert_tokens = rank_major_tokens.index_select(0, row_idx_rank_to_exp)
-    fc1_all = rank_major_fc1.index_select(0, row_idx_rank_to_exp)
-    return all_expert_tokens, fc1_all, all_tokens_per_expert
+    return all_expert_tokens, all_tokens_per_expert
 
 
 def _build_row_reorder_index(
@@ -509,7 +415,6 @@ def dispatch_fc1_p2p_forward(
     tokens_per_expert: torch.Tensor,
     needs_backward: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
-           Optional[torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor]:
     """
     Dispatch phase with P2P overlap: parallel FC1+Act computation with P2P communication.
@@ -523,8 +428,7 @@ def dispatch_fc1_p2p_forward(
         Each P2P message includes a metadata row containing tokens_per_expert info.
         This eliminates the need for a separate AllGather operation.
 
-    When needs_backward=True, this function also keeps FC1 pre-activation values
-    (local + received) so backward can reuse them without FC1 recomputation.
+    FC1 pre-activation values are NOT saved; backward recomputes them to save memory.
 
     Args:
         tokens: [num_tokens, hidden] input tokens (sorted by expert)
@@ -543,8 +447,6 @@ def dispatch_fc1_p2p_forward(
         local_act: [local_count, ffn_hidden] local activation output
         recv_act_results: Dict[partner -> act_tensor] - activation outputs from peers
         recv_buffers: Dict[partner -> token_tensor] - received tokens from peers (without metadata row)
-        local_fc1: [local_count, ffn_hidden] local FC1 pre-activation (or None)
-        recv_fc1_results: Dict[partner -> fc1_tensor] - FC1 pre-activation from peers
         partners: List of partner ranks
         recv_offsets: Dict of partner -> offset in buffer
         tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor built from P2P metadata
@@ -645,9 +547,7 @@ def dispatch_fc1_p2p_forward(
     prev_partner = None
     prev_reqs = []
     recv_act_results = {}
-    recv_fc1_results = {}
     local_act = None
-    local_fc1 = None
 
     # Compute metadata layout (same as encoding)
     int32_as_elements = 4 // element_size
@@ -693,25 +593,14 @@ def dispatch_fc1_p2p_forward(
         if round_idx == 0:
             # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0:
-                if needs_backward:
-                    local_fc1, local_act = grouped_fc1_act(
-                        local_tokens, w1, local_tokens_per_expert_cpu, activation_func, return_fc1=True
-                    )
-                else:
-                    local_act = grouped_fc1_act(local_tokens, w1, local_tokens_per_expert_cpu, activation_func)
+                local_act = grouped_fc1_act(local_tokens, w1, local_tokens_per_expert_cpu, activation_func)
         elif prev_partner is not None:
             # Extract metadata from previous round's received data
             extract_metadata_and_tokens(prev_partner)
             if prev_partner in recv_buffers:
                 # Compute previous round's received data (now guaranteed complete)
                 recv_data = recv_buffers[prev_partner]
-                if needs_backward:
-                    recv_fc1, recv_act = grouped_fc1_act(
-                        recv_data, w1, tokens_cpu[prev_partner], activation_func, return_fc1=True
-                    )
-                    recv_fc1_results[prev_partner] = recv_fc1
-                else:
-                    recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
+                recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
 
@@ -730,20 +619,14 @@ def dispatch_fc1_p2p_forward(
             extract_metadata_and_tokens(prev_partner)
             if prev_partner in recv_buffers:
                 recv_data = recv_buffers[prev_partner]
-                if needs_backward:
-                    recv_fc1, recv_act = grouped_fc1_act(
-                        recv_data, w1, tokens_cpu[prev_partner], activation_func, return_fc1=True
-                    )
-                    recv_fc1_results[prev_partner] = recv_fc1
-                else:
-                    recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
+                recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
 
     nvtx_range_pop()  # dispatch_fc1_p2p
     return (
         local_tokens, local_act, recv_act_results, recv_buffers,
-        local_fc1, recv_fc1_results, partners, recv_offsets, tokens_cpu
+        partners, recv_offsets, tokens_cpu
     )
 
 
@@ -756,8 +639,6 @@ def fc2_combine_p2p_forward(
     local_act: torch.Tensor,
     recv_act_results: Dict[int, torch.Tensor],
     recv_buffers: Dict[int, torch.Tensor],
-    local_fc1: Optional[torch.Tensor],
-    recv_fc1_results: Dict[int, torch.Tensor],
     weight2: torch.Tensor,
     input_splits: List[int],
     output_splits: List[int],
@@ -767,37 +648,19 @@ def fc2_combine_p2p_forward(
     partners: List[int],
     tokens_cpu: torch.Tensor,
     needs_backward: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+           Optional[torch.Tensor], Optional[list], Optional[dict]]:
     """
-    FC2 + Combine phase with P2P overlap: parallel FC2 computation with P2P communication.
+    FC2 + Combine phase with P2P overlap.
 
     Pipeline:
         Round -1: Compute first peer's FC2
         Round i:  event.synchronize(), start P2P_i, compute next peer's FC2
-        Final:    Compute local FC2 (parallel with last P2P)
-
-    Args:
-        local_tokens: [local_count, hidden] local tokens
-        local_act: [local_count, ffn_hidden] local activation output
-        recv_act_results: Dict[partner -> act_tensor] - activation outputs from peers
-        recv_buffers: Dict[partner -> token_tensor] - received tokens from peers
-        local_fc1: [local_count, ffn_hidden] local FC1 pre-activation (or None)
-        recv_fc1_results: Dict[partner -> fc1_tensor] - FC1 pre-activation from peers
-        weight2: [num_local_experts, ffn_hidden, hidden] FC2 weight
-        input_splits: [ep_size] token count to send to each rank
-        output_splits: [ep_size] token count to receive from each rank
-        ep_group: Expert Parallel process group
-        overlap_ctx: P2P overlap context
-        num_local_experts: Number of local experts
-        partners: List of partner ranks
-        tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor from dispatch_fc1
-        needs_backward: Whether backward is needed
+        Final:    Compute local FC2 + merge/sort for backward (parallel with last P2P)
 
     Returns:
-        combined_output: [total_tokens, hidden] final output
-        local_fc2: [local_count, hidden] local FC2 output (or None)
-        all_peer_tokens_rank_major: [peer_count, hidden] peer tokens in rank-major order (or None)
-        all_peer_fc1_rank_major: [peer_count, ffn_hidden] peer FC1 in rank-major order (or None)
+        combined_output, local_fc2,
+        all_expert_tokens (expert-major), all_tokens_per_expert, backward_indices
     """
     nvtx_range_push("fc2_combine_p2p")
     my_rank = ep_group.rank()
@@ -887,6 +750,42 @@ def fc2_combine_p2p_forward(
             nvtx_range_pop()
 
     # =========================================================================
+    # Merge tokens to expert-major + precompute sort indices (overlap with last P2P)
+    # recv_buffers are from dispatch phase and fully available.
+    # =========================================================================
+    all_expert_tokens = None
+    all_tokens_per_expert = None
+    backward_indices = None
+    if needs_backward and tokens_cpu is not None:
+        nvtx_range_push("merge_sort_fwd")
+        # Build peer tokens concat
+        peer_tokens = [recv_buffers[i] for i in range(ep_size) if i != my_rank and i in recv_buffers]
+        if len(peer_tokens) == 0:
+            all_peer_tokens = torch.empty(0, hidden_size, dtype=dtype, device=device)
+        elif len(peer_tokens) == 1:
+            all_peer_tokens = peer_tokens[0]
+        else:
+            all_peer_tokens = torch.cat(peer_tokens, dim=0)
+
+        all_expert_tokens, all_tokens_per_expert = merge_tokens_expert_major(
+            local_tokens, all_peer_tokens,
+            num_local_experts, tokens_cpu, my_rank, ep_size, device,
+        )
+        backward_indices = precompute_backward_sort_indices(
+            num_local_experts=num_local_experts, ep_size=ep_size,
+            tokens_cpu=tokens_cpu, device=device,
+        )
+        backward_indices['row_idx_rank_to_exp'] = _build_row_reorder_index(
+            backward_indices['split_sizes_rank_major'],
+            backward_indices['sorted_idxs_rank_to_exp'], device,
+        )
+        backward_indices['row_idx_exp_to_rank'] = _build_row_reorder_index(
+            backward_indices['split_sizes_exp_major'],
+            backward_indices['sorted_idxs_exp_to_rank'], device,
+        )
+        nvtx_range_pop()
+
+    # =========================================================================
     # Wait for all Combine P2P to complete
     # =========================================================================
     nvtx_range_push("combine_wait_all")
@@ -902,28 +801,8 @@ def fc2_combine_p2p_forward(
     if local_fc2 is not None:
         combined_output[local_start:local_start + local_count] = local_fc2
 
-    # Keep rank-major peer caches for backward; merge/precompute is deferred to backward.
-    all_peer_tokens_rank_major = None
-    all_peer_fc1_rank_major = None
-    if needs_backward and tokens_cpu is not None:
-        peer_tokens = [recv_buffers[i] for i in range(ep_size) if i != my_rank and i in recv_buffers]
-        if len(peer_tokens) == 0:
-            all_peer_tokens_rank_major = torch.empty(0, hidden_size, dtype=dtype, device=device)
-        elif len(peer_tokens) == 1:
-            all_peer_tokens_rank_major = peer_tokens[0]
-        else:
-            all_peer_tokens_rank_major = torch.cat(peer_tokens, dim=0)
-
-        peer_fc1 = [recv_fc1_results[i] for i in range(ep_size) if i != my_rank and i in recv_fc1_results]
-        if len(peer_fc1) == 0:
-            all_peer_fc1_rank_major = torch.empty(0, ffn_hidden, dtype=dtype, device=device)
-        elif len(peer_fc1) == 1:
-            all_peer_fc1_rank_major = peer_fc1[0]
-        else:
-            all_peer_fc1_rank_major = torch.cat(peer_fc1, dim=0)
-
     nvtx_range_pop()  # fc2_combine_p2p
-    return combined_output, local_fc2, all_peer_tokens_rank_major, all_peer_fc1_rank_major
+    return combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert, backward_indices
 
 
 __all__ = [

@@ -5,7 +5,6 @@ Single autograd.Function for complete Transformer layer (Attention + MoE).
 Minimizes Python overhead by combining all operations into one Function.
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -188,7 +187,6 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Dispatch + FC1 with P2P overlap (tokens_cpu built from P2P metadata)
         (local_tokens, local_act, recv_act_results, recv_buffers,
-         local_fc1, recv_fc1_results,
          moe_partners, recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
@@ -196,11 +194,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
-        # Forward only keeps rank-major caches; merge/precompute is deferred to backward.
-        (combined_output, local_fc2, all_peer_tokens_rank_major,
-         all_peer_fc1_rank_major) = fc2_combine_p2p_forward(
+        # Merge+sort is done here in forward, overlapping with last combine P2P.
+        (combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert,
+         backward_indices) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
-            local_fc1, recv_fc1_results,
             moe_w2_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, num_local_experts,
             moe_partners, tokens_cpu, needs_backward=needs_grad,
@@ -221,24 +218,9 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Save for backward
         # =====================================================================
         if needs_grad:
-            # Compute ffn_hidden for backward
-            total_ffn_hidden = moe_w1.shape[-1]
-            ffn_hidden = total_ffn_hidden // num_local_experts
-            local_fc1_rank_major = (
-                local_fc1
-                if local_fc1 is not None
-                else torch.empty(0, ffn_hidden, dtype=dtype, device=hidden_states.device)
-            )
-            peer_tokens_rank_major = (
-                all_peer_tokens_rank_major
-                if all_peer_tokens_rank_major is not None
-                else torch.empty(0, hidden_size, dtype=dtype, device=hidden_states.device)
-            )
-            peer_fc1_rank_major = (
-                all_peer_fc1_rank_major
-                if all_peer_fc1_rank_major is not None
-                else torch.empty(0, ffn_hidden, dtype=dtype, device=hidden_states.device)
-            )
+            # all_expert_tokens is pre-merged in forward (expert-major order)
+            if all_expert_tokens is None:
+                all_expert_tokens = torch.empty(0, hidden_size, dtype=dtype, device=hidden_states.device)
 
             ctx.save_for_backward(
                 # Input and intermediate states
@@ -248,14 +230,16 @@ class TransformerLayerFunction(torch.autograd.Function):
                 # MoE states
                 permuted_tokens, permuted_probs, restore_indices, sorted_indices,
                 router_probs, top_indices,
-                local_tokens, peer_tokens_rank_major,
-                local_fc1_rank_major, peer_fc1_rank_major, tokens_cpu,
+                all_expert_tokens,
                 combined_output,
                 # Weights (detached)
                 ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                 qkv_weight.detach(), proj_weight.detach(),
                 router_weight.detach(), moe_w1.detach(), moe_w2.detach(),
             )
+            # Store non-tensor merge results on ctx
+            ctx.all_tokens_per_expert = all_tokens_per_expert
+            ctx.backward_indices = backward_indices
             # Save SDPA computation graph (avoids redundant forward in backward)
             # FlashAttention only stores logsumexp O(seq), not attention matrix O(seq²)
             ctx._q_for_attn = q_for_attn
@@ -289,7 +273,6 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.activation_func = activation_func
             ctx.num_local_experts = num_local_experts
             ctx.head_dim = head_dim
-            ctx.ffn_hidden = ffn_hidden
             ctx.scale = scale
 
             # MoE routing info
@@ -319,12 +302,15 @@ class TransformerLayerFunction(torch.autograd.Function):
          attn_input_full,
          permuted_tokens, permuted_probs, restore_indices, sorted_indices,
          router_probs, top_indices,
-         local_tokens_rank_major, all_peer_tokens_rank_major,
-         local_fc1_rank_major, all_peer_fc1_rank_major, tokens_cpu,
+         all_expert_tokens,
          combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight,
          router_weight, moe_w1_2d, moe_w2_2d) = ctx.saved_tensors
+
+        # Retrieve pre-computed merge results
+        all_tokens_per_expert = ctx.all_tokens_per_expert
+        backward_indices = ctx.backward_indices
 
         # Retrieve SDPA computation graph for direct backward (no redundant forward)
         q_for_attn = ctx._q_for_attn
@@ -348,7 +334,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         activation_func = ctx.activation_func
         num_local_experts = ctx.num_local_experts
         head_dim = ctx.head_dim
-        ffn_hidden = ctx.ffn_hidden
         scale = ctx.scale
 
         input_splits_list = ctx.input_splits_list
@@ -408,20 +393,18 @@ class TransformerLayerFunction(torch.autograd.Function):
         (grad_all_fc1, act_output, all_fc1, grad_all_fc2,
          all_expert_tokens, all_tokens_per_expert, backward_indices) = combine_fc2_backward(
             grad_combined, input_splits_list, output_splits_list, ep_group, layer_id,
+            weight1=moe_w1,
             weight2=moe_w2,
             activation_func=activation_func,
             num_local_experts=num_local_experts,
             num_chunks=moe_combine_chunks_actual,
-            local_tokens_rank_major=local_tokens_rank_major,
-            all_peer_tokens_rank_major=all_peer_tokens_rank_major,
-            local_fc1_rank_major=local_fc1_rank_major,
-            all_peer_fc1_rank_major=all_peer_fc1_rank_major,
-            tokens_cpu=tokens_cpu,
+            all_expert_tokens=all_expert_tokens,
+            all_tokens_per_expert=all_tokens_per_expert,
+            backward_indices=backward_indices,
         )
 
         scheduler.end_region()
 
-        # Register dW tasks for MoE weights (between Region 1 and 2)
         moe_needs_ar = scheduler.expert_dp_world_size > 1
         grad_moe_w1, grad_moe_w2 = register_moe_dw_tasks(
             moe_w1, moe_w2, all_expert_tokens, act_output,
@@ -432,70 +415,145 @@ class TransformerLayerFunction(torch.autograd.Function):
             needs_ar=moe_needs_ar,
         )
 
+        # =================================================================
+        # Register router_backward + router_dw + LN2 normalize as scheduler
+        # tasks so they execute during R2's Dispatch A2A overlap window.
+        # All inputs are available NOW (before R2): they only depend on
+        # forward-saved tensors and pre-R1 grad computations.
+        # =================================================================
+        router_result = [None, None]  # [grad_hidden_from_router, grad_router_logits]
+        ln2_cache = [None, None]      # [std, normalized]
+        grad_router_weight = None
+        grad_ln2_weight = None
+        grad_ln2_bias = None
+
+        if is_enabled:
+            # --- router backward (no weight, just compute) ---
+            _grad_permuted_probs = grad_permuted_probs.detach()
+            _sorted_indices = sorted_indices
+            _restore_indices = restore_indices
+            _permuted_probs = permuted_probs
+            _router_probs = router_probs
+            _top_indices = top_indices
+            _router_weight = router_weight
+
+            def _router_bwd_task():
+                router_result[0], router_result[1] = router_backward(
+                    grad_permuted_probs=_grad_permuted_probs,
+                    sorted_indices=_sorted_indices,
+                    restore_indices=_restore_indices,
+                    permuted_probs=_permuted_probs,
+                    router_probs=_router_probs,
+                    top_indices=_top_indices,
+                    router_weight=_router_weight,
+                    num_tokens=num_tokens,
+                    top_k=top_k,
+                    dtype=dtype,
+                )
+                return None  # no gradient to write
+
+            scheduler.register_dw_task(
+                layer_name=f"router_bwd_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=_router_bwd_task,
+                weight_param=None,
+            )
+
+            # --- router dW (depends on router_result[1] from above) ---
+            _ln2_flat_saved = ln2_flat.detach()
+
+            def _router_dw_task():
+                return torch.matmul(_ln2_flat_saved.t().float(),
+                                    router_result[1].float())
+
+            scheduler.register_dw_task(
+                layer_name=f"router_weight_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=_router_dw_task,
+                weight_param=orig_router_weight,
+            )
+
+            # --- LN2 normalize precompute (no weight, just cache std & normalized) ---
+            _hidden_after_attn = hidden_after_attn.detach()
+
+            def _ln2_norm_task():
+                mean = _hidden_after_attn.mean(dim=-1, keepdim=True)
+                var = _hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
+                ln2_cache[0] = (var + 1e-5).sqrt()
+                ln2_cache[1] = (_hidden_after_attn - mean) / ln2_cache[0]
+                return None
+
+            scheduler.register_dw_task(
+                layer_name=f"ln2_norm_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=_ln2_norm_task,
+                weight_param=None,
+            )
+
         # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
         # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
+        # dW window now also executes: router_bwd → router_dw → ln2_norm → moe dW
         split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
         sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
         row_idx_exp_to_rank = backward_indices.get('row_idx_exp_to_rank', None)
 
         scheduler.begin_region('moe_dispatch')
-        grad_permuted_tokens = fc1_dispatch_backward(
+        grad_hidden_from_moe_tokens = fc1_dispatch_backward(
             grad_all_fc1, moe_w1,
             num_local_experts, all_tokens_per_expert,
             split_sizes_exp_major, sorted_idxs_exp_to_rank, row_idx_exp_to_rank,
             input_splits_list, output_splits_list, ep_group,
+            restore_indices=restore_indices,
+            num_tokens=num_tokens,
+            top_k=top_k,
             layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
         )
 
         scheduler.end_region()
 
-        # Step 8: Backward through sort/permute
-        # expanded = permuted[restore_indices]
-        grad_expanded_tokens = grad_permuted_tokens.index_select(0, restore_indices)
+        # After R2: router_backward + LN2 normalize already executed in R2 overlap.
+        # Fallback: compute synchronously if scheduler disabled.
+        if not is_enabled:
+            router_result[0], router_result[1] = router_backward(
+                grad_permuted_probs=grad_permuted_probs,
+                sorted_indices=sorted_indices,
+                restore_indices=restore_indices,
+                permuted_probs=permuted_probs,
+                router_probs=router_probs,
+                top_indices=top_indices,
+                router_weight=router_weight,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                dtype=dtype,
+            )
+            grad_router_weight = register_router_dw_task(
+                hidden_states=ln2_flat,
+                grad_router_logits=router_result[1],
+                router_weight=orig_router_weight,
+                layer_id=layer_id,
+            )
 
-        # Step 9: Backward through expand (sum over top_k copies)
-        grad_hidden_from_moe_tokens = grad_expanded_tokens.view(num_tokens, top_k, hidden_size).sum(dim=1)
+        # Combine MoE gradients
+        grad_ln2_flat = grad_hidden_from_moe_tokens + router_result[0]
 
-        # Step 10: Router backward
-        grad_hidden_from_router, grad_router_logits = router_backward(
-            grad_permuted_probs=grad_permuted_probs,
-            sorted_indices=sorted_indices,
-            restore_indices=restore_indices,
-            permuted_probs=permuted_probs,
-            router_probs=router_probs,
-            top_indices=top_indices,
-            router_weight=router_weight,
-            num_tokens=num_tokens,
-            top_k=top_k,
-            dtype=dtype,
-        )
-
-        # Step 11: Combine MoE gradients for ln2_flat
-        grad_ln2_flat = grad_hidden_from_moe_tokens + grad_hidden_from_router
-
-        # Step 12: Register router dW task
-        grad_router_weight = register_router_dw_task(
-            hidden_states=ln2_flat,
-            grad_router_logits=grad_router_logits,
-            router_weight=orig_router_weight,
-            layer_id=layer_id,
-        )
-
-        # Step 13: LayerNorm 2 backward
+        # LayerNorm 2 backward
         grad_ln2_out = grad_ln2_flat.view(seq_len, batch_size, hidden_size)
 
-        # Compute dX immediately (needed for gradient propagation)
-        mean = hidden_after_attn.mean(dim=-1, keepdim=True)
-        var = hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
-        std = (var + 1e-5).sqrt()
-        normalized = (hidden_after_attn - mean) / std
+        if is_enabled:
+            # LN2 normalize was precomputed in R2 overlap window
+            std = ln2_cache[0]
+            normalized = ln2_cache[1]
+        else:
+            mean = hidden_after_attn.mean(dim=-1, keepdim=True)
+            var = hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
+            std = (var + 1e-5).sqrt()
+            normalized = (hidden_after_attn - mean) / std
 
         # dX: gradient through LayerNorm
         grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std
 
-        # Register dW tasks for LN2 (deferred, overlaps with AllToAll)
-        scheduler = get_backward_scheduler()
-        if scheduler.is_enabled():
+        # Register dW tasks for LN2 (execute during R3 overlap)
+        if is_enabled:
             grad_ln2_out_saved = grad_ln2_out.detach()
             normalized_saved = normalized.detach()
 
@@ -519,8 +577,6 @@ class TransformerLayerFunction(torch.autograd.Function):
                 weight_param=orig_ln2_bias,
                 needs_ar=True,
             )
-            grad_ln2_weight = None
-            grad_ln2_bias = None
         else:
             grad_ln2_weight = (grad_ln2_out * normalized).sum(dim=(0, 1))
             grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
@@ -552,6 +608,32 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_attn_hp, retain_graph=False
         )
 
+        # =================================================================
+        # Register LN1 normalize precompute as scheduler task.
+        # R4's dW window is otherwise empty (R3 already drained the queue).
+        # LN1 normalize only depends on hidden_states (forward-saved).
+        # =================================================================
+        ln1_cache = [None, None]  # [std1, normalized1]
+        grad_ln1_weight = None
+        grad_ln1_bias = None
+
+        if is_enabled:
+            _hidden_states_saved = hidden_states.detach()
+
+            def _ln1_norm_task():
+                mean1 = _hidden_states_saved.mean(dim=-1, keepdim=True)
+                var1 = _hidden_states_saved.var(dim=-1, unbiased=False, keepdim=True)
+                ln1_cache[0] = (var1 + 1e-5).sqrt()
+                ln1_cache[1] = (_hidden_states_saved - mean1) / ln1_cache[0]
+                return None
+
+            scheduler.register_dw_task(
+                layer_name=f"ln1_norm_L{layer_id}",
+                layer_id=layer_id,
+                compute_fn=_ln1_norm_task,
+                weight_param=None,
+            )
+
         # Region 4: hp2sp AllToAll → QKV dX (communication-first pipeline)
         scheduler.begin_region('attn_qkv')
         grad_ln1_out, grad_qkv_weight = hp2sp_qkv_backward(
@@ -567,16 +649,21 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_hidden_states = grad_hidden_after_attn.clone()
 
         # Step 19: LayerNorm 1 backward
-        mean1 = hidden_states.mean(dim=-1, keepdim=True)
-        var1 = hidden_states.var(dim=-1, unbiased=False, keepdim=True)
-        std1 = (var1 + 1e-5).sqrt()
-        normalized1 = (hidden_states - mean1) / std1
+        if is_enabled:
+            # LN1 normalize was precomputed in R4 overlap window
+            std1 = ln1_cache[0]
+            normalized1 = ln1_cache[1]
+        else:
+            mean1 = hidden_states.mean(dim=-1, keepdim=True)
+            var1 = hidden_states.var(dim=-1, unbiased=False, keepdim=True)
+            std1 = (var1 + 1e-5).sqrt()
+            normalized1 = (hidden_states - mean1) / std1
 
         # dX: gradient through LayerNorm
         grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
 
-        # Register dW tasks for LN1 (deferred, overlaps with AllToAll)
-        if scheduler.is_enabled():
+        # Register dW tasks for LN1 (execute during next layer's R1)
+        if is_enabled:
             grad_ln1_out_saved = grad_ln1_out.detach()
             normalized1_saved = normalized1.detach()
 
@@ -600,8 +687,6 @@ class TransformerLayerFunction(torch.autograd.Function):
                 weight_param=orig_ln1_bias,
                 needs_ar=True,
             )
-            grad_ln1_weight = None
-            grad_ln1_bias = None
         else:
             grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
             grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
