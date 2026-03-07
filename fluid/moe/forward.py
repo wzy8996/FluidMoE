@@ -34,6 +34,8 @@ Timeline:
     Final:    Compute local FC2 (parallel with last P2P)
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -42,7 +44,36 @@ from typing import List, Tuple, Optional, Dict
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop
 
+try:
+    from grouped_gemm.backend import gmm as _cutlass_gmm
+    _HAS_GROUPED_GEMM = True
+except Exception:
+    _cutlass_gmm = None
+    _HAS_GROUPED_GEMM = False
+
 _LAYOUT_IDX_CACHE = {}
+
+
+def _to_batch_sizes(tokens_per_expert) -> torch.Tensor:
+    """Convert tokens_per_expert to CPU int64 tensor for grouped_gemm backend."""
+    if torch.is_tensor(tokens_per_expert):
+        if tokens_per_expert.dtype == torch.int64 and tokens_per_expert.device.type == "cpu":
+            return tokens_per_expert
+        return tokens_per_expert.to(dtype=torch.int64, device="cpu")
+    return torch.tensor(tokens_per_expert, dtype=torch.int64)
+
+
+def _grouped_gemm_or_none(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    tokens_per_expert,
+    trans_b: bool = False,
+) -> Optional[torch.Tensor]:
+    """Try grouped_gemm backend, return None when unavailable."""
+    if (not _HAS_GROUPED_GEMM) or (not A.is_cuda):
+        return None
+    batch_sizes = _to_batch_sizes(tokens_per_expert)
+    return _cutlass_gmm(A, B, batch_sizes, trans_a=False, trans_b=trans_b)
 
 
 def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
@@ -68,25 +99,19 @@ def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
             return fc1, activation_func(fc1)
         return activation_func(fc1)
 
-    # Multi-expert path: for loop over experts.
-    output = torch.empty(tokens.shape[0], w1.shape[-1], dtype=tokens.dtype, device=tokens.device)
-    fc1_all = torch.empty(tokens.shape[0], w1.shape[-1], dtype=tokens.dtype, device=tokens.device) if return_fc1 else None
-    counts = tokens_per_expert.tolist() if torch.is_tensor(tokens_per_expert) else tokens_per_expert
-    offset = 0
-    for i, n in enumerate(counts):
-        if n > 0:
-            if return_fc1:
-                # Write FC1 directly to destination to avoid an extra full-size copy.
-                fc1_dst = fc1_all[offset:offset+n]
-                torch.mm(tokens[offset:offset+n], w1[i], out=fc1_dst)
-                output[offset:offset+n] = activation_func(fc1_dst)
-            else:
-                fc1_chunk = torch.matmul(tokens[offset:offset+n], w1[i])
-                output[offset:offset+n] = activation_func(fc1_chunk)
-            offset += n
+    # Multi-expert path: prefer grouped GEMM backend, fallback to for-loop.
+    fc1 = _grouped_gemm_or_none(tokens, w1, tokens_per_expert, trans_b=False)
+    if fc1 is None:
+        fc1 = torch.empty(tokens.shape[0], w1.shape[-1], dtype=tokens.dtype, device=tokens.device)
+        counts = tokens_per_expert.tolist() if torch.is_tensor(tokens_per_expert) else tokens_per_expert
+        offset = 0
+        for i, n in enumerate(counts):
+            if n > 0:
+                torch.mm(tokens[offset:offset+n], w1[i], out=fc1[offset:offset+n])
+                offset += n
     if return_fc1:
-        return fc1_all, output
-    return output
+        return fc1, activation_func(fc1)
+    return activation_func(fc1)
 
 
 def grouped_fc2(act: torch.Tensor, w2: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
@@ -104,12 +129,17 @@ def grouped_fc2(act: torch.Tensor, w2: torch.Tensor, tokens_per_expert: torch.Te
     if num_experts == 1:
         return torch.matmul(act, w2[0])
 
+    # Multi-expert path: prefer grouped GEMM backend, fallback to for-loop.
+    output = _grouped_gemm_or_none(act, w2, tokens_per_expert, trans_b=False)
+    if output is not None:
+        return output
+
     output = torch.empty(act.shape[0], w2.shape[-1], dtype=act.dtype, device=act.device)
     counts = tokens_per_expert.tolist() if torch.is_tensor(tokens_per_expert) else tokens_per_expert
     offset = 0
     for i, n in enumerate(counts):
         if n > 0:
-            output[offset:offset+n] = torch.matmul(act[offset:offset+n], w2[i])
+            torch.mm(act[offset:offset+n], w2[i], out=output[offset:offset+n])
             offset += n
     return output
 
@@ -124,21 +154,12 @@ def router_forward(
     num_experts: int,
     top_k: int,
     ep_group: dist.ProcessGroup,
+    capacity_factor: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Router forward computation: token-to-expert assignment with top-k selection.
-
-    This function computes:
-    1. Router logits via linear projection
-    2. Softmax probabilities
-    3. Top-k expert selection
-    4. Token permutation by expert assignment
-    5. AllToAll split sizes computation
-
-    Note: tokens_per_expert_2d AllGather has been removed. Each rank's tokens_per_expert
-    is now piggybacked on P2P communication in dispatch_fc1_p2p_forward.
+    Router forward: token-to-expert assignment with top-k selection and capacity dropping.
 
     Args:
         hidden_states: [num_tokens, hidden_size] input tokens
@@ -146,18 +167,19 @@ def router_forward(
         num_experts: Total number of experts across all ranks
         top_k: Number of experts each token is sent to
         ep_group: Expert Parallel process group
+        capacity_factor: Expert capacity = ceil(num_tokens * top_k / num_experts * capacity_factor)
 
     Returns:
-        permuted_tokens: [num_tokens * top_k, hidden_size] tokens sorted by expert
-        permuted_probs: [num_tokens * top_k] routing probabilities (sorted)
-        restore_indices: [num_tokens * top_k] indices to restore original order
-        sorted_indices: [num_tokens * top_k] indices used for sorting
+        permuted_tokens: [num_kept, hidden_size] tokens sorted by expert (after capacity drop)
+        permuted_probs: [num_kept] routing probabilities
+        sorted_indices: [num_kept] positions in expanded [N*top_k] space (= kept_expanded_indices)
+        token_ids: [num_kept] original token index (= sorted_indices // top_k, precomputed)
         input_splits: [ep_size] token count to send to each rank
         output_splits: [ep_size] token count to receive from each rank
-        tokens_per_expert: [num_experts] local tokens per expert (full, not 2D)
+        tokens_per_expert: [num_experts] clamped token counts per expert
         router_probs: [num_tokens, num_experts] full softmax probabilities (for backward)
+        top_probs: [num_tokens, top_k] normalized top-k probabilities (for backward)
         top_indices: [num_tokens, top_k] top-k expert indices (for backward)
-        router_logits: [num_tokens, num_experts] router logits (for debugging)
     """
     nvtx_range_push("router_forward")
 
@@ -167,58 +189,56 @@ def router_forward(
     hidden_size = hidden_states.shape[-1]
     device = hidden_states.device
 
-    # Step 1: Compute router logits
-    # Detach weight to avoid retaining computation graph across iterations
+    # Step 1: Router logits
     router_logits = torch.matmul(hidden_states.float(), router_weight.detach().float())
 
-    # Step 2: Softmax and top-k selection
+    # Step 2: Softmax + top-k
     router_probs = F.softmax(router_logits, dim=-1)
     top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
-
-    # Step 3: Normalize top-k probabilities
     top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
 
-    # Step 4: Expand tokens - each token is replicated top_k times
+    # Step 3: Expand tokens (replicate top_k times)
     expanded_tokens = hidden_states.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_size)
     expanded_probs = top_probs.reshape(-1)
     expanded_expert_indices = top_indices.reshape(-1)
 
-    # Step 5: Sort by expert index (stable sort to ensure determinism)
+    # Step 4: Sort by expert index (stable for determinism)
     sorted_indices = torch.argsort(expanded_expert_indices, stable=True)
-    permuted_tokens = expanded_tokens[sorted_indices]
-    permuted_probs = expanded_probs[sorted_indices]
     sorted_expert_indices = expanded_expert_indices[sorted_indices]
 
-    # Step 6: Count tokens per expert
+    # Step 5: Count tokens per expert
     tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=num_experts)
 
-    # Step 7: Compute input_splits and output_splits for AllToAll
-    experts_per_rank = num_experts // ep_size
+    # Step 6: Capacity dropping — vectorized (no Python loop)
+    expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
+    # Compute within-expert position for each sorted token
+    offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+    torch.cumsum(tokens_per_expert, dim=0, out=offsets[1:])
+    within_expert_pos = torch.arange(num_tokens * top_k, device=device) - offsets[sorted_expert_indices]
+    keep_mask = within_expert_pos < expert_capacity
 
+    sorted_indices = sorted_indices[keep_mask]
+    token_ids = sorted_indices // top_k  # precompute for forward restore + backward reuse
+    permuted_tokens = expanded_tokens[sorted_indices]
+    permuted_probs = expanded_probs[sorted_indices]
+    tokens_per_expert = tokens_per_expert.clamp(max=expert_capacity)
+
+    # Step 7: Compute AllToAll splits
+    experts_per_rank = num_experts // ep_size
     input_splits = torch.zeros(ep_size, dtype=torch.int64, device=device)
     for i in range(ep_size):
-        start_expert = i * experts_per_rank
-        end_expert = start_expert + experts_per_rank
-        input_splits[i] = tokens_per_expert[start_expert:end_expert].sum()
+        s = i * experts_per_rank
+        input_splits[i] = tokens_per_expert[s:s + experts_per_rank].sum()
 
-    # AllGather to get all ranks' input_splits
     all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
     dist.all_gather(all_input_splits, input_splits, group=ep_group)
-    all_input_splits = torch.stack(all_input_splits)  # [ep_size, ep_size]
-
-    # output_splits[i] = rank i's tokens destined for my experts
+    all_input_splits = torch.stack(all_input_splits)
     output_splits = all_input_splits[:, my_rank].clone()
 
-    # Step 8: Compute restore indices for combining results
-    restore_indices = torch.argsort(sorted_indices)
-
-    # Note: AllGather for tokens_per_expert is removed - metadata is now piggybacked on P2P
-    # Each rank will receive peer's tokens_per_expert along with token data in dispatch_fc1_p2p_forward
-
     nvtx_range_pop()
-    return (permuted_tokens, permuted_probs, restore_indices, sorted_indices,
+    return (permuted_tokens, permuted_probs, sorted_indices, token_ids,
             input_splits, output_splits, tokens_per_expert,
-            router_probs, top_indices, router_logits)
+            router_probs, top_probs, top_indices)
 
 
 # =============================================================================

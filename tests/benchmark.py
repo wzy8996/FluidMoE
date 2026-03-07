@@ -2,14 +2,36 @@
 FluidMoE Benchmark
 
 用法:
-    1) 在本文件中手动设置 dp_size/cp_size/ep_size
-    2) 再运行:
-       torchrun --nproc_per_node=<world_size> tests/benchmark.py
+    torchrun --nproc_per_node=<world_size> tests/benchmark.py --model <model_name>
 """
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import argparse
+import os
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS_DIR = os.path.join(ROOT_DIR, "tools")
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, TOOLS_DIR)
 import torch
 import torch.distributed as dist
+from model_configs import get_model_config, list_model_names
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="FluidMoE Benchmark")
+    parser.add_argument("--model", type=str, default="qwen_moe_a2_7b", help="模型名称 (from tools/model_configs.py)")
+    parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
+    return parser.parse_args()
+
+
+args = parse_args()
+if args.list_models:
+    print("Available models:")
+    for n in list_model_names():
+        print(" ", n)
+    raise SystemExit(0)
+model_name = args.model
+model_cfg = get_model_config(model_name)
 
 rank = int(os.environ.get('LOCAL_RANK', 0))
 device = torch.device(f'cuda:{rank}')
@@ -24,29 +46,29 @@ def p0(*args):
 # ============================================================
 # 配置
 # ============================================================
-hidden_size = 4096
-num_heads = 32
-num_kv_heads = 32
-ffn_hidden = 14336
-num_experts = 8
-top_k = 4
-num_layers = 2
-seq_len = 4096
-batch_size = 4
+hidden_size = int(model_cfg.get("hidden_size", 4096))
+num_heads = int(model_cfg.get("num_heads", 32))
+num_kv_heads = int(model_cfg.get("num_kv_heads", 8))
+ffn_hidden = int(model_cfg.get("ffn_hidden", 14336))
+num_experts = int(model_cfg.get("num_experts", 8))
+top_k = int(model_cfg.get("top_k", 2))
+num_layers = int(model_cfg.get("num_layers", 4))
+seq_len = int(model_cfg.get("seq_len", 4096))
+batch_size = int(model_cfg.get("batch_size", 4))
+capacity_factor = float(model_cfg.get("capacity_factor", 1.0))
 
 # 各 region 分块数 (R1=moe_combine, R2=moe_dispatch, R3=attn_proj, R4=attn_qkv)
-moe_combine_chunks = 2
-moe_dispatch_chunks = 2
-attn_proj_chunks = 1
+moe_combine_chunks = 4
+moe_dispatch_chunks = 4
+attn_proj_chunks = 2
 attn_qkv_chunks = 2
 
-# Per-region AR trickle sizes (bytes), from tune.py BDP model.
-# 0 = unlimited (submit all pending). Set by tune.py output.
+# Per-region AR trickle sizes (bytes), benchmark 中手动设置
 ar_trickle_sizes = {
-    'moe_combine': 220 * 1024 * 1024,
-    'moe_dispatch': 142 * 1024 * 1024,
-    'attn_proj': 24 * 1024 * 1024,
-    'attn_qkv': 26 * 1024 * 1024,
+    'moe_combine': 43 * 1024 * 1024,
+    'moe_dispatch': 29 * 1024 * 1024,
+    'attn_proj': 16 * 1024 * 1024,
+    'attn_qkv': 17 * 1024 * 1024,
 }
 
 # 并行度配置（手动指定）
@@ -100,6 +122,7 @@ else:
 
 p0("=" * 60)
 p0("FluidMoE Benchmark")
+p0(f"  model={model_name} (from tools/model_configs.py)")
 p0(f"  hidden={hidden_size}, heads={num_heads}, ffn={ffn_hidden}")
 p0(f"  experts={num_experts}, top_k={top_k}, layers={num_layers}")
 p0(f"  seq={seq_len}, batch={batch_size}, GPUs={num_gpus}")
@@ -118,6 +141,7 @@ baseline_model = BaselineTransformerModel(
     num_heads=num_heads, num_kv_heads=num_kv_heads,
     ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
     cp_group=cp_group, ep_group=ep_group,
+    capacity_factor=capacity_factor,
     dtype=torch.bfloat16, device=device,
 )
 
@@ -129,6 +153,7 @@ fluidmoe_model = TransformerModel(
     attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
     moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
     ar_trickle_sizes=ar_trickle_sizes,
+    capacity_factor=capacity_factor,
     dtype=torch.bfloat16, device=device,
 )
 

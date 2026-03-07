@@ -5,6 +5,8 @@ Uses standard PyTorch AllToAll without overlap for fair comparison.
 Uses attention recomputation (same as FluidMoE) for fair memory comparison.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,6 +93,7 @@ class BaselineTransformerFunction(torch.autograd.Function):
         num_heads: int, num_kv_heads: int,
         num_experts: int, top_k: int,
         activation_func: Callable,
+        capacity_factor: float,
     ):
         seq_len, batch_size, hidden_size = hidden_states.shape
         device = hidden_states.device
@@ -175,6 +178,19 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         # Count and splits
         tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=num_experts)
+
+        # Capacity dropping (vectorized)
+        expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
+        offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+        torch.cumsum(tokens_per_expert, dim=0, out=offsets[1:])
+        within_expert_pos = torch.arange(num_tokens * top_k, device=device) - offsets[sorted_expert_indices]
+        keep_mask = within_expert_pos < expert_capacity
+        sorted_indices = sorted_indices[keep_mask]
+        token_ids = sorted_indices // top_k  # precompute for reuse
+        permuted_tokens = expanded_tokens[sorted_indices]
+        permuted_probs = expanded_probs[sorted_indices]
+        tokens_per_expert = tokens_per_expert.clamp(max=expert_capacity)
+
         experts_per_rank = num_experts // ep_size
 
         input_splits = [tokens_per_expert[i * experts_per_rank:(i + 1) * experts_per_rank].sum().item()
@@ -212,11 +228,11 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Combine AllToAll
         combined_output = _moe_all_to_all(expert_output, output_splits, input_splits, ep_group)
 
-        # Restore
-        restore_indices = torch.argsort(sorted_indices)
+        # Restore via scatter_add (token_ids precomputed above)
         weighted = combined_output * permuted_probs.unsqueeze(-1).to(dtype)
-        restored = weighted[restore_indices]
-        moe_output = restored.view(num_tokens, top_k, hidden_size).sum(dim=1)
+        moe_output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
+        moe_output.scatter_add_(
+            0, token_ids.unsqueeze(1).expand_as(weighted), weighted)
         moe_output = moe_output.view(seq_len, batch_size, hidden_size)
 
         output = hidden_after_attn + moe_output
@@ -224,8 +240,8 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Save for backward
         ctx.save_for_backward(
             hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-            permuted_tokens, permuted_probs, restore_indices, sorted_indices,
-            router_probs, top_indices, recv_tokens, combined_output,
+            permuted_tokens, permuted_probs, sorted_indices, token_ids,
+            router_probs, top_probs, top_indices, recv_tokens, combined_output,
             ln1_weight, ln1_bias, ln2_weight, ln2_bias,
             qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
         )
@@ -253,8 +269,8 @@ class BaselineTransformerFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-         permuted_tokens, permuted_probs, restore_indices, sorted_indices,
-         router_probs, top_indices, recv_tokens, combined_output,
+         permuted_tokens, permuted_probs, sorted_indices, token_ids,
+         router_probs, top_probs, top_indices, recv_tokens, combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
          ) = ctx.saved_tensors
@@ -293,10 +309,9 @@ class BaselineTransformerFunction(torch.autograd.Function):
         grad_output_flat = grad_output.view(num_tokens, hidden_size)
         grad_hidden_after_attn = grad_output.clone()
 
-        # Restore backward - expand grad to match top_k expanded tokens
-        grad_expanded = grad_output_flat.unsqueeze(1).expand(-1, top_k, -1).reshape(num_tokens * top_k, hidden_size)
-        grad_weighted = grad_expanded[sorted_indices]  # reorder to match permuted order
-        grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(dtype)  # weight by routing probs
+        # Restore backward (capacity mode: scatter_add, token_ids precomputed)
+        grad_weighted = grad_output_flat[token_ids]
+        grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(dtype)
 
         # Combine AllToAll backward
         grad_expert_output = _moe_all_to_all(grad_combined, input_splits, output_splits, ep_group)
@@ -397,17 +412,18 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Dispatch AllToAll backward
         grad_permuted_tokens = _moe_all_to_all(grad_recv_tokens, output_splits, input_splits, ep_group)
 
-        # Unsort
-        grad_expanded_tokens = grad_permuted_tokens[torch.argsort(sorted_indices)]
-        grad_ln2_flat_from_tokens = grad_expanded_tokens.view(num_tokens, top_k, hidden_size).sum(dim=1)
+        # Scatter-reduce back to [num_tokens, hidden] (token_ids precomputed)
+        grad_ln2_flat_from_tokens = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
+        grad_ln2_flat_from_tokens.scatter_add_(
+            0, token_ids.unsqueeze(1).expand_as(grad_permuted_tokens), grad_permuted_tokens)
 
         # Router backward dX (AR 可重叠)
         with _timed_overlap("bwd", "router_dx"):
             grad_permuted_probs = (grad_weighted * combined_output.to(dtype)).sum(dim=-1)
-            grad_expanded_probs = torch.zeros_like(grad_permuted_probs)
-            grad_expanded_probs[sorted_indices] = grad_permuted_probs
-            grad_top_probs = grad_expanded_probs.view(num_tokens, top_k)
-            top_probs_saved = permuted_probs[restore_indices].view(num_tokens, top_k)
+            grad_top_probs = torch.zeros(num_tokens, top_k, dtype=grad_permuted_probs.dtype, device=device)
+            slot_ids = sorted_indices % top_k
+            grad_top_probs[token_ids, slot_ids] = grad_permuted_probs
+            top_probs_saved = top_probs  # already normalized in forward
             grad_dot = (grad_top_probs * top_probs_saved).sum(dim=-1, keepdim=True)
             grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs_saved) / top_probs_saved.sum(dim=-1, keepdim=True).clamp(min=1e-6)
             grad_router_probs = torch.zeros_like(router_probs)
@@ -513,7 +529,8 @@ class BaselineTransformerFunction(torch.autograd.Function):
             grad_router_weight,
             grad_moe_w1, grad_moe_w2,
             None, None,  # groups
-            None, None, None, None, None,  # config
+            None, None, None, None, None,  # num_heads, num_kv_heads, num_experts, top_k, activation_func
+            None,  # capacity_factor
         )
 
 
@@ -577,6 +594,7 @@ class BaselineTransformerLayer(nn.Module):
         ep_group: dist.ProcessGroup,
         layer_id: int = 0,
         activation_func: Optional[Callable] = None,
+        capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ):
@@ -592,6 +610,7 @@ class BaselineTransformerLayer(nn.Module):
         self.top_k = top_k
         self.layer_id = layer_id
         self.activation_func = activation_func or F.gelu
+        self.capacity_factor = capacity_factor
 
         self.cp_group = cp_group
         self.ep_group = ep_group
@@ -638,6 +657,7 @@ class BaselineTransformerLayer(nn.Module):
             self.num_heads, self.num_kv_heads,
             self.num_experts, self.top_k,
             self.activation_func,
+            self.capacity_factor,
         )
 
 
@@ -656,6 +676,7 @@ class BaselineTransformerModel(nn.Module):
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
         activation_func: Optional[Callable] = None,
+        capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ):
@@ -664,7 +685,7 @@ class BaselineTransformerModel(nn.Module):
             BaselineTransformerLayer(
                 hidden_size, num_heads, num_kv_heads, ffn_hidden_size,
                 num_experts, top_k, cp_group, ep_group, i,
-                activation_func, dtype, device,
+                activation_func, capacity_factor, dtype, device,
             )
             for i in range(num_layers)
         ])

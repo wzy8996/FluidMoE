@@ -69,6 +69,8 @@ class FluidMoEGPTModel(nn.Module):
         if hasattr(config, 'num_query_groups') and config.num_query_groups is not None:
             num_kv_heads = config.num_query_groups
 
+        capacity_factor = getattr(config, 'moe_capacity_factor', 1.0)
+
         self.decoder = TransformerModel(
             num_layers=config.num_layers,
             hidden_size=config.hidden_size,
@@ -83,6 +85,7 @@ class FluidMoEGPTModel(nn.Module):
             moe_dispatch_chunks=2,
             attn_proj_chunks=2,
             attn_qkv_chunks=2,
+            capacity_factor=capacity_factor,
             dtype=config.params_dtype if hasattr(config, 'params_dtype') else torch.bfloat16,
         )
 
