@@ -1,8 +1,8 @@
 """
-FluidMoE GPT Model for Megatron Integration
+FluidMoE model wrapper for Megatron integration.
 
-Provides FluidMoEGPTModel that wraps FluidMoE's TransformerModel with
-embedding and output layers, compatible with Megatron's pretrain() loop.
+Provides `FluidMoEModel`, which wraps FluidMoE's TransformerModel
+with embedding and output layers, compatible with Megatron-style pretrain loops.
 """
 
 import torch
@@ -12,6 +12,12 @@ from typing import Optional
 
 from megatron.core import parallel_state
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    import transformer_engine.pytorch as te
+    _HAS_TE = True
+except ImportError:
+    _HAS_TE = False
 
 from fluid.layer import TransformerModel
 
@@ -28,15 +34,15 @@ class _CastToFloat32(torch.autograd.Function):
         return grad.to(ctx.input_dtype)
 
 
-class FluidMoEGPTModel(nn.Module):
-    """GPT model using FluidMoE transformer layers.
+class FluidMoEModel(nn.Module):
+    """Decoder-only language model using FluidMoE transformer layers.
 
     Architecture:
         - Word embedding + position embedding (simple, no TP)
         - FluidMoE TransformerModel (CP + EP)
         - Final LayerNorm + output projection
 
-    Compatible with Megatron's pretrain() forward_step interface:
+    Compatible with Megatron-style pretrain forward_step interface:
         model(input_ids, position_ids, attention_mask, labels=labels)
     """
 
@@ -55,13 +61,11 @@ class FluidMoEGPTModel(nn.Module):
         self.pre_process = pre_process
         self.post_process = post_process
 
-        # Embedding (only on first pipeline stage)
         if self.pre_process:
             self.word_embeddings = nn.Embedding(vocab_size, config.hidden_size)
             self.position_embeddings = nn.Embedding(max_sequence_length, config.hidden_size)
             self.embedding_dropout = nn.Dropout(config.hidden_dropout)
 
-        # FluidMoE Transformer layers
         cp_group = parallel_state.get_context_parallel_group()
         ep_group = parallel_state.get_expert_model_parallel_group()
 
@@ -89,9 +93,12 @@ class FluidMoEGPTModel(nn.Module):
             dtype=config.params_dtype if hasattr(config, 'params_dtype') else torch.bfloat16,
         )
 
-        # Final layer norm + output projection (only on last pipeline stage)
         if self.post_process:
-            self.final_layernorm = nn.LayerNorm(config.hidden_size, dtype=config.params_dtype if hasattr(config, 'params_dtype') else torch.bfloat16)
+            _ln_dtype = config.params_dtype if hasattr(config, 'params_dtype') else torch.bfloat16
+            if _HAS_TE:
+                self.final_layernorm = te.LayerNorm(config.hidden_size, params_dtype=_ln_dtype)
+            else:
+                self.final_layernorm = nn.LayerNorm(config.hidden_size, dtype=_ln_dtype)
             self.output_layer = nn.Linear(config.hidden_size, vocab_size, bias=False)
 
     def forward(
@@ -103,48 +110,28 @@ class FluidMoEGPTModel(nn.Module):
         loss_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward pass compatible with Megatron's forward_step.
-
-        Args:
-            input_ids: [batch, seq] token ids
-            position_ids: [batch, seq] position ids
-            attention_mask: [1, 1, seq, seq] attention mask (ignored, using causal)
-            labels: [batch, seq] target token ids for loss computation
-            loss_mask: [batch, seq] mask for loss computation
-
-        Returns:
-            If labels provided: loss tensor [batch, seq] (per-token losses)
-            If no labels: logits [batch, seq, vocab]
-        """
-        # 1. Embedding: [batch, seq] -> [seq, batch, hidden]
         if self.pre_process:
             hidden_states = self.word_embeddings(input_ids) + self.position_embeddings(position_ids)
             hidden_states = self.embedding_dropout(hidden_states)
-            # [batch, seq, hidden] -> [seq, batch, hidden]
             hidden_states = hidden_states.transpose(0, 1).contiguous()
         else:
-            hidden_states = input_ids  # PP intermediate: already [seq, batch, hidden]
+            hidden_states = input_ids
 
-        # 2. Transformer layers: [seq, batch, hidden] -> [seq, batch, hidden]
         hidden_states = self.decoder(hidden_states)
 
-        # 3. Output + loss
         if not self.post_process:
             return hidden_states
 
         hidden_states = self.final_layernorm(hidden_states)
-        logits = self.output_layer(hidden_states)  # [seq, batch, vocab]
+        logits = self.output_layer(hidden_states)
 
         if labels is None:
-            # [seq, batch, vocab] -> [batch, seq, vocab]
             return logits.transpose(0, 1).contiguous()
 
-        # Compute per-token cross-entropy loss
-        # logits: [seq, batch, vocab] -> [batch*seq, vocab]
-        # labels: [batch, seq] -> [batch*seq]
         logits_2d = logits.transpose(0, 1).contiguous().view(-1, self.vocab_size)
-        # Cast to float32 for cross_entropy precision; grad flows back in original dtype
         logits_2d = _CastToFloat32.apply(logits_2d)
         labels_1d = labels.view(-1)
         loss = F.cross_entropy(logits_2d, labels_1d, reduction='none')
         return loss
+
+__all__ = ["FluidMoEModel"]

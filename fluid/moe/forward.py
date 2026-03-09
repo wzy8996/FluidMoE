@@ -43,6 +43,7 @@ from typing import List, Tuple, Optional, Dict
 
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop
+from fluid.core.triton_kernels import permute_by_row_idx
 
 try:
     from grouped_gemm.backend import gmm as _cutlass_gmm
@@ -67,13 +68,14 @@ def _grouped_gemm_or_none(
     A: torch.Tensor,
     B: torch.Tensor,
     tokens_per_expert,
+    trans_a: bool = False,
     trans_b: bool = False,
 ) -> Optional[torch.Tensor]:
     """Try grouped_gemm backend, return None when unavailable."""
     if (not _HAS_GROUPED_GEMM) or (not A.is_cuda):
         return None
     batch_sizes = _to_batch_sizes(tokens_per_expert)
-    return _cutlass_gmm(A, B, batch_sizes, trans_a=False, trans_b=trans_b)
+    return _cutlass_gmm(A, B, batch_sizes, trans_a=trans_a, trans_b=trans_b)
 
 
 def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
@@ -197,38 +199,33 @@ def router_forward(
     top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
     top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
 
-    # Step 3: Expand tokens (replicate top_k times)
-    expanded_tokens = hidden_states.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_size)
-    expanded_probs = top_probs.reshape(-1)
+    # Step 3: Flatten expert indices + sort by expert (stable for determinism)
     expanded_expert_indices = top_indices.reshape(-1)
-
-    # Step 4: Sort by expert index (stable for determinism)
     sorted_indices = torch.argsort(expanded_expert_indices, stable=True)
     sorted_expert_indices = expanded_expert_indices[sorted_indices]
 
-    # Step 5: Count tokens per expert
+    # Step 4: Count tokens per expert
     tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=num_experts)
 
-    # Step 6: Capacity dropping — vectorized (no Python loop)
+    # Step 5: Capacity dropping — vectorized (no Python loop)
     expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
-    # Compute within-expert position for each sorted token
     offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
     torch.cumsum(tokens_per_expert, dim=0, out=offsets[1:])
     within_expert_pos = torch.arange(num_tokens * top_k, device=device) - offsets[sorted_expert_indices]
     keep_mask = within_expert_pos < expert_capacity
 
     sorted_indices = sorted_indices[keep_mask]
-    token_ids = sorted_indices // top_k  # precompute for forward restore + backward reuse
-    permuted_tokens = expanded_tokens[sorted_indices]
-    permuted_probs = expanded_probs[sorted_indices]
     tokens_per_expert = tokens_per_expert.clamp(max=expert_capacity)
 
-    # Step 7: Compute AllToAll splits
+    # Step 6: Derive permuted_tokens/probs from sorted_indices directly
+    # (avoids materialising [N*K, H] expanded_tokens intermediate)
+    token_ids = sorted_indices // top_k
+    permuted_tokens = hidden_states.index_select(0, token_ids)
+    permuted_probs = top_probs.reshape(-1).index_select(0, sorted_indices)
+
+    # Step 7: Compute AllToAll splits — vectorized
     experts_per_rank = num_experts // ep_size
-    input_splits = torch.zeros(ep_size, dtype=torch.int64, device=device)
-    for i in range(ep_size):
-        s = i * experts_per_rank
-        input_splits[i] = tokens_per_expert[s:s + experts_per_rank].sum()
+    input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
 
     all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
     dist.all_gather(all_input_splits, input_splits, group=ep_group)
@@ -305,7 +302,7 @@ def merge_tokens_expert_major(
         rank_major_tokens = torch.cat(tokens_parts, dim=0)
 
     # 2) Build row permutation for rank-major -> expert-major once.
-    split_sizes_rank_major = tokens_2d.reshape(-1).contiguous()
+    split_sizes_rank_major = tokens_2d.reshape(-1)
     sorted_idxs_rank_to_exp, _ = _get_cached_layout_indices(
         num_local_experts=num_local_experts,
         ep_size=ep_size,
@@ -317,8 +314,9 @@ def merge_tokens_expert_major(
         device=device,
     )
 
-    # 3) Single reorder.
-    all_expert_tokens = rank_major_tokens.index_select(0, row_idx_rank_to_exp)
+    # 3) Single reorder via Triton gather (avoids intermediate allocation).
+    all_expert_tokens = torch.empty(total_tokens, hidden_size, dtype=tok_dtype, device=device)
+    permute_by_row_idx(rank_major_tokens, row_idx_rank_to_exp, all_expert_tokens)
     return all_expert_tokens, all_tokens_per_expert
 
 
@@ -368,13 +366,13 @@ def _get_cached_layout_indices(
     # rank-major: [R0_E0, R0_E1, ..., R1_E0, ...]
     # rank->exp permutation: [R0_E0, R1_E0, ..., R0_E1, R1_E1, ...]
     rank_major = torch.arange(ep_size * num_local_experts, dtype=torch.int64, device=device).view(ep_size, num_local_experts)
-    sorted_idxs_rank_to_exp = rank_major.transpose(0, 1).reshape(-1).contiguous()
+    sorted_idxs_rank_to_exp = rank_major.transpose(0, 1).reshape(-1)
 
     # exp-major -> rank-major permutation.
     # exp-major chunk order index is [E0_R0, E0_R1, ..., E1_R0, E1_R1, ...]
     # rank-major expects [R0_E0, R0_E1, ..., R1_E0, ...]
     exp_major = torch.arange(ep_size * num_local_experts, dtype=torch.int64, device=device).view(num_local_experts, ep_size)
-    sorted_idxs_exp_to_rank = exp_major.transpose(0, 1).reshape(-1).contiguous()
+    sorted_idxs_exp_to_rank = exp_major.transpose(0, 1).reshape(-1)
 
     _LAYOUT_IDX_CACHE[key] = (sorted_idxs_rank_to_exp, sorted_idxs_exp_to_rank)
     return _LAYOUT_IDX_CACHE[key]
@@ -404,7 +402,7 @@ def precompute_backward_sort_indices(
     """
     # Tensorized construction (CPU tensor -> device tensor), avoiding Python loops.
     split_sizes_rank_major = tokens_cpu.reshape(-1).to(device=device, dtype=torch.int64)
-    split_sizes_exp_major = tokens_cpu.transpose(0, 1).contiguous().reshape(-1).to(device=device, dtype=torch.int64)
+    split_sizes_exp_major = tokens_cpu.transpose(0, 1).reshape(-1).to(device=device, dtype=torch.int64)
     sorted_idxs_rank_to_exp, sorted_idxs_exp_to_rank = _get_cached_layout_indices(
         num_local_experts=num_local_experts,
         ep_size=ep_size,

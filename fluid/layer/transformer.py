@@ -7,12 +7,12 @@ Minimizes Python overhead by combining all operations into one Function.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Optional, Callable, Tuple, List
 
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.scheduler import get_backward_scheduler
+from fluid.core.te_ops import te_layernorm_fwd
 # Import forward operations
 from fluid.attention.forward import (
     qkv_projection_p2p_forward,
@@ -111,7 +111,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # =====================================================================
 
         # LayerNorm 1
-        ln1_out = F.layer_norm(hidden_states, (hidden_size,), ln1_weight, ln1_bias)
+        ln1_out = te_layernorm_fwd(hidden_states, ln1_weight, ln1_bias)
 
         # QKV Projection with P2P overlap
         # Returns q, k, v in format [seq_full, batch, heads_local, head_dim]
@@ -170,7 +170,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # =====================================================================
 
         # LayerNorm 2
-        ln2_out = F.layer_norm(hidden_after_attn, (hidden_size,), ln2_weight, ln2_bias)
+        ln2_out = te_layernorm_fwd(hidden_after_attn, ln2_weight, ln2_bias)
 
         # Flatten for MoE: [seq, batch, hidden] -> [seq*batch, hidden]
         ln2_flat = ln2_out.view(-1, hidden_size)
@@ -377,7 +377,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # =====================================================================
 
         # Gradient through residual: grad flows to both hidden_after_attn and moe_output
-        grad_hidden_after_attn = grad_output.clone()
+        grad_hidden_after_attn = grad_output
         grad_moe_output = grad_output.view(num_tokens, hidden_size)
 
         # Step 1: Backward through sum and restore (capacity mode: scatter_add)
@@ -492,15 +492,13 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
         # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
         # dW window now also executes: router_bwd → router_dw → ln2_norm → moe dW
-        split_sizes_exp_major = backward_indices.get('split_sizes_exp_major', all_tokens_per_expert)
-        sorted_idxs_exp_to_rank = backward_indices.get('sorted_idxs_exp_to_rank', list(range(len(all_tokens_per_expert))))
-        row_idx_exp_to_rank = backward_indices.get('row_idx_exp_to_rank', None)
+        row_idx_exp_to_rank = backward_indices['row_idx_exp_to_rank']
 
         scheduler.begin_region('moe_dispatch')
         grad_dispatched = fc1_dispatch_backward(
             grad_all_fc1, moe_w1,
             num_local_experts, all_tokens_per_expert,
-            split_sizes_exp_major, sorted_idxs_exp_to_rank, row_idx_exp_to_rank,
+            row_idx_exp_to_rank,
             input_splits_list, output_splits_list, ep_group,
             layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
         )
@@ -646,7 +644,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler.end_region()
 
         # Step 18: Residual backward - grad flows to hidden_states
-        grad_hidden_states = grad_hidden_after_attn.clone()
+        grad_hidden_states = grad_hidden_after_attn
 
         # Step 19: LayerNorm 1 backward
         if is_enabled:
@@ -770,7 +768,8 @@ class TransformerLayer(nn.Module):
         self.attn_qkv_chunks = attn_qkv_chunks
         self.moe_combine_chunks = moe_combine_chunks
         self.moe_dispatch_chunks = moe_dispatch_chunks
-        self.activation_func = activation_func or F.gelu
+        from fluid.core.te_ops import te_gelu
+        self.activation_func = activation_func or te_gelu
         self.capacity_factor = capacity_factor
 
         # Apply per-region AR trickle sizes to scheduler singleton

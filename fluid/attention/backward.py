@@ -131,8 +131,6 @@ def outproj_sp2hp_backward(
         grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
 
         if scheduler_enabled:
-            _grad_chunk = grad_chunk.contiguous()
-
             def make_alltoall_fn(data, o_s, o_e):
                 def do_alltoall():
                     result = _all_to_all_sp2hp_forward(data, cp_group)
@@ -140,7 +138,7 @@ def outproj_sp2hp_backward(
                     return result
                 return do_alltoall
 
-            task_id = scheduler.submit_alltoall(make_alltoall_fn(_grad_chunk, o_start, o_end))
+            task_id = scheduler.submit_alltoall(make_alltoall_fn(grad_chunk, o_start, o_end))
             task_ids.append(task_id)
         else:
             result = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
@@ -251,16 +249,15 @@ def hp2sp_qkv_backward(
         # hp2sp AllToAll
         if scheduler.is_enabled():
             result_holder = [None]
-            _grad_qkv_hp = grad_qkv_hp.contiguous()
             def do_alltoall():
-                result_holder[0] = _all_to_all_hp2sp_forward(_grad_qkv_hp, cp_group)
+                result_holder[0] = _all_to_all_hp2sp_forward(grad_qkv_hp, cp_group)
                 return result_holder[0]
             task_id = scheduler.submit_alltoall(do_alltoall)
             scheduler.execute_dw_tasks()
             scheduler.wait_alltoall(task_id)
             grad_qkv_sp = result_holder[0]
         else:
-            grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_hp.contiguous(), cp_group)
+            grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_hp, cp_group)
 
         # grad_qkv_sp: [seq_local, batch, num_kv_heads, (q_per_group+2)*head_dim]
         # Flatten to [seq_local, batch, total_proj]
@@ -282,7 +279,7 @@ def hp2sp_qkv_backward(
     if seq_full % num_chunks != 0:
         num_chunks = 1
         # Fallback
-        grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_hp.contiguous(), cp_group)
+        grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_hp, cp_group)
         grad_qkv_flat = grad_qkv_sp.view(seq_local, batch, -1)
         grad_tokens = torch.matmul(grad_qkv_flat, weight_qkv)
         grad_weight = _register_qkv_dw(grad_qkv_flat, tokens, weight_qkv, hidden_size, layer_id)
@@ -292,14 +289,12 @@ def hp2sp_qkv_backward(
     seq_chunk_local = seq_local // num_chunks
 
     chunk_results = [None] * num_chunks
-    grad_qkv_hp_contig = grad_qkv_hp.contiguous()
-
     # Prepare all input chunks
     input_chunks = []
     for chunk_idx in range(num_chunks):
         s_start = chunk_idx * seq_chunk_full
         s_end = s_start + seq_chunk_full
-        input_chunks.append(grad_qkv_hp_contig[s_start:s_end].contiguous())
+        input_chunks.append(grad_qkv_hp[s_start:s_end])
 
     def make_alltoall_fn(idx, data):
         def do_alltoall():

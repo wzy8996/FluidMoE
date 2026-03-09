@@ -19,12 +19,13 @@ sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, TOOLS_DIR)
 import torch
 import torch.distributed as dist
+from experiment_configs import get_tune_defaults, persist_block_benchmark_defaults
 from model_configs import get_model_config, list_model_names
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE 参数搜索")
-    parser.add_argument("--model", type=str, default="qwen_moe_a2_7b", help="模型名称 (from tools/model_configs.py)")
+    parser.add_argument("--model", type=str, default="mixtral_8x7b", help="模型名称 (from tools/model_configs.py)")
     parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
     return parser.parse_args()
 
@@ -37,6 +38,7 @@ if args.list_models:
     raise SystemExit(0)
 model_name = args.model
 model_cfg = get_model_config(model_name)
+tune_defaults = get_tune_defaults()
 
 rank = int(os.environ.get('LOCAL_RANK', 0))
 device = torch.device(f'cuda:{rank}')
@@ -64,10 +66,10 @@ seq_len = int(model_cfg.get("seq_len", 4096))
 batch_size = int(model_cfg.get("batch_size", 4))
 capacity_factor = float(model_cfg.get("capacity_factor", 1.0))
 
-# 并行度配置（手动指定）
-dp_size = 1
-cp_size = 2
-ep_size = 2
+# 并行度配置（默认来自 tools/experiment_configs.py）
+dp_size = int(tune_defaults["dp_size"])
+cp_size = int(tune_defaults["cp_size"])
+ep_size = int(tune_defaults["ep_size"])
 
 assert dp_size > 0, f"dp_size 必须 > 0, 但 dp_size={dp_size}"
 assert cp_size > 0, f"cp_size 必须 > 0, 但 cp_size={cp_size}"
@@ -75,13 +77,13 @@ assert ep_size > 0, f"ep_size 必须 > 0, 但 ep_size={ep_size}"
 num_gpus = dp_size * cp_size
 
 # Chunk 搜索参数
-N_ITER = 10                # 测量轮数
-MAX_C = 8                  # 最大分块数
-STOP_MIN_SAVING_MS = 0.5   # 早停阈值 (ms)
+N_ITER = int(tune_defaults["chunk_search_iters"])              # 测量轮数
+MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大分块数
+STOP_MIN_SAVING_MS = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值 (ms)
 
 # AR 搜索参数
-N_AR_WARMUP = 5            # 预热轮数
-N_AR_ITER = 10             # 测量轮数
+N_AR_WARMUP = int(tune_defaults["ar_warmup"])                  # 预热轮数
+N_AR_ITER = int(tune_defaults["ar_iters"])                     # 测量轮数
 
 assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
 assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
@@ -452,6 +454,21 @@ for region in REGION_ORDER:
     mb = bdp_per_region.get(region, 0)
     p0(f"        '{region}': {mb} * 1024 * 1024,  # {REGION_GAP_DESC[region]}")
 p0(f"    }}")
+
+persist_updates = {
+    "moe_combine_chunks": best_chunks[0],
+    "moe_dispatch_chunks": best_chunks[1],
+    "attn_proj_chunks": best_chunks[2],
+    "attn_qkv_chunks": best_chunks[3],
+    "ar_trickle_sizes": {
+        region: int(bdp_per_region.get(region, 0)) * 1024 * 1024
+        for region in REGION_ORDER
+    },
+}
+
+if rank == 0:
+    persist_block_benchmark_defaults(persist_updates)
+    p0(f"\n  已写回 tools/experiment_configs.py 的 BLOCK_BENCHMARK_DEFAULTS")
 
 dist.barrier()
 dist.destroy_process_group()

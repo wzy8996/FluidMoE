@@ -8,6 +8,7 @@ from typing import Dict, Any
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     # 1) Alibaba Cloud - Qwen1.5-MoE-A2.7B (~14.3B total, 2.7B active)
     "qwen_moe_a2_7b": {
+        "hf_model_id": "Qwen/Qwen1.5-MoE-A2.7B",
         "hidden_size": 2048,
         "num_heads": 16,
         "num_kv_heads": 16,
@@ -34,6 +35,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
     # 3) Mistral AI - Mixtral-8x7B-v0.1 (~46.7B total, ~13B active)
     "mixtral_8x7b": {
+        "hf_model_id": "mistralai/Mixtral-8x7B-v0.1",
         "hidden_size": 4096,
         "num_heads": 32,
         "num_kv_heads": 8,
@@ -47,6 +49,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
     # 4) DeepSeek - DeepSeek-V3 (native MoE, 671B total)
     "deepseek_v3": {
+        "hf_model_id": "deepseek-ai/DeepSeek-V3",
         "hidden_size": 7168,
         "num_heads": 128,
         "num_kv_heads": 128,

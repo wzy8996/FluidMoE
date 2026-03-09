@@ -216,6 +216,13 @@ class BackwardScheduler:
         self._region_a2a_times = []
         self._region_dw_time = 0.0
 
+        # Communication visibility metrics
+        # - a2a_total_ms: sum of A2A kernel durations on comm_stream
+        # - a2a_visible_ms: sum of default_stream stall windows waiting on A2A
+        self.comm_metrics_enabled = False
+        self._a2a_event_pairs = []         # [(start_evt, end_evt), ...]
+        self._visible_wait_pairs = []      # [(wait_start_evt, wait_end_evt), ...]
+
         # Event pool (initialized in _init_cuda, defaults here for safety)
         self._event_pool = []
         self._event_pool_size = 0
@@ -378,13 +385,14 @@ class BackwardScheduler:
 
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_event(input_event)
-            if self.profiling:
+            need_timing = self.profiling or self.comm_metrics_enabled
+            if need_timing:
                 start_evt = torch.cuda.Event(enable_timing=True)
                 start_evt.record(self.comm_stream)
             else:
                 start_evt = None
             result = comm_fn()
-            if self.profiling:
+            if need_timing:
                 end_evt = torch.cuda.Event(enable_timing=True)
                 end_evt.record(self.comm_stream)
             else:
@@ -411,7 +419,8 @@ class BackwardScheduler:
                 task_id = self._alltoall_task_id
                 self._alltoall_task_id += 1
 
-                if self.profiling:
+                need_timing = self.profiling or self.comm_metrics_enabled
+                if need_timing:
                     start_evt = torch.cuda.Event(enable_timing=True)
                     start_evt.record(self.comm_stream)
                 else:
@@ -419,7 +428,7 @@ class BackwardScheduler:
 
                 result = fn()
 
-                if self.profiling:
+                if need_timing:
                     end_evt = torch.cuda.Event(enable_timing=True)
                     end_evt.record(self.comm_stream)
                 else:
@@ -441,7 +450,7 @@ class BackwardScheduler:
         result, end_evt, start_evt = task_data
 
         # BDP gap tracking (only when profiling creates timing events)
-        if self._first_a2a_in_region and start_evt is not None:
+        if self.profiling and self._first_a2a_in_region and start_evt is not None:
             if self._last_a2a_end_event is not None:
                 self._gap_event_pairs.append((
                     self._last_a2a_end_region, self._last_a2a_end_event, start_evt))
@@ -453,9 +462,19 @@ class BackwardScheduler:
             torch.cuda.synchronize()
             if self._region_name:
                 self._region_a2a_times.append(start_evt.elapsed_time(end_evt))
+        if self.comm_metrics_enabled and start_evt is not None and end_evt is not None:
+            self._a2a_event_pairs.append((start_evt, end_evt))
 
         if end_evt is not None:
-            self.default_stream.wait_event(end_evt)
+            if self.comm_metrics_enabled:
+                wait_start_evt = torch.cuda.Event(enable_timing=True)
+                wait_end_evt = torch.cuda.Event(enable_timing=True)
+                wait_start_evt.record(self.default_stream)
+                self.default_stream.wait_event(end_evt)
+                wait_end_evt.record(self.default_stream)
+                self._visible_wait_pairs.append((wait_start_evt, wait_end_evt))
+            else:
+                self.default_stream.wait_event(end_evt)
 
         # Clean up waited tasks
         for tid in range(task_id - num_tasks + 1, task_id + 1):
@@ -733,6 +752,42 @@ class BackwardScheduler:
         self._last_a2a_end_event = None
         self._last_a2a_end_region = None
         self._first_a2a_in_region = True
+
+    # ========================================
+    # Communication visibility metrics
+    # ========================================
+    def set_comm_metrics_enabled(self, enabled: bool):
+        self.comm_metrics_enabled = bool(enabled)
+
+    def reset_comm_metrics(self):
+        self._a2a_event_pairs = []
+        self._visible_wait_pairs = []
+
+    def get_comm_metrics(self):
+        """Return A2A total/visible communication time in ms."""
+        if not self._a2a_event_pairs and not self._visible_wait_pairs:
+            return {
+                'a2a_total_ms': 0.0,
+                'a2a_visible_ms': 0.0,
+                'overlap_ratio': 0.0,
+                'n_a2a': 0,
+                'n_waits': 0,
+            }
+        torch.cuda.synchronize()
+        a2a_total = 0.0
+        visible = 0.0
+        for s, e in self._a2a_event_pairs:
+            a2a_total += s.elapsed_time(e)
+        for s, e in self._visible_wait_pairs:
+            visible += s.elapsed_time(e)
+        overlap_ratio = 0.0 if a2a_total <= 1e-9 else max(0.0, min(1.0, 1.0 - visible / a2a_total))
+        return {
+            'a2a_total_ms': float(a2a_total),
+            'a2a_visible_ms': float(visible),
+            'overlap_ratio': float(overlap_ratio),
+            'n_a2a': len(self._a2a_event_pairs),
+            'n_waits': len(self._visible_wait_pairs),
+        }
 
     def process_gap_events(self):
         for region, end_evt, start_evt in self._gap_event_pairs:
