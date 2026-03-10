@@ -143,8 +143,8 @@ elif args.mode == 'fluidmoe':
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
         cp_group=cp_group, ep_group=ep_group,
-        attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
         moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
+        attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
         ar_trickle_sizes=ar_trickle_sizes,
         dtype=torch.bfloat16, device=device,
     )

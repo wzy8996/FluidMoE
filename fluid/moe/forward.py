@@ -53,6 +53,36 @@ except Exception:
     _HAS_GROUPED_GEMM = False
 
 _LAYOUT_IDX_CACHE = {}
+_PADDED_ROW_IDX_CACHE = {}
+_GROUP_RANKS_CACHE = {}
+
+
+def _get_group_ranks(group: dist.ProcessGroup):
+    """Cache dist.get_process_group_ranks() to avoid repeated Python list allocation."""
+    gid = id(group)
+    cached = _GROUP_RANKS_CACHE.get(gid)
+    if cached is not None:
+        return cached
+    ranks = dist.get_process_group_ranks(group)
+    _GROUP_RANKS_CACHE[gid] = ranks
+    return ranks
+
+
+def _get_padded_row_indices(
+    nle: int, ep_size: int, cap: int, device: torch.device,
+) -> "Tuple[torch.Tensor, torch.Tensor]":
+    """Cached row reorder indices for uniform padding case (no GPU-CPU sync)."""
+    key = (nle, ep_size, cap, device.type,
+           device.index if device.index is not None else -1)
+    cached = _PADDED_ROW_IDX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    sorted_r2e, sorted_e2r = _get_cached_layout_indices(nle, ep_size, device)
+    split_sizes = torch.full((ep_size * nle,), cap, dtype=torch.int64, device=device)
+    row_idx_r2e = _build_row_reorder_index(split_sizes, sorted_r2e, device)
+    row_idx_e2r = _build_row_reorder_index(split_sizes, sorted_e2r, device)
+    _PADDED_ROW_IDX_CACHE[key] = (row_idx_r2e, row_idx_e2r)
+    return row_idx_r2e, row_idx_e2r
 
 
 def _to_batch_sizes(tokens_per_expert) -> torch.Tensor:
@@ -227,10 +257,15 @@ def router_forward(
     experts_per_rank = num_experts // ep_size
     input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
 
-    all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
-    dist.all_gather(all_input_splits, input_splits, group=ep_group)
-    all_input_splits = torch.stack(all_input_splits)
-    output_splits = all_input_splits[:, my_rank].clone()
+    if capacity_factor > 0:
+        # Padding makes splits uniform — caller overrides splits anyway.
+        # Skip AllGather to avoid unnecessary collective synchronization.
+        output_splits = input_splits  # placeholder, unused by caller
+    else:
+        all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
+        dist.all_gather(all_input_splits, input_splits, group=ep_group)
+        all_input_splits = torch.stack(all_input_splits)
+        output_splits = all_input_splits[:, my_rank].clone()
 
     nvtx_range_pop()
     return (permuted_tokens, permuted_probs, sorted_indices, token_ids,
@@ -432,6 +467,7 @@ def dispatch_fc1_p2p_forward(
     num_local_experts: int,
     tokens_per_expert: torch.Tensor,
     needs_backward: bool = True,
+    pre_tokens_cpu: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor]:
     """
@@ -442,11 +478,11 @@ def dispatch_fc1_p2p_forward(
         Round i: req.wait(P2P_{i-1}), start P2P_i, compute recv_{i-1} FC1 + Act
         Final:   req.wait(last round), compute last FC1 + Act
 
-    P2P Metadata Piggybacking:
+    P2P Metadata Piggybacking (skipped when pre_tokens_cpu is provided):
         Each P2P message includes a metadata row containing tokens_per_expert info.
         This eliminates the need for a separate AllGather operation.
-
-    FC1 pre-activation values are NOT saved; backward recomputes them to save memory.
+        When pre_tokens_cpu is given (e.g. padding with known uniform metadata),
+        metadata is skipped — no extra P2P row, no torch.cat, no .cpu() syncs.
 
     Args:
         tokens: [num_tokens, hidden] input tokens (sorted by expert)
@@ -459,25 +495,28 @@ def dispatch_fc1_p2p_forward(
         num_local_experts: Number of local experts
         tokens_per_expert: [num_global_experts] local tokens per expert from router
         needs_backward: Whether backward is needed (unused, kept for API compatibility)
+        pre_tokens_cpu: Optional [ep_size, nle] CPU int64 tensor. When provided,
+            metadata piggybacking is skipped (no .cpu() syncs, no torch.cat).
 
     Returns:
         local_tokens: [local_count, hidden] local tokens
         local_act: [local_count, ffn_hidden] local activation output
         recv_act_results: Dict[partner -> act_tensor] - activation outputs from peers
-        recv_buffers: Dict[partner -> token_tensor] - received tokens from peers (without metadata row)
+        recv_buffers: Dict[partner -> token_tensor] - received tokens from peers
         partners: List of partner ranks
         recv_offsets: Dict of partner -> offset in buffer
-        tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor built from P2P metadata
+        tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor
     """
     nvtx_range_push("dispatch_fc1_p2p")
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
-    # Build local-to-global rank mapping for P2P ops
-    global_ranks = dist.get_process_group_ranks(ep_group)
+    # Build local-to-global rank mapping for P2P ops (cached)
+    global_ranks = _get_group_ranks(ep_group)
     device = tokens.device
     dtype = tokens.dtype
     hidden_size = tokens.shape[-1]
     element_size = torch.finfo(dtype).bits // 8
+    use_metadata = pre_tokens_cpu is None  # skip piggybacking when metadata is known
 
     # Weight dimensions - weight1 is already 3D: [num_local_experts, hidden, ffn_hidden]
     ffn_hidden = weight1.shape[-1]
@@ -494,15 +533,16 @@ def dispatch_fc1_p2p_forward(
     local_count = input_splits[my_rank]
     local_start = input_offsets[my_rank]
 
-    # Extract local tokens_per_expert (for my local experts)
-    # tokens_per_expert[my_rank * num_local_experts : (my_rank + 1) * num_local_experts]
-    local_tokens_per_expert = tokens_per_expert[my_rank * num_local_experts : (my_rank + 1) * num_local_experts]
-    local_tokens_per_expert_cpu = local_tokens_per_expert.to(dtype=torch.int64).cpu()
-
-    # Initialize tokens_cpu tensor to collect metadata from all ranks
-    # tokens_cpu[rank] = tokens_per_expert for that rank's tokens going to my local experts
-    tokens_cpu = torch.zeros(ep_size, num_local_experts, dtype=torch.int64)
-    tokens_cpu[my_rank] = local_tokens_per_expert_cpu
+    if use_metadata:
+        # Extract local tokens_per_expert (GPU -> CPU sync required)
+        local_tokens_per_expert = tokens_per_expert[my_rank * num_local_experts : (my_rank + 1) * num_local_experts]
+        local_tokens_per_expert_cpu = local_tokens_per_expert.to(dtype=torch.int64).cpu()
+        tokens_cpu = torch.zeros(ep_size, num_local_experts, dtype=torch.int64)
+        tokens_cpu[my_rank] = local_tokens_per_expert_cpu
+    else:
+        # Metadata known a priori (e.g. padding) — no GPU-CPU sync needed
+        tokens_cpu = pre_tokens_cpu
+        local_tokens_per_expert_cpu = tokens_cpu[my_rank]
 
     # Get Round-Robin scheduled partners
     partners = []
@@ -514,40 +554,38 @@ def dispatch_fc1_p2p_forward(
     # Extract local tokens (no clone needed - data will be copied in merge_tokens_expert_major anyway)
     local_tokens = tokens[local_start:local_start + local_count] if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
 
-    # Prepare send data with metadata row
-    # Metadata encoding: Use int32 view to exactly preserve integer values
-    # Each int32 value maps to 2 float16 values (or 1 float32/bfloat16 value)
-    # We store metadata as int32 values reinterpreted as the dtype's raw bits
+    # Prepare send data
     send_chunks = {}
-    send_buffers_with_metadata = {}
-    for partner in partners:
-        if input_splits[partner] > 0:
-            token_chunk = tokens[input_offsets[partner]:input_offsets[partner+1]]
-            # Metadata: my tokens_per_expert for partner's local experts
-            partner_metadata = tokens_per_expert[partner * num_local_experts : (partner + 1) * num_local_experts]
-            # Create metadata row - encode as int32, then view as dtype
-            metadata_int32 = partner_metadata.to(torch.int32).to(device)
-            # Pad to required size (need enough space for num_local_experts int32 values)
-            # int32 is 4 bytes, float16 is 2 bytes, so we need 2*num_local_experts float16 elements
-            # For bfloat16/float32, we need different calculations
-            int32_as_elements = 4 // element_size  # How many dtype elements per int32
-            metadata_elements = num_local_experts * int32_as_elements
-            metadata_row = torch.zeros(1, hidden_size, dtype=dtype, device=device)
-            # View int32 as dtype and copy
-            metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
-            metadata_row[0, :metadata_elements] = metadata_as_dtype
-            # Concatenate metadata + tokens
-            send_buffers_with_metadata[partner] = torch.cat([metadata_row, token_chunk], dim=0)
-            send_chunks[partner] = send_buffers_with_metadata[partner]
-
-    # Prepare receive buffers with extra row for metadata
     recv_buffers_with_metadata = {}
-    recv_buffers = {}  # Will store token data without metadata
-    for partner in partners:
-        recv_size = output_splits[partner]
-        if recv_size > 0:
-            # +1 row for metadata
-            recv_buffers_with_metadata[partner] = torch.empty(recv_size + 1, hidden_size, dtype=dtype, device=device)
+    recv_buffers = {}
+    if use_metadata:
+        # Metadata piggybacking: encode per-expert token counts as extra row
+        send_buffers_with_metadata = {}
+        int32_as_elements = 4 // element_size
+        metadata_elements = num_local_experts * int32_as_elements
+        for partner in partners:
+            if input_splits[partner] > 0:
+                token_chunk = tokens[input_offsets[partner]:input_offsets[partner+1]]
+                partner_metadata = tokens_per_expert[partner * num_local_experts : (partner + 1) * num_local_experts]
+                metadata_int32 = partner_metadata.to(torch.int32).to(device)
+                metadata_row = torch.zeros(1, hidden_size, dtype=dtype, device=device)
+                metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
+                metadata_row[0, :metadata_elements] = metadata_as_dtype
+                send_buffers_with_metadata[partner] = torch.cat([metadata_row, token_chunk], dim=0)
+                send_chunks[partner] = send_buffers_with_metadata[partner]
+        for partner in partners:
+            recv_size = output_splits[partner]
+            if recv_size > 0:
+                recv_buffers_with_metadata[partner] = torch.empty(recv_size + 1, hidden_size, dtype=dtype, device=device)
+    else:
+        # No metadata needed — send raw token slices (no cat, no extra row)
+        for partner in partners:
+            if input_splits[partner] > 0:
+                send_chunks[partner] = tokens[input_offsets[partner]:input_offsets[partner+1]]
+        for partner in partners:
+            recv_size = output_splits[partner]
+            if recv_size > 0:
+                recv_buffers_with_metadata[partner] = torch.empty(recv_size, hidden_size, dtype=dtype, device=device)
 
     # Compute each partner's offset in buffer
     recv_offsets = {}
@@ -567,22 +605,24 @@ def dispatch_fc1_p2p_forward(
     recv_act_results = {}
     local_act = None
 
-    # Compute metadata layout (same as encoding)
-    int32_as_elements = 4 // element_size
-    metadata_elements = num_local_experts * int32_as_elements
+    if use_metadata:
+        # Compute metadata layout (same as encoding)
+        _int32_as_elems = 4 // element_size
+        _meta_elems = num_local_experts * _int32_as_elems
 
     def extract_metadata_and_tokens(partner):
         """Extract metadata from received buffer and update tokens_cpu."""
         if partner in recv_buffers_with_metadata:
             full_buffer = recv_buffers_with_metadata[partner]
-            # First row is metadata encoded as int32 viewed as dtype
-            metadata_as_dtype = full_buffer[0, :metadata_elements]
-            # View back as int32
-            metadata_int32 = metadata_as_dtype.view(torch.int8).view(torch.int32)
-            # Move compact int32 metadata to CPU first, then cast to int64 on CPU.
-            tokens_cpu[partner] = metadata_int32[:num_local_experts].cpu().to(torch.int64)
-            # Rest is token data
-            recv_buffers[partner] = full_buffer[1:]
+            if use_metadata:
+                # Decode metadata from first row (GPU -> CPU sync)
+                metadata_as_dtype = full_buffer[0, :_meta_elems]
+                metadata_int32 = metadata_as_dtype.view(torch.int8).view(torch.int32)
+                tokens_cpu[partner] = metadata_int32[:num_local_experts].cpu().to(torch.int64)
+                recv_buffers[partner] = full_buffer[1:]
+            else:
+                # No metadata row — recv buffer IS the token data (no sync)
+                recv_buffers[partner] = full_buffer
 
     for round_idx, partner in enumerate(partners):
         # 1. Start current round P2P (async, returns immediately)
@@ -683,8 +723,8 @@ def fc2_combine_p2p_forward(
     nvtx_range_push("fc2_combine_p2p")
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
-    # Build local-to-global rank mapping for P2P ops
-    global_ranks = dist.get_process_group_ranks(ep_group)
+    # Build local-to-global rank mapping for P2P ops (cached)
+    global_ranks = _get_group_ranks(ep_group)
     device = local_tokens.device
     dtype = local_tokens.dtype
     hidden_size = weight2.shape[-1]
@@ -785,22 +825,67 @@ def fc2_combine_p2p_forward(
         else:
             all_peer_tokens = torch.cat(peer_tokens, dim=0)
 
-        all_expert_tokens, all_tokens_per_expert = merge_tokens_expert_major(
-            local_tokens, all_peer_tokens,
-            num_local_experts, tokens_cpu, my_rank, ep_size, device,
-        )
-        backward_indices = precompute_backward_sort_indices(
-            num_local_experts=num_local_experts, ep_size=ep_size,
-            tokens_cpu=tokens_cpu, device=device,
-        )
-        backward_indices['row_idx_rank_to_exp'] = _build_row_reorder_index(
-            backward_indices['split_sizes_rank_major'],
-            backward_indices['sorted_idxs_rank_to_exp'], device,
-        )
-        backward_indices['row_idx_exp_to_rank'] = _build_row_reorder_index(
-            backward_indices['split_sizes_exp_major'],
-            backward_indices['sorted_idxs_exp_to_rank'], device,
-        )
+        # Check for uniform padding case (CPU tensor — no GPU sync)
+        _cap = int(tokens_cpu.view(-1)[0])
+        _is_padded = bool((tokens_cpu == _cap).all())
+
+        if _is_padded and _cap > 0:
+            # Fast path: all indices are deterministic and cached.
+            # Eliminates GPU-CPU syncs from _build_row_reorder_index and merge.
+            row_idx_r2e, row_idx_e2r = _get_padded_row_indices(
+                num_local_experts, ep_size, _cap, device)
+
+            n_per_rank = num_local_experts * _cap
+            total_tokens_merge = ep_size * n_per_rank
+
+            # Build rank-major tokens
+            rank_parts = []
+            peer_offset = 0
+            for rank in range(ep_size):
+                if rank == my_rank:
+                    rank_parts.append(local_tokens)
+                else:
+                    rank_parts.append(all_peer_tokens[peer_offset:peer_offset + n_per_rank])
+                    peer_offset += n_per_rank
+            rank_major = torch.cat(rank_parts, dim=0) if len(rank_parts) > 1 else rank_parts[0]
+
+            # Reorder to expert-major using cached index
+            all_expert_tokens = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
+            permute_by_row_idx(rank_major, row_idx_r2e, all_expert_tokens)
+
+            all_tokens_per_expert = [ep_size * _cap] * num_local_experts
+
+            # Backward indices from cache (no _build_row_reorder_index calls)
+            sorted_r2e, sorted_e2r = _get_cached_layout_indices(
+                num_local_experts, ep_size, device)
+            split_uniform = torch.full(
+                (ep_size * num_local_experts,), _cap, dtype=torch.int64, device=device)
+            backward_indices = {
+                'split_sizes_rank_major': split_uniform,
+                'sorted_idxs_rank_to_exp': sorted_r2e,
+                'split_sizes_exp_major': split_uniform,
+                'sorted_idxs_exp_to_rank': sorted_e2r,
+                'row_idx_rank_to_exp': row_idx_r2e,
+                'row_idx_exp_to_rank': row_idx_e2r,
+            }
+        else:
+            # General path: non-uniform splits, compute from scratch
+            all_expert_tokens, all_tokens_per_expert = merge_tokens_expert_major(
+                local_tokens, all_peer_tokens,
+                num_local_experts, tokens_cpu, my_rank, ep_size, device,
+            )
+            backward_indices = precompute_backward_sort_indices(
+                num_local_experts=num_local_experts, ep_size=ep_size,
+                tokens_cpu=tokens_cpu, device=device,
+            )
+            backward_indices['row_idx_rank_to_exp'] = _build_row_reorder_index(
+                backward_indices['split_sizes_rank_major'],
+                backward_indices['sorted_idxs_rank_to_exp'], device,
+            )
+            backward_indices['row_idx_exp_to_rank'] = _build_row_reorder_index(
+                backward_indices['split_sizes_exp_major'],
+                backward_indices['sorted_idxs_exp_to_rank'], device,
+            )
         nvtx_range_pop()
 
     # =========================================================================
@@ -823,8 +908,76 @@ def fc2_combine_p2p_forward(
     return combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert, backward_indices
 
 
+def pad_moe_dispatch(
+    permuted_tokens: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    token_ids: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    cap_per_rank: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor]:
+    """Pad dispatched tokens so every expert has exactly cap_per_rank tokens.
+
+    Tokens beyond cap_per_rank are truncated; experts with fewer tokens are
+    zero-padded.  Returns a boolean ``real_mask`` so the caller can distinguish
+    real tokens from padding in the backward pass.
+
+    Fully vectorized — no Python loop, no per-expert GPU-CPU sync.
+
+    Returns:
+        padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids,
+        padded_tokens_per_expert, real_mask
+    """
+    device = permuted_tokens.device
+    hidden_size = permuted_tokens.shape[1]
+    num_real = permuted_tokens.shape[0]
+    total_padded = num_experts * cap_per_rank
+
+    padded_tokens = torch.zeros(total_padded, hidden_size,
+                                dtype=permuted_tokens.dtype, device=device)
+    padded_probs = torch.zeros(total_padded, dtype=permuted_probs.dtype,
+                               device=device)
+    padded_sorted_indices = torch.zeros(total_padded, dtype=sorted_indices.dtype,
+                                        device=device)
+    padded_token_ids = torch.zeros(total_padded, dtype=token_ids.dtype,
+                                   device=device)
+    real_mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
+
+    if num_real > 0:
+        # Vectorized scatter: compact expert-sorted → fixed-capacity padded layout.
+        # All ops are pure GPU — zero GPU-CPU sync.
+        tpe = tokens_per_expert[:num_experts].to(dtype=torch.int64, device=device)
+        n_copy = tpe.clamp(max=cap_per_rank)
+
+        # Expert boundaries in compact layout
+        cum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+        torch.cumsum(n_copy, dim=0, out=cum[1:])
+
+        # Per-token expert id via searchsorted (pure GPU, no sync unlike repeat_interleave)
+        row_ids = torch.arange(num_real, dtype=torch.int64, device=device)
+        expert_ids = torch.searchsorted(cum[1:], row_ids, right=True)
+        within_pos = row_ids - cum[:-1][expert_ids]
+
+        # Destination in padded buffer: expert_id * cap_per_rank + within_pos
+        dst_idx = expert_ids * cap_per_rank + within_pos
+
+        padded_tokens.index_copy_(0, dst_idx, permuted_tokens)
+        padded_probs.index_copy_(0, dst_idx, permuted_probs)
+        padded_sorted_indices.index_copy_(0, dst_idx, sorted_indices)
+        padded_token_ids.index_copy_(0, dst_idx, token_ids)
+        real_mask[dst_idx] = True
+
+    padded_tpe = torch.full((num_experts,), cap_per_rank,
+                            dtype=tokens_per_expert.dtype, device=device)
+    return (padded_tokens, padded_probs, padded_sorted_indices,
+            padded_token_ids, padded_tpe, real_mask)
+
+
 __all__ = [
     'router_forward',
+    'pad_moe_dispatch',
     'merge_tokens_expert_major',
     'precompute_backward_sort_indices',
     'dispatch_fc1_p2p_forward',

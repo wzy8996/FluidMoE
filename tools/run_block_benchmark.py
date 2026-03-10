@@ -139,8 +139,7 @@ def main():
     p0(rank, f"  seq={seq_len}, batch={batch_size}, GPUs={num_gpus}")
     p0(rank, f"  dp={dp_size}, cp={cp_size}, ep={ep_size}")
     if args.impl == "fluidmoe":
-        p0(rank, f"  chunks: combine={args.moe_combine_chunks}, dispatch={args.moe_dispatch_chunks}, "
-                 f"proj={args.attn_proj_chunks}, qkv={args.attn_qkv_chunks}")
+        p0(rank, f"  chunks: R1={args.moe_combine_chunks}, R2={args.moe_dispatch_chunks}, R3={args.attn_proj_chunks}, R4={args.attn_qkv_chunks}")
     p0(rank, "=" * 60)
 
     from fluid.core.scheduler import get_backward_scheduler
@@ -210,10 +209,10 @@ def main():
         top_k=top_k,
         cp_group=cp_group,
         ep_group=ep_group,
-        attn_proj_chunks=args.attn_proj_chunks,
-        attn_qkv_chunks=args.attn_qkv_chunks,
         moe_combine_chunks=args.moe_combine_chunks,
         moe_dispatch_chunks=args.moe_dispatch_chunks,
+        attn_proj_chunks=args.attn_proj_chunks,
+        attn_qkv_chunks=args.attn_qkv_chunks,
         ar_trickle_sizes=ar_trickle_sizes,
         capacity_factor=capacity_factor,
         dtype=torch.bfloat16,

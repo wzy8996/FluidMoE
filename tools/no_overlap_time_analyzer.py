@@ -182,21 +182,14 @@ def parse_args():
     # Keep defaults aligned with tests/benchmark.py measurement style.
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
-    # R1 backward pipeline (comm→compute):
-    #   combine AllToAll BW (n1 chunks) → FC2 bwd (n1 chunks)
-    #   第一反向层: 1/n1 combine BW 暴露通信，1/n1 FC2 bwd 暴露计算
-    # R2 backward pipeline (compute→comm):
-    #   FC1 bwd (n2 chunks) → dispatch AllToAll BW (n2 chunks)
-    #   第一反向层: 1/n2 FC1 bwd 暴露计算（pipeline 起始无 comm 覆盖）
-    # R3/R4 通信均可被 dW 完全覆盖，无需 chunk 参数
     parser.add_argument("--moe-combine-chunks", type=int, default=4, metavar="N1",
-                        help="R1 combine AllToAll BW chunks (default: 1)")
+                        help="R1 combine AllToAll BW chunks")
     parser.add_argument("--moe-dispatch-chunks", type=int, default=2, metavar="N2",
-                        help="R2 dispatch AllToAll BW chunks (default: 1)")
+                        help="R2 dispatch AllToAll BW chunks")
     parser.add_argument("--attn-proj-chunks", type=int, default=1, metavar="N3",
-                        help="R3 sp2hp AllToAll BW chunks (default: 1)")
+                        help="R3 sp2hp AllToAll BW chunks")
     parser.add_argument("--attn-qkv-chunks", type=int, default=4, metavar="N4",
-                        help="R4 hp2sp AllToAll BW chunks (default: 1)")
+                        help="R4 hp2sp AllToAll BW chunks")
     return parser.parse_args()
 
 

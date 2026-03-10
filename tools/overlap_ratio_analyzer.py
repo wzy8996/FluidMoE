@@ -19,6 +19,7 @@ sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, TOOLS_DIR)
 
 from model_configs import get_model_config, list_model_names
+from experiment_configs import get_block_benchmark_defaults
 from fluid.layer import TransformerModel
 from fluid.core.scheduler import get_backward_scheduler
 
@@ -58,20 +59,15 @@ def main():
     batch_size = int(cfg.get("batch_size", 4))
     capacity_factor = float(cfg.get("capacity_factor", 1.0))
 
-    # 与 tests/benchmark.py 对齐
-    moe_combine_chunks = 4
-    moe_dispatch_chunks = 4
-    attn_proj_chunks = 2
-    attn_qkv_chunks = 2
-    ar_trickle_sizes = {
-        "moe_combine": 43 * 1024 * 1024,
-        "moe_dispatch": 29 * 1024 * 1024,
-        "attn_proj": 16 * 1024 * 1024,
-        "attn_qkv": 17 * 1024 * 1024,
-    }
-    dp_size = 1
-    cp_size = 2
-    ep_size = 2
+    bench_defaults = get_block_benchmark_defaults()
+    moe_combine_chunks = int(bench_defaults.get("moe_combine_chunks", 1))
+    moe_dispatch_chunks = int(bench_defaults.get("moe_dispatch_chunks", 1))
+    attn_proj_chunks = int(bench_defaults.get("attn_proj_chunks", 1))
+    attn_qkv_chunks = int(bench_defaults.get("attn_qkv_chunks", 1))
+    ar_trickle_sizes = bench_defaults.get("ar_trickle_sizes", {})
+    dp_size = int(bench_defaults.get("dp_size", 1))
+    cp_size = int(bench_defaults.get("cp_size", 2))
+    ep_size = int(bench_defaults.get("ep_size", 2))
 
     assert ep_size == cp_size
     num_gpus = dp_size * cp_size
@@ -107,8 +103,8 @@ def main():
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
         cp_group=cp_group, ep_group=ep_group,
-        attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
         moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
+        attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
         ar_trickle_sizes=ar_trickle_sizes,
         capacity_factor=capacity_factor,
         dtype=torch.bfloat16, device=device,

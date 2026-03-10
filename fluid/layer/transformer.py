@@ -5,6 +5,8 @@ Single autograd.Function for complete Transformer layer (Attention + MoE).
 Minimizes Python overhead by combining all operations into one Function.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -21,6 +23,7 @@ from fluid.attention.forward import (
 )
 from fluid.moe.forward import (
     router_forward,
+    pad_moe_dispatch,
     dispatch_fc1_p2p_forward,
     fc2_combine_p2p_forward,
 )
@@ -77,13 +80,14 @@ class TransformerLayerFunction(torch.autograd.Function):
         num_kv_heads: int,
         num_experts: int,
         top_k: int,
-        # Chunk configs for 4 backward overlap regions
-        attn_proj_chunks: int,       # Region 3: output projection dX + sp2hp AllToAll
-        attn_qkv_chunks: int,        # Region 4: hp2sp AllToAll + QKV dX
-        moe_combine_chunks: int,     # Region 1: Combine AllToAll + FC2 dX
-        moe_dispatch_chunks: int,    # Region 2: FC1 dX + Dispatch AllToAll
+        # Chunk config for backward overlap regions
+        moe_combine_chunks: int,
+        moe_dispatch_chunks: int,
+        attn_proj_chunks: int,
+        attn_qkv_chunks: int,
         activation_func: Callable,
         capacity_factor: float,
+        chunk_config: Optional[dict] = None,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
         needs_grad = hidden_states.requires_grad
@@ -184,15 +188,36 @@ class TransformerLayerFunction(torch.autograd.Function):
             capacity_factor=capacity_factor,
         )
 
-        input_splits_list = input_splits.tolist()
-        output_splits_list = output_splits.tolist()
+        # Pad to fixed capacity for uniform splits (enables token-dim chunking in backward)
+        pad_to_cap = capacity_factor > 0
+        if pad_to_cap:
+            expert_capacity = int(math.ceil(
+                num_tokens * top_k / num_experts * capacity_factor))
+            cap_per_rank = expert_capacity
+            (permuted_tokens, permuted_probs, sorted_indices, token_ids,
+             tokens_per_expert, real_mask) = pad_moe_dispatch(
+                permuted_tokens, permuted_probs, sorted_indices, token_ids,
+                tokens_per_expert, cap_per_rank, num_experts,
+            )
+            S = num_local_experts * cap_per_rank
+            input_splits_list = [S] * ep_group.size()
+            output_splits_list = [S] * ep_group.size()
+            # Metadata is deterministic — skip P2P metadata piggybacking
+            pre_tokens_cpu = torch.full(
+                (ep_group.size(), num_local_experts), cap_per_rank, dtype=torch.int64)
+        else:
+            real_mask = None
+            input_splits_list = input_splits.tolist()
+            output_splits_list = output_splits.tolist()
+            pre_tokens_cpu = None
 
-        # Dispatch + FC1 with P2P overlap (tokens_cpu built from P2P metadata)
+        # Dispatch + FC1 with P2P overlap
         (local_tokens, local_act, recv_act_results, recv_buffers,
          moe_partners, recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
             tokens_per_expert, needs_backward=needs_grad,
+            pre_tokens_cpu=pre_tokens_cpu,
         )
 
         # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
@@ -268,16 +293,17 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.num_kv_heads = num_kv_heads
             ctx.num_experts = num_experts
             ctx.top_k = top_k
-            ctx.attn_proj_chunks = attn_proj_chunks
-            ctx.attn_qkv_chunks = attn_qkv_chunks
             ctx.moe_combine_chunks = moe_combine_chunks
             ctx.moe_dispatch_chunks = moe_dispatch_chunks
+            ctx.attn_proj_chunks = attn_proj_chunks
+            ctx.attn_qkv_chunks = attn_qkv_chunks
             ctx.activation_func = activation_func
             ctx.num_local_experts = num_local_experts
             ctx.head_dim = head_dim
             ctx.scale = scale
 
-            # MoE routing info
+            # MoE routing info (real_mask distinguishes real vs padded tokens)
+            ctx.real_mask = real_mask
             ctx.input_splits_list = input_splits_list
             ctx.output_splits_list = output_splits_list
 
@@ -287,13 +313,16 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.hidden_size = hidden_size
             ctx.num_tokens = num_tokens
 
+            # Pre-computed static chunk config (None when capacity_factor <= 0)
+            ctx.chunk_config = chunk_config
+
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass with P2P overlap and dW scheduling."""
         if not ctx.needs_grad:
-            return (None,) * 25  # 10 weights + 4 groups/contexts + 11 config params
+            return (None,) * 26  # 10 weights + 4 groups/contexts + 12 config params
 
         # Ensure grad_output matches forward dtype (e.g. loss computed in float32 → cast back to bf16)
         if grad_output.dtype != ctx.dtype:
@@ -329,10 +358,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         num_kv_heads = ctx.num_kv_heads
         num_experts = ctx.num_experts
         top_k = ctx.top_k
-        attn_proj_chunks = ctx.attn_proj_chunks
-        attn_qkv_chunks = ctx.attn_qkv_chunks
         moe_combine_chunks = ctx.moe_combine_chunks
         moe_dispatch_chunks = ctx.moe_dispatch_chunks
+        attn_proj_chunks = ctx.attn_proj_chunks
+        attn_qkv_chunks = ctx.attn_qkv_chunks
         activation_func = ctx.activation_func
         num_local_experts = ctx.num_local_experts
         head_dim = ctx.head_dim
@@ -340,6 +369,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         input_splits_list = ctx.input_splits_list
         output_splits_list = ctx.output_splits_list
+        chunk_config = ctx.chunk_config
 
         seq_len = ctx.seq_len
         batch_size = ctx.batch_size
@@ -367,10 +397,8 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Compute actual chunk values (1 if scheduler disabled)
         is_enabled = scheduler.is_enabled()
-        attn_proj_chunks_actual = attn_proj_chunks if is_enabled else 1
-        attn_qkv_chunks_actual = attn_qkv_chunks if is_enabled else 1
-        moe_combine_chunks_actual = moe_combine_chunks if is_enabled else 1
-        moe_dispatch_chunks_actual = moe_dispatch_chunks if is_enabled else 1
+        if not is_enabled:
+            moe_combine_chunks = moe_dispatch_chunks = attn_proj_chunks = attn_qkv_chunks = 1
 
         # =====================================================================
         # MoE Backward (reverse order)
@@ -388,6 +416,16 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(grad_weighted.dtype)
         grad_permuted_probs = (grad_weighted * combined_output.to(grad_weighted.dtype)).sum(dim=-1)
 
+        # Filter padded positions for router backward (padded grads are zero but
+        # direct-assignment in router_backward could overwrite real gradients).
+        real_mask = ctx.real_mask
+        if real_mask is not None:
+            grad_permuted_probs_real = grad_permuted_probs[real_mask]
+            sorted_indices_real = sorted_indices[real_mask]
+        else:
+            grad_permuted_probs_real = grad_permuted_probs
+            sorted_indices_real = sorted_indices
+
         # Region 1: Combine AllToAll → FC2 dx (communication-first pipeline)
         # Chunked AllToAll submitted first, FC2 dx computed as each chunk arrives
         scheduler.begin_region('moe_combine')
@@ -398,10 +436,11 @@ class TransformerLayerFunction(torch.autograd.Function):
             weight2=moe_w2,
             activation_func=activation_func,
             num_local_experts=num_local_experts,
-            num_chunks=moe_combine_chunks_actual,
+            num_chunks=moe_combine_chunks,
             all_expert_tokens=all_expert_tokens,
             all_tokens_per_expert=all_tokens_per_expert,
             backward_indices=backward_indices,
+            chunk_config=chunk_config,
         )
 
         scheduler.end_region()
@@ -430,8 +469,8 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         if is_enabled:
             # --- router backward (no weight, just compute) ---
-            _grad_permuted_probs = grad_permuted_probs.detach()
-            _sorted_indices = sorted_indices
+            _grad_permuted_probs = grad_permuted_probs_real.detach()
+            _sorted_indices = sorted_indices_real
             _top_probs = top_probs
             _router_probs = router_probs
             _top_indices = top_indices
@@ -500,7 +539,8 @@ class TransformerLayerFunction(torch.autograd.Function):
             num_local_experts, all_tokens_per_expert,
             row_idx_exp_to_rank,
             input_splits_list, output_splits_list, ep_group,
-            layer_id=layer_id, num_chunks=moe_dispatch_chunks_actual,
+            layer_id=layer_id, num_chunks=moe_dispatch_chunks,
+            chunk_config=chunk_config,
         )
         # token_ids precomputed in forward
         grad_hidden_from_moe_tokens = torch.zeros(
@@ -514,8 +554,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Fallback: compute synchronously if scheduler disabled.
         if not is_enabled:
             router_result[0], router_result[1] = router_backward(
-                grad_permuted_probs=grad_permuted_probs,
-                sorted_indices=sorted_indices,
+                grad_permuted_probs=grad_permuted_probs_real,
+                sorted_indices=sorted_indices_real,
                 top_probs=top_probs,
                 router_probs=router_probs,
                 top_indices=top_indices,
@@ -592,7 +632,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler.begin_region('attn_proj')
         grad_attn_output = outproj_sp2hp_backward(
             grad_hidden_after_attn, proj_weight, num_heads, head_dim, cp_group,
-            num_chunks=attn_proj_chunks_actual,
+            num_chunks=attn_proj_chunks,
         )
 
         scheduler.end_region()
@@ -638,7 +678,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_q, grad_k, grad_v, cp_group,
             tokens=ln1_out, weight_qkv=orig_qkv_weight,
             num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
-            layer_id=layer_id, num_chunks=attn_qkv_chunks_actual,
+            layer_id=layer_id, num_chunks=attn_qkv_chunks,
         )
 
         scheduler.end_region()
@@ -703,9 +743,10 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_moe_w2,          # moe_w2
             None, None, None, None,  # groups and contexts
             None, None, None, None, None,  # layer_id, num_heads, num_kv_heads, num_experts, top_k
-            None, None, None, None,  # attn_proj_chunks, attn_qkv_chunks, moe_combine_chunks, moe_dispatch_chunks
+            None, None, None, None,  # 4 chunk params
             None,                 # activation_func
             None,                 # capacity_factor
+            None,                 # chunk_config
         )
 
 
@@ -723,10 +764,10 @@ class TransformerLayer(nn.Module):
         cp_group: Context parallel group
         ep_group: Expert parallel group
         layer_id: Layer index
-        attn_proj_chunks: Region 3 chunks - output projection dX + sp2hp AllToAll
-        attn_qkv_chunks: Region 4 chunks - hp2sp AllToAll + QKV dX
-        moe_combine_chunks: Region 1 chunks - Combine AllToAll + FC2 dX
-        moe_dispatch_chunks: Region 2 chunks - FC1 dX + Dispatch AllToAll
+        moe_combine_chunks: R1 (combine AllToAll) chunk count
+        moe_dispatch_chunks: R2 (dispatch AllToAll) chunk count
+        attn_proj_chunks: R3 (sp2hp AllToAll) chunk count
+        attn_qkv_chunks: R4 (hp2sp AllToAll) chunk count
         activation_func: MoE activation function
         dtype: Parameter dtype
         device: Parameter device
@@ -743,10 +784,10 @@ class TransformerLayer(nn.Module):
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
         layer_id: int = 0,
-        attn_proj_chunks: int = 4,
-        attn_qkv_chunks: int = 4,
         moe_combine_chunks: int = 1,
         moe_dispatch_chunks: int = 1,
+        attn_proj_chunks: int = 1,
+        attn_qkv_chunks: int = 1,
         ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
@@ -764,13 +805,14 @@ class TransformerLayer(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.layer_id = layer_id
-        self.attn_proj_chunks = attn_proj_chunks
-        self.attn_qkv_chunks = attn_qkv_chunks
         self.moe_combine_chunks = moe_combine_chunks
         self.moe_dispatch_chunks = moe_dispatch_chunks
+        self.attn_proj_chunks = attn_proj_chunks
+        self.attn_qkv_chunks = attn_qkv_chunks
         from fluid.core.te_ops import te_gelu
         self.activation_func = activation_func or te_gelu
         self.capacity_factor = capacity_factor
+        self._moe_chunk_config = None  # lazily computed on first forward
 
         # Apply per-region AR trickle sizes to scheduler singleton
         if ar_trickle_sizes is not None:
@@ -830,6 +872,23 @@ class TransformerLayer(nn.Module):
         Returns:
             [seq, batch, hidden] output tensor
         """
+        # Lazy-init static chunk config for padded MoE backward
+        if self.capacity_factor > 0 and self._moe_chunk_config is None:
+            seq_len, batch_size, _ = x.shape
+            num_tokens = seq_len * batch_size
+            nle = self.num_experts // self.ep_group.size()
+            cap = int(math.ceil(
+                num_tokens * self.top_k / self.num_experts * self.capacity_factor))
+            from fluid.moe.backward import build_moe_chunk_config
+            self._moe_chunk_config = build_moe_chunk_config(
+                num_local_experts=nle,
+                ep_size=self.ep_group.size(),
+                cap=cap,
+                moe_combine_chunks=self.moe_combine_chunks,
+                moe_dispatch_chunks=self.moe_dispatch_chunks,
+                device=x.device,
+            )
+
         return TransformerLayerFunction.apply(
             x,
             self.ln1_weight, self.ln1_bias,
@@ -840,10 +899,13 @@ class TransformerLayer(nn.Module):
             self.attn_overlap_ctx, self.moe_overlap_ctx,
             self.layer_id, self.num_heads, self.num_kv_heads,
             self.num_experts, self.top_k,
-            self.attn_proj_chunks, self.attn_qkv_chunks,
-            self.moe_combine_chunks, self.moe_dispatch_chunks,
+            self.moe_combine_chunks,
+            self.moe_dispatch_chunks,
+            self.attn_proj_chunks,
+            self.attn_qkv_chunks,
             self.activation_func,
             self.capacity_factor,
+            self._moe_chunk_config,
         )
 
 
@@ -861,10 +923,10 @@ class TransformerModel(nn.Module):
         top_k: int,
         cp_group: dist.ProcessGroup,
         ep_group: dist.ProcessGroup,
-        attn_proj_chunks: int = 1,
-        attn_qkv_chunks: int = 1,
         moe_combine_chunks: int = 1,
         moe_dispatch_chunks: int = 1,
+        attn_proj_chunks: int = 1,
+        attn_qkv_chunks: int = 1,
         ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
@@ -884,10 +946,10 @@ class TransformerModel(nn.Module):
                 cp_group=cp_group,
                 ep_group=ep_group,
                 layer_id=i,
-                attn_proj_chunks=attn_proj_chunks,
-                attn_qkv_chunks=attn_qkv_chunks,
                 moe_combine_chunks=moe_combine_chunks,
                 moe_dispatch_chunks=moe_dispatch_chunks,
+                attn_proj_chunks=attn_proj_chunks,
+                attn_qkv_chunks=attn_qkv_chunks,
                 ar_trickle_sizes=ar_trickle_sizes if i == 0 else None,  # set once
                 activation_func=activation_func,
                 capacity_factor=capacity_factor,

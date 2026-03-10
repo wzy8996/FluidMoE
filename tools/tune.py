@@ -78,8 +78,11 @@ num_gpus = dp_size * cp_size
 
 # Chunk 搜索参数
 N_ITER = int(tune_defaults["chunk_search_iters"])              # 测量轮数
-MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大分块数
-STOP_MIN_SAVING_MS = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值 (ms)
+MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大候选分块数
+MIN_SAVING = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值(ms)
+CHUNK_CANDIDATES = [2**i for i in range(MAX_C.bit_length()) if 2**i <= MAX_C]
+if 1 not in CHUNK_CANDIDATES:
+    CHUNK_CANDIDATES.insert(0, 1)
 
 # AR 搜索参数
 N_AR_WARMUP = int(tune_defaults["ar_warmup"])                  # 预热轮数
@@ -131,7 +134,7 @@ p0(f"Config: hidden={hidden_size}, heads={num_heads}, kv_heads={num_kv_heads}")
 p0(f"        ffn={ffn_hidden}, experts={num_experts}, top_k={top_k}")
 p0(f"        layers={num_layers}, seq={seq_len}, seq_local={seq_local}, batch={batch_size}, GPUs={num_gpus}")
 p0(f"        dp={dp_size}, cp={cp_size}, ep={ep_size}")
-p0(f"Chunk 搜索: iter={N_ITER}, max_C={MAX_C}, stop<{STOP_MIN_SAVING_MS} ms")
+p0(f"Chunk 搜索: iter={N_ITER}, candidates={CHUNK_CANDIDATES}, 早停阈值={MIN_SAVING}ms")
 p0(f"AR 搜索:    warmup={N_AR_WARMUP}, iter={N_AR_ITER}")
 p0("=" * 60)
 
@@ -147,10 +150,6 @@ model_kwargs = dict(
 x_input = torch.randn(seq_local, batch_size, hidden_size, dtype=torch.bfloat16, device=device)
 
 
-def get_valid_chunks(size, max_C=MAX_C):
-    return [c for c in range(1, min(size, max_C) + 1) if size % c == 0]
-
-
 # 在任何训练开始前调用 configure_allreduce，创建 ar_group
 # (dist.new_group 是集合操作，必须在所有 rank 同步时调用一次)
 # shared_dp_group=all_group: 共享参数 AR 跨所有参与 rank (shared_dp_world_size=num_gpus)
@@ -162,21 +161,31 @@ sched.configure_allreduce(enabled=False, shared_dp_group=all_group,
 
 
 # ============================================================
-# Step 1: Chunk 搜索 (无 AR)
+# Step 1: 逐区域 Chunk 贪心搜索 (无 AR, 带早停)
 # ============================================================
 p0(f"\n{'=' * 60}")
-p0("Step 1: Chunk 搜索 (同步 AR)")
+p0("Step 1: 逐区域 Chunk 贪心搜索 (同步 AR, 带早停)")
 p0("=" * 60)
+p0(f"候选值: {CHUNK_CANDIDATES}, 早停阈值: {MIN_SAVING}ms")
 
-valid_moe = get_valid_chunks(hidden_size)
-valid_attn = get_valid_chunks(seq_local)
-p0(f"有效因数: MoE(R1,R2)={valid_moe}, Attn(R3,R4)={valid_attn}")
+SEARCH_ORDER = ['moe_combine', 'moe_dispatch', 'attn_proj', 'attn_qkv']
+SEARCH_LABELS = {
+    'moe_combine':  'R1 (moe_combine)',
+    'moe_dispatch': 'R2 (moe_dispatch)',
+    'attn_proj':    'R3 (attn_proj)',
+    'attn_qkv':     'R4 (attn_qkv)',
+}
+REGION_ATTRS = {
+    'moe_combine': 'moe_combine_chunks',
+    'moe_dispatch': 'moe_dispatch_chunks',
+    'attn_proj': 'attn_proj_chunks',
+    'attn_qkv': 'attn_qkv_chunks',
+}
+MOE_REGIONS = {'moe_combine', 'moe_dispatch'}
 
 sched.clear_iteration()
 chunk_model = TransformerModel(
     **model_kwargs,
-    moe_combine_chunks=1, moe_dispatch_chunks=1,
-    attn_proj_chunks=1, attn_qkv_chunks=1,
     dtype=torch.bfloat16, device=device,
 )
 sched.enable()  # ar_enabled=False + shared_dp_world_size=num_gpus → 同步 AR 模式
@@ -185,20 +194,8 @@ chunk_model.setup_ar_buffer()
 xg = x_input.clone().detach().requires_grad_(True)
 
 
-def bench_chunk(mc, md, ap, aq):
-    """测量一个 chunk 配置的 backward 时间 (完整 forward+backward，固定输入)。
-
-    Returns rank 0's timing broadcast to all ranks, ensuring deterministic
-    early-stop decisions across ranks (avoids NCCL deadlock from divergent paths).
-    """
-    # 直接修改模型各层的 chunk 属性，forward 时会传入 ctx 供 backward 使用
-    for layer in chunk_model.layers:
-        layer.moe_combine_chunks = mc
-        layer.moe_dispatch_chunks = md
-        layer.attn_proj_chunks = ap
-        layer.attn_qkv_chunks = aq
-    # Per-config warmup: 首次运行新 chunk 配置时会触发 buffer 分配、
-    # NCCL plan 创建等一次性开销，需要排除在计时之外。
+def bench_bwd():
+    """测量当前 chunk 配置的 backward 时间 (avg across ranks)."""
     for _ in range(2):
         xg.grad = None
         for p in chunk_model.parameters():
@@ -222,74 +219,61 @@ def bench_chunk(mc, md, ap, aq):
         torch.cuda.synchronize()
         total += start.elapsed_time(end)
         sched.clear_iteration()
-    # AllReduce 取均值，确保所有 rank 做出相同的早停决策
     t_tensor = torch.tensor([total / N_ITER], device=device)
     dist.all_reduce(t_tensor, op=dist.ReduceOp.AVG)
     return t_tensor.item()
 
 
-# Baseline C=(1,1,1,1)
-T_baseline = bench_chunk(1, 1, 1, 1)
-p0(f"\nBaseline C=(1,1,1,1): {T_baseline:.3f} ms")
+T_baseline = bench_bwd()  # 全 C=1 baseline
+p0(f"  全 C=1 baseline: {T_baseline:.3f} ms")
 
-bench_data = {(1, 1, 1, 1): T_baseline}
+best_chunks = {r: 1 for r in SEARCH_ORDER}
 
-# 贪心逐 region 扫描
-region_names = ['R1 (moe_combine)', 'R2 (moe_dispatch)', 'R3 (attn_proj)', 'R4 (attn_qkv)']
-region_valid = [valid_moe, valid_moe, valid_attn, valid_attn]
-best_per_region = [1, 1, 1, 1]
-best_speedup_per_region = [1.0, 1.0, 1.0, 1.0]
+for region in SEARCH_ORDER:
+    attr = REGION_ATTRS[region]
+    label = SEARCH_LABELS[region]
+    p0(f"\n  搜索 {label} (候选: {CHUNK_CANDIDATES})...")
 
-for ri in range(4):
-    p0(f"\n  {region_names[ri]}")
+    region_results = {}
     best_c = 1
-    best_t_region = T_baseline
-    prev_t = T_baseline
+    best_t = float('inf')
 
-    for c in region_valid[ri]:
-        cfg = list(best_per_region)
-        cfg[ri] = c
-        cfg_tuple = tuple(cfg)
-        if cfg_tuple in bench_data:
-            t = bench_data[cfg_tuple]
-        else:
-            t = bench_chunk(*cfg_tuple)
-            bench_data[cfg_tuple] = t
-
-        saving = T_baseline - t
-        marginal = prev_t - t
-        speedup = T_baseline / t
-
+    for c in CHUNK_CANDIDATES:
+        for layer in chunk_model.layers:
+            setattr(layer, attr, c)
+            if region in MOE_REGIONS:
+                layer._moe_chunk_config = None
+        t = bench_bwd()
+        region_results[c] = t
         marker = ""
-        if t < best_t_region:
-            best_t_region = t
+        if t < best_t:
+            best_t = t
             best_c = c
             marker = " <-- best"
+        p0(f"    C={c}: {t:.3f} ms{marker}")
 
-        if c == 1:
-            p0(f"    C={c}: {t:.3f} ms  (saving={saving:+.3f} ms, speedup={speedup:.4f}x){marker}")
-        else:
-            p0(f"    C={c}: {t:.3f} ms  (saving={saving:+.3f} ms, marginal={marginal:+.3f} ms, speedup={speedup:.4f}x){marker}")
+    T_c1 = region_results[1]
+    saving = T_c1 - best_t
 
-        if c > 1 and marginal < STOP_MIN_SAVING_MS:
-            p0(f"    >>> 早停 (marginal {marginal:+.3f} ms < 阈值 {STOP_MIN_SAVING_MS} ms)")
-            break
+    if saving < MIN_SAVING:
+        p0(f"  {label}: 节省={saving:.3f}ms < {MIN_SAVING}ms, 使用 C=1")
+        for layer in chunk_model.layers:
+            setattr(layer, attr, 1)
+            if region in MOE_REGIONS:
+                layer._moe_chunk_config = None
+        continue
 
-        prev_t = t
+    # 锁定最优值
+    best_chunks[region] = best_c
+    for layer in chunk_model.layers:
+        setattr(layer, attr, best_c)
+        if region in MOE_REGIONS:
+            layer._moe_chunk_config = None
+    p0(f"  {label}: 最优 C={best_c}, 节省={saving:.3f}ms")
 
-    best_per_region[ri] = best_c
-    best_speedup_per_region[ri] = T_baseline / best_t_region
-    p0(f"  最优: C={best_c}, {best_t_region:.3f} ms  (speedup={best_speedup_per_region[ri]:.4f}x)")
-
-final_cfg = tuple(best_per_region)
-T_chunk_best = bench_data[final_cfg]
-if T_baseline < T_chunk_best:
-    p0(f"\n  Baseline ({T_baseline:.3f} ms) 优于最终配置 ({T_chunk_best:.3f} ms), 回退到 C=(1,1,1,1)")
-    final_cfg = (1, 1, 1, 1)
-    T_chunk_best = T_baseline
-
-best_chunks = final_cfg
-p0(f"\n最优分块配置: C={best_chunks}, {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
+T_chunk_best = bench_bwd()
+p0(f"\n最优分块配置: {best_chunks}")
+p0(f"  最终: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
 
 del chunk_model, xg
 gc.collect()
@@ -304,15 +288,10 @@ dist.barrier()  # 确保两个 rank 同步后再进入 Step 2
 p0(f"\n{'=' * 60}")
 p0("Step 2: 分区域 BDP 模型计算最优 AR trickle size")
 p0("=" * 60)
-p0(f"  (使用最优分块配置 C={best_chunks})")
+p0(f"  (使用最优分块配置: {best_chunks})")
 
 REGION_ORDER = ['moe_combine', 'moe_dispatch', 'attn_proj', 'attn_qkv']
-REGION_LABELS = {
-    'moe_combine':  'R1 (moe_combine)',
-    'moe_dispatch': 'R2 (moe_dispatch)',
-    'attn_proj':    'R3 (attn_proj)',
-    'attn_qkv':     'R4 (attn_qkv)',
-}
+REGION_LABELS = SEARCH_LABELS
 # Gap description: what compute fills the gap after each region
 REGION_GAP_DESC = {
     'moe_combine':  'R1→R2: last FC2 dX + act_bwd + FC1 dX(c0)',
@@ -340,10 +319,10 @@ p0(f"\n  2b. Profile 分区域 trickle windows (ar_enabled=False, 纯净 gap)...
 sched.clear_iteration()
 ar_model = TransformerModel(
     **model_kwargs,
-    moe_combine_chunks=best_chunks[0],
-    moe_dispatch_chunks=best_chunks[1],
-    attn_proj_chunks=best_chunks[2],
-    attn_qkv_chunks=best_chunks[3],
+    moe_combine_chunks=best_chunks['moe_combine'],
+    moe_dispatch_chunks=best_chunks['moe_dispatch'],
+    attn_proj_chunks=best_chunks['attn_proj'],
+    attn_qkv_chunks=best_chunks['attn_qkv'],
     dtype=torch.bfloat16, device=device,
 )
 sched.enable()
@@ -429,8 +408,10 @@ p0(f"\n{'=' * 60}")
 p0("最终结果")
 p0("=" * 60)
 p0(f"\n  分块配置:")
-p0(f"    Baseline C=(1,1,1,1): {T_baseline:.3f} ms")
-p0(f"    最优配置 C={best_chunks}: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
+p0(f"    Baseline 全C=1: {T_baseline:.3f} ms")
+p0(f"    最优配置: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
+for region in REGION_ORDER:
+    p0(f"      {REGION_LABELS[region]}: C={best_chunks[region]}")
 
 p0(f"\n  Per-region AR trickle size (BDP, size-dependent BW):")
 p0(f"    safety = {bdp_result['safety_factor']}")
@@ -445,10 +426,8 @@ for region in REGION_ORDER:
         p0(f"    {REGION_LABELS[region]}: {label}  (no data)")
 
 p0(f"\n  推荐设置:")
-p0(f"    moe_combine_chunks  = {best_chunks[0]}")
-p0(f"    moe_dispatch_chunks = {best_chunks[1]}")
-p0(f"    attn_proj_chunks    = {best_chunks[2]}")
-p0(f"    attn_qkv_chunks     = {best_chunks[3]}")
+for region in REGION_ORDER:
+    p0(f"    {REGION_ATTRS[region]} = {best_chunks[region]}")
 p0(f"    scheduler.ar_trickle_sizes = {{")
 for region in REGION_ORDER:
     mb = bdp_per_region.get(region, 0)
@@ -456,10 +435,10 @@ for region in REGION_ORDER:
 p0(f"    }}")
 
 persist_updates = {
-    "moe_combine_chunks": best_chunks[0],
-    "moe_dispatch_chunks": best_chunks[1],
-    "attn_proj_chunks": best_chunks[2],
-    "attn_qkv_chunks": best_chunks[3],
+    "moe_combine_chunks": best_chunks['moe_combine'],
+    "moe_dispatch_chunks": best_chunks['moe_dispatch'],
+    "attn_proj_chunks": best_chunks['attn_proj'],
+    "attn_qkv_chunks": best_chunks['attn_qkv'],
     "ar_trickle_sizes": {
         region: int(bdp_per_region.get(region, 0)) * 1024 * 1024
         for region in REGION_ORDER

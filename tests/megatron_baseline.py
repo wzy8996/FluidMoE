@@ -120,7 +120,7 @@ class MegatronBaselineTransformerModel(nn.Module):
             moe_router_load_balancing_type="none",
             moe_aux_loss_coeff=0.0,
             moe_expert_capacity_factor=moe_capacity,
-            moe_pad_expert_input_to_capacity=False,
+            moe_pad_expert_input_to_capacity=(moe_capacity is not None),
             moe_grouped_gemm=True,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,

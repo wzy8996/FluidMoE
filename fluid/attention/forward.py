@@ -27,6 +27,7 @@ import torch.distributed as dist
 from typing import Tuple, Optional
 
 from fluid.core.comm import MultiCardOverlapContext
+from fluid.moe.forward import _get_group_ranks
 
 
 def qkv_projection_p2p_forward(
@@ -68,7 +69,7 @@ def qkv_projection_p2p_forward(
     cp_size = cp_group.size()
     my_rank = cp_group.rank()
     # Build local-to-global rank mapping for P2P ops
-    global_ranks = dist.get_process_group_ranks(cp_group)
+    global_ranks = _get_group_ranks(cp_group)
     device = tokens.device
     dtype = tokens.dtype
 
@@ -261,7 +262,7 @@ def output_projection_p2p_forward(
     cp_size = cp_group.size()
     my_rank = cp_group.rank()
     # Build local-to-global rank mapping for P2P ops
-    global_ranks = dist.get_process_group_ranks(cp_group)
+    global_ranks = _get_group_ranks(cp_group)
     device = attn_output.device
     dtype = attn_output.dtype
 
