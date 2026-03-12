@@ -9,7 +9,6 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
 MODEL="${MODEL:-mixtral_8x7b}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 read_default() {
   local key="$1"
@@ -37,10 +36,12 @@ EP_SIZE="${EP_SIZE:-$(read_default ep_size)}"
 WARMUP="${WARMUP:-$(read_default warmup)}"
 ITERS="${ITERS:-$(read_default iters)}"
 
+NPROC_PER_NODE=$(( DP_SIZE * CP_SIZE ))
+
 echo "============================================================"
 echo "Run All Block Benchmarks"
 echo "  model=${MODEL}"
-echo "  nproc_per_node=${NPROC_PER_NODE}"
+echo "  nproc_per_node=${NPROC_PER_NODE} (dp=${DP_SIZE} * cp=${CP_SIZE})"
 echo "  dp=${DP_SIZE} cp=${CP_SIZE} ep=${EP_SIZE}"
 echo "============================================================"
 echo
@@ -72,6 +73,7 @@ echo
 echo "[3/3] Overlap Analysis"
 "${TORCHRUN_BIN}" --nproc_per_node="${NPROC_PER_NODE}" \
   tools/overlap_ratio_analyzer.py --model "${MODEL}" \
+  --dp-size "${DP_SIZE}" --cp-size "${CP_SIZE}" --ep-size "${EP_SIZE}" \
   --warmup "${WARMUP}" --iters "${ITERS}" | tee "${OVERLAP_LOG}"
 echo
 

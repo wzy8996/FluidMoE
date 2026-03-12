@@ -18,6 +18,11 @@ from experiment_configs import get_block_benchmark_defaults
 from model_configs import get_model_config, list_model_names
 
 
+class _NullScheduler:
+    def clear_iteration(self):
+        return None
+
+
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
@@ -105,7 +110,21 @@ def main():
 
     assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
     assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+    assert world_size == num_gpus, (
+        f"world_size={world_size} != dp*cp={num_gpus}, "
+        f"多余的 {world_size - num_gpus} 个进程会直接退出。"
+        f"请设置 NPROC_PER_NODE={num_gpus} 或调整 dp/cp"
+    )
     assert seq_len % cp_size == 0, f"seq_len={seq_len} 不能被 cp_size={cp_size} 整除"
+    assert num_experts % ep_size == 0, (
+        f"num_experts={num_experts} 不能被 ep_size={ep_size} 整除"
+    )
+    assert num_heads % cp_size == 0, (
+        f"num_heads={num_heads} 不能被 cp_size={cp_size} 整除"
+    )
+    assert num_kv_heads % cp_size == 0, (
+        f"num_kv_heads={num_kv_heads} 不能被 cp_size={cp_size} 整除"
+    )
     seq_local = seq_len // cp_size
 
     if rank >= num_gpus:
@@ -142,16 +161,14 @@ def main():
         p0(rank, f"  chunks: R1={args.moe_combine_chunks}, R2={args.moe_dispatch_chunks}, R3={args.attn_proj_chunks}, R4={args.attn_qkv_chunks}")
     p0(rank, "=" * 60)
 
-    from fluid.core.scheduler import get_backward_scheduler
-    from fluid.layer import TransformerModel
-    from megatron_baseline import MegatronBaselineTransformerModel
-
     x = torch.randn(seq_local, batch_size, hidden_size, dtype=torch.bfloat16, device=device)
     x_grad = x.clone().detach().requires_grad_(True)
     ev_s = torch.cuda.Event(enable_timing=True)
     ev_e = torch.cuda.Event(enable_timing=True)
 
     if args.impl == "megatron":
+        from megatron_baseline import MegatronBaselineTransformerModel
+
         model = MegatronBaselineTransformerModel(
             num_layers=num_layers,
             hidden_size=hidden_size,
@@ -168,7 +185,7 @@ def main():
             dtype=torch.bfloat16,
             device=device,
         )
-        scheduler = get_backward_scheduler()
+        scheduler = _NullScheduler()
 
         def run_megatron_bwd():
             x_grad.grad = None
@@ -198,6 +215,9 @@ def main():
         p0(rank, "Done!")
         return
 
+    from fluid.core.scheduler import get_backward_scheduler
+    from fluid.layer import TransformerModel
+
     ar_trickle_sizes = get_block_benchmark_defaults()["ar_trickle_sizes"]
     fluidmoe_model = TransformerModel(
         num_layers=num_layers,
@@ -218,6 +238,9 @@ def main():
         dtype=torch.bfloat16,
         device=device,
     )
+    chunk_messages = fluidmoe_model.prepare_chunk_status(x)
+    if chunk_messages:
+        p0(rank, "[FluidMoE][chunk-check] " + " | ".join(chunk_messages))
     scheduler = get_backward_scheduler()
     scheduler.enable()
     scheduler.configure_allreduce(

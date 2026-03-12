@@ -25,9 +25,13 @@ from fluid.core.scheduler import get_backward_scheduler
 
 
 def parse_args():
+    defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="Overlap ratio analyzer")
     parser.add_argument("--model", type=str, default="qwen_moe_a2_7b")
     parser.add_argument("--list-models", action="store_true")
+    parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
+    parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])
+    parser.add_argument("--ep-size", type=int, default=defaults["ep_size"])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--mode", choices=["sync", "interleaved"], default="interleaved")
@@ -65,9 +69,9 @@ def main():
     attn_proj_chunks = int(bench_defaults.get("attn_proj_chunks", 1))
     attn_qkv_chunks = int(bench_defaults.get("attn_qkv_chunks", 1))
     ar_trickle_sizes = bench_defaults.get("ar_trickle_sizes", {})
-    dp_size = int(bench_defaults.get("dp_size", 1))
-    cp_size = int(bench_defaults.get("cp_size", 2))
-    ep_size = int(bench_defaults.get("ep_size", 2))
+    dp_size = args.dp_size
+    cp_size = args.cp_size
+    ep_size = args.ep_size
 
     assert ep_size == cp_size
     num_gpus = dp_size * cp_size
@@ -109,6 +113,11 @@ def main():
         capacity_factor=capacity_factor,
         dtype=torch.bfloat16, device=device,
     )
+    chunk_messages = model.prepare_chunk_status(x=torch.empty(
+        seq_local, batch_size, hidden_size, dtype=torch.bfloat16, device=device
+    ))
+    if rank == 0 and chunk_messages:
+        print("[FluidMoE][chunk-check] " + " | ".join(chunk_messages), flush=True)
 
     scheduler = get_backward_scheduler()
     scheduler.enable()

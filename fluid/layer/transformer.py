@@ -813,6 +813,7 @@ class TransformerLayer(nn.Module):
         self.activation_func = activation_func or te_gelu
         self.capacity_factor = capacity_factor
         self._moe_chunk_config = None  # lazily computed on first forward
+        self._moe_chunk_signature = None
 
         # Apply per-region AR trickle sizes to scheduler singleton
         if ar_trickle_sizes is not None:
@@ -862,6 +863,28 @@ class TransformerLayer(nn.Module):
         nn.init.xavier_uniform_(self.moe_w1)
         nn.init.xavier_uniform_(self.moe_w2)
 
+    def _build_moe_chunk_config(self, x: torch.Tensor):
+        """Build static MoE chunk config for the current input shape."""
+        signature = (int(x.shape[0]), int(x.shape[1]))
+        if self.capacity_factor <= 0:
+            return None, None, signature
+
+        seq_len, batch_size, _ = x.shape
+        num_tokens = seq_len * batch_size
+        nle = self.num_experts // self.ep_group.size()
+        cap = int(math.ceil(
+            num_tokens * self.top_k / self.num_experts * self.capacity_factor))
+        from fluid.moe.backward import build_moe_chunk_config
+        cfg = build_moe_chunk_config(
+            num_local_experts=nle,
+            ep_size=self.ep_group.size(),
+            cap=cap,
+            moe_combine_chunks=self.moe_combine_chunks,
+            moe_dispatch_chunks=self.moe_dispatch_chunks,
+            device=x.device,
+        )
+        return cfg, cap, signature
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
@@ -872,22 +895,12 @@ class TransformerLayer(nn.Module):
         Returns:
             [seq, batch, hidden] output tensor
         """
-        # Lazy-init static chunk config for padded MoE backward
-        if self.capacity_factor > 0 and self._moe_chunk_config is None:
-            seq_len, batch_size, _ = x.shape
-            num_tokens = seq_len * batch_size
-            nle = self.num_experts // self.ep_group.size()
-            cap = int(math.ceil(
-                num_tokens * self.top_k / self.num_experts * self.capacity_factor))
-            from fluid.moe.backward import build_moe_chunk_config
-            self._moe_chunk_config = build_moe_chunk_config(
-                num_local_experts=nle,
-                ep_size=self.ep_group.size(),
-                cap=cap,
-                moe_combine_chunks=self.moe_combine_chunks,
-                moe_dispatch_chunks=self.moe_dispatch_chunks,
-                device=x.device,
-            )
+        # Lazy-init static chunk config for padded MoE backward.
+        signature = (int(x.shape[0]), int(x.shape[1]))
+        if self.capacity_factor > 0 and (
+            self._moe_chunk_config is None or self._moe_chunk_signature != signature
+        ):
+            self._moe_chunk_config, _, self._moe_chunk_signature = self._build_moe_chunk_config(x)
 
         return TransformerLayerFunction.apply(
             x,
@@ -934,6 +947,7 @@ class TransformerModel(nn.Module):
         device: Optional[torch.device] = None,
     ):
         super().__init__()
+        self._chunk_check_signature = None
 
         self.layers = nn.ModuleList([
             TransformerLayer(
@@ -958,6 +972,63 @@ class TransformerModel(nn.Module):
             )
             for i in range(num_layers)
         ])
+
+    def prepare_chunk_status(self, x: torch.Tensor):
+        """Precompute chunk config for this input shape and return one-time fallback messages."""
+        if not self.layers:
+            return []
+
+        signature = (int(x.shape[0]), int(x.shape[1]))
+        if self._chunk_check_signature == signature:
+            return []
+
+        layer0 = self.layers[0]
+        seq_local, batch_size, _ = x.shape
+        cp_size = layer0.cp_group.size()
+        seq_full = seq_local * cp_size
+        messages = []
+
+        if layer0.capacity_factor > 0:
+            moe_cfg, cap, _ = layer0._build_moe_chunk_config(x)
+            for layer in self.layers:
+                layer._moe_chunk_config = moe_cfg
+                layer._moe_chunk_signature = signature
+
+            if layer0.moe_combine_chunks > 1 and (moe_cfg is None or moe_cfg.get("r1") is None):
+                messages.append(
+                    f"R1 moe_combine_chunks={layer0.moe_combine_chunks} will fallback to 1 "
+                    f"(cap={cap} is not divisible)"
+                )
+            if layer0.moe_dispatch_chunks > 1 and (moe_cfg is None or moe_cfg.get("r2") is None):
+                messages.append(
+                    f"R2 moe_dispatch_chunks={layer0.moe_dispatch_chunks} will fallback to 1 "
+                    f"(cap={cap} is not divisible)"
+                )
+        else:
+            if layer0.moe_combine_chunks > 1:
+                messages.append(
+                    "R1 moe_combine_chunks cannot be prevalidated because capacity_factor<=0 "
+                    "(runtime MoE splits are dynamic)"
+                )
+            if layer0.moe_dispatch_chunks > 1:
+                messages.append(
+                    "R2 moe_dispatch_chunks cannot be prevalidated because capacity_factor<=0 "
+                    "(runtime MoE splits are dynamic)"
+                )
+
+        if layer0.attn_proj_chunks > 1 and seq_local % layer0.attn_proj_chunks != 0:
+            messages.append(
+                f"R3 attn_proj_chunks={layer0.attn_proj_chunks} will fallback to 1 "
+                f"(seq_local={seq_local} is not divisible)"
+            )
+        if layer0.attn_qkv_chunks > 1 and seq_full % layer0.attn_qkv_chunks != 0:
+            messages.append(
+                f"R4 attn_qkv_chunks={layer0.attn_qkv_chunks} will fallback to 1 "
+                f"(seq_full={seq_full} is not divisible)"
+            )
+
+        self._chunk_check_signature = signature
+        return messages
 
     def setup_ar_buffer(self):
         """Set up flat AR buffers for zero-copy trickle slicing.
