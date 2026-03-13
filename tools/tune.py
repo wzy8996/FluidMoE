@@ -80,7 +80,10 @@ num_gpus = dp_size * cp_size
 N_ITER = int(tune_defaults["chunk_search_iters"])              # 测量轮数
 MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大候选分块数
 MIN_SAVING = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值(ms)
-CHUNK_CANDIDATES = [2**i for i in range(MAX_C.bit_length()) if 2**i <= MAX_C]
+# 候选受限于本 rank 上的专家数 nle（expert-dim 切分要求 C | nle）
+_nle = num_experts // ep_size
+_effective_max = min(MAX_C, _nle)
+CHUNK_CANDIDATES = [2**i for i in range(_effective_max.bit_length()) if 2**i <= _effective_max]
 if 1 not in CHUNK_CANDIDATES:
     CHUNK_CANDIDATES.insert(0, 1)
 

@@ -28,7 +28,7 @@ import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
 from fluid.core import _all_to_all
-from fluid.core.triton_kernels import row_gather
+from fluid.core.triton_kernels import row_gather, unpermute_by_row_idx as row_scatter
 from fluid.core.scheduler import get_backward_scheduler
 from fluid.core.nvtx import nvtx_range_push, nvtx_range_pop
 from fluid.moe.forward import (
@@ -99,6 +99,48 @@ def _get_chunk_row_indices(
     return row_idx_r2e, row_idx_e2r
 
 
+_SCATTER_IDX_CACHE = {}
+
+
+def _build_chunk_scatter_indices(
+    nle: int, ep_size: int, cap: int, num_chunks: int, device: torch.device,
+) -> List[torch.Tensor]:
+    """Precompute per-chunk scatter index: chunk-expert-major → final expert-major.
+
+    For chunk c, scatter_idx[j] gives the flat row in the final expert-major
+    buffer [nle, ep_size, cap, D] where chunk-expert-major position j should go.
+
+    Chunk-expert-major layout (chunk_total rows):
+      expert e, rank r, token t  →  j = e * ep_size * cap_c + r * cap_c + t
+    Final expert-major layout (total rows):
+      expert e, rank r, token t  →  flat = e * ep_size * cap + r * cap + c * cap_c + t
+    """
+    key = (nle, ep_size, cap, num_chunks, device.type,
+           device.index if device.index is not None else -1)
+    cached = _SCATTER_IDX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cap_c = cap // num_chunks
+    chunk_total = nle * ep_size * cap_c
+
+    # Vectorised: compute all j → flat mappings at once
+    j = torch.arange(chunk_total, dtype=torch.int64, device=device)
+    e = j // (ep_size * cap_c)
+    rem = j % (ep_size * cap_c)
+    r = rem // cap_c
+    t = rem % cap_c
+    # base = e * ep_size * cap + r * cap  (independent of c)
+    base = e * (ep_size * cap) + r * cap
+
+    indices = []
+    for c in range(num_chunks):
+        indices.append(base + c * cap_c + t)
+
+    _SCATTER_IDX_CACHE[key] = indices
+    return indices
+
+
 def build_moe_chunk_config(
     num_local_experts: int,
     ep_size: int,
@@ -125,32 +167,72 @@ def build_moe_chunk_config(
         S=S, total=total, splits=splits,
     )
 
-    # R1 (combine): needs row_r2e
-    if moe_combine_chunks > 1 and cap % moe_combine_chunks == 0:
-        cap_c = cap // moe_combine_chunks
+    # R1 (combine): prefer expert-dim chunking (zero scatter), fall back to cap-dim
+    C1 = moe_combine_chunks
+    if C1 > 1 and nle % C1 == 0:
+        # Expert-dim chunking: split nle into C1 groups → contiguous output per chunk
+        nle_c = nle // C1
+        chunk_S = nle_c * cap
+        row_r2e, _ = _get_chunk_row_indices(nle_c, ep_size, cap, device)
+        cfg['r1'] = dict(
+            mode='expert', num_chunks=C1, nle_c=nle_c,
+            chunk_S=chunk_S, chunk_total=ep_size * chunk_S,
+            chunk_splits=[chunk_S] * ep_size,
+            chunk_tpe=[ep_size * cap] * nle_c,
+            row_r2e=row_r2e,
+        )
+    elif C1 > 1 and cap % C1 == 0:
+        # Cap-dim chunking: split cap → needs scatter
+        cap_c = cap // C1
         chunk_S = nle * cap_c
         row_r2e, _ = _get_chunk_row_indices(nle, ep_size, cap_c, device)
+        scatter_indices = _build_chunk_scatter_indices(
+            nle, ep_size, cap, C1, device)
         cfg['r1'] = dict(
-            num_chunks=moe_combine_chunks, cap_c=cap_c,
+            mode='cap', num_chunks=C1, cap_c=cap_c,
             chunk_S=chunk_S, chunk_total=ep_size * chunk_S,
             chunk_splits=[chunk_S] * ep_size,
             chunk_tpe=[ep_size * cap_c] * nle,
             row_r2e=row_r2e,
+            scatter_idx=scatter_indices,
         )
     else:
         cfg['r1'] = None
 
-    # R2 (dispatch): needs row_e2r
-    if moe_dispatch_chunks > 1 and cap % moe_dispatch_chunks == 0:
-        cap_c = cap // moe_dispatch_chunks
+    # R2 (dispatch): prefer expert-dim chunking, fall back to cap-dim
+    C2 = moe_dispatch_chunks
+    if C2 > 1 and nle % C2 == 0:
+        # Expert-dim: input is contiguous, reassembly uses strided copy
+        nle_c = nle // C2
+        chunk_S = nle_c * cap
+        _, row_e2r = _get_chunk_row_indices(nle_c, ep_size, cap, device)
+        cfg['r2'] = dict(
+            mode='expert', num_chunks=C2, nle_c=nle_c,
+            chunk_S=chunk_S, chunk_total=ep_size * chunk_S,
+            chunk_splits=[chunk_S] * ep_size,
+            chunk_tpe=[ep_size * cap] * nle_c,
+            row_e2r=row_e2r,
+        )
+    elif C2 > 1 and cap % C2 == 0:
+        # Cap-dim: needs scatter for reassembly
+        cap_c = cap // C2
         chunk_S = nle * cap_c
         _, row_e2r = _get_chunk_row_indices(nle, ep_size, cap_c, device)
+        chunk_total_r2 = ep_size * chunk_S
+        j = torch.arange(chunk_total_r2, dtype=torch.int64, device=device)
+        r = j // (nle * cap_c)
+        rem = j % (nle * cap_c)
+        e = rem // cap_c
+        t = rem % cap_c
+        base_r2 = r * (nle * cap) + e * cap
+        r2_scatter = [base_r2 + c * cap_c + t for c in range(C2)]
         cfg['r2'] = dict(
-            num_chunks=moe_dispatch_chunks, cap_c=cap_c,
-            chunk_S=chunk_S, chunk_total=ep_size * chunk_S,
+            mode='cap', num_chunks=C2, cap_c=cap_c,
+            chunk_S=chunk_S, chunk_total=chunk_total_r2,
             chunk_splits=[chunk_S] * ep_size,
             chunk_tpe=[ep_size * cap_c] * nle,
             row_e2r=row_e2r,
+            scatter_idx=r2_scatter,
         )
     else:
         cfg['r2'] = None
@@ -595,8 +677,11 @@ def combine_fc2_backward(
         elif (input_splits_list[0] % num_chunks != 0 or
               output_splits_list[0] % num_chunks != 0):
             num_chunks = 1
-        elif (input_splits_list[0] // num_local_experts) % num_chunks != 0:
-            num_chunks = 1  # cap not divisible by C
+        else:
+            _cap = input_splits_list[0] // num_local_experts
+            # Accept if either expert-dim (nle % C) or cap-dim (cap % C) works
+            if num_local_experts % num_chunks != 0 and _cap % num_chunks != 0:
+                num_chunks = 1
 
     if all_expert_tokens is None:
         raise RuntimeError("combine_fc2_backward requires pre-computed all_expert_tokens from forward.")
@@ -681,18 +766,18 @@ def combine_fc2_backward(
         )
 
     # ========================================================================
-    # Chunked communication-first pipeline (token-dimension)
-    # Each chunk has all nle experts, cap/C tokens per expert per rank.
-    # Per-chunk overlap: wait → layout convert → FC2 dx (full weights)
+    # Chunked communication-first pipeline
+    # Two modes: expert-dim (zero scatter) or cap-dim (with scatter fallback)
+    # Per-chunk overlap: wait → layout convert → FC2 dx
     # ========================================================================
     nvtx_range_push("combine_fc2_chunked")
 
+    _r1_mode = _r1_cfg.get('mode', 'cap') if _r1_cfg is not None else 'cap'
+
     if _r1_cfg is not None:
-        # Use pre-computed static shapes
         nle = chunk_config['nle']
         ep_size = chunk_config['ep_size']
         cap = chunk_config['cap']
-        cap_c = _r1_cfg['cap_c']
         chunk_S_send = chunk_S_recv = _r1_cfg['chunk_S']
         chunk_total = _r1_cfg['chunk_total']
         chunk_send_splits = chunk_recv_splits = _r1_cfg['chunk_splits']
@@ -702,28 +787,44 @@ def combine_fc2_backward(
         S_send = input_splits_list[0]
         S_recv = output_splits_list[0]
         cap = S_send // nle
-        cap_c = cap // num_chunks
         chunk_S_send = S_send // num_chunks
         chunk_S_recv = S_recv // num_chunks
         chunk_total = ep_size * chunk_S_recv
         chunk_send_splits = [chunk_S_send] * ep_size
         chunk_recv_splits = [chunk_S_recv] * ep_size
+        # Determine mode dynamically
+        if nle % num_chunks == 0:
+            _r1_mode = 'expert'
+        else:
+            _r1_mode = 'cap'
 
-    # Step 1: Rearrange to chunk-first (split token dim within each expert)
-    # [ep, nle, cap, H] → [ep, nle, C, cap_c, H] → [C, ep, nle, cap_c, H]
+    # Step 1: Rearrange to chunk-first layout
     nvtx_range_push("rearrange_submit")
     grad_output_contig = grad_output.contiguous()
     _combine_in_all = _BWD_POOL.get_2d(
         tag="combine_input_chunks_tok", rows=total_output, cols=hidden_size,
         dtype=dtype, device=device,
     )
-    _combine_in_all.view(
-        num_chunks, ep_size, nle, cap_c, hidden_size
-    ).copy_(
-        grad_output_contig.view(
-            ep_size, nle, num_chunks, cap_c, hidden_size
-        ).permute(2, 0, 1, 3, 4)
-    )
+    if _r1_mode == 'expert':
+        # Expert-dim: [ep, nle, cap, H] = [ep, C, nle_c, cap, H] → [C, ep, nle_c, cap, H]
+        nle_c = _r1_cfg['nle_c'] if _r1_cfg is not None else nle // num_chunks
+        _combine_in_all.view(
+            num_chunks, ep_size, nle_c, cap, hidden_size
+        ).copy_(
+            grad_output_contig.view(
+                ep_size, num_chunks, nle_c, cap, hidden_size
+            ).permute(1, 0, 2, 3, 4)
+        )
+    else:
+        # Cap-dim: [ep, nle, cap, H] = [ep, nle, C, cap_c, H] → [C, ep, nle, cap_c, H]
+        cap_c = _r1_cfg['cap_c'] if _r1_cfg is not None else cap // num_chunks
+        _combine_in_all.view(
+            num_chunks, ep_size, nle, cap_c, hidden_size
+        ).copy_(
+            grad_output_contig.view(
+                ep_size, nle, num_chunks, cap_c, hidden_size
+            ).permute(2, 0, 1, 3, 4)
+        )
     _combine_out_all = _BWD_POOL.get_2d(
         tag="combine_output_chunks_tok", rows=total_recv, cols=hidden_size,
         dtype=dtype, device=device,
@@ -756,7 +857,19 @@ def combine_fc2_backward(
     # Step 4: dW tasks overlap with AllToAll
     _maybe_execute_dw_tasks(scheduler, for_dispatch=False)
 
-    # Prepare output buffers (full expert-major tensors)
+    # Chunk layout index
+    if _r1_cfg is not None:
+        chunk_row_r2e = _r1_cfg['row_r2e']
+        chunk_tpe = _r1_cfg['chunk_tpe']
+    else:
+        if _r1_mode == 'expert':
+            chunk_row_r2e, _ = _get_chunk_row_indices(nle_c, ep_size, cap, device)
+            chunk_tpe = [ep_size * cap] * nle_c
+        else:
+            chunk_row_r2e, _ = _get_chunk_row_indices(nle, ep_size, cap_c, device)
+            chunk_tpe = [ep_size * cap_c] * nle
+
+    # Allocate final expert-major buffers
     if _should_keep_grad_all_fc2_stable():
         grad_all_fc2 = torch.empty(total_recv, hidden_size, dtype=dtype, device=device)
     else:
@@ -769,49 +882,56 @@ def combine_fc2_backward(
         dtype=dtype, device=device,
     )
 
-    # Chunk layout index for (nle, ep_size, cap_c)
-    if _r1_cfg is not None:
-        chunk_row_r2e = _r1_cfg['row_r2e']
-        chunk_tpe = _r1_cfg['chunk_tpe']
+    # Step 5: Per-chunk compute
+    if _r1_mode == 'expert':
+        # Expert-dim: each chunk writes to a contiguous slice → zero scatter
+        for c in range(num_chunks):
+            is_last = (c == num_chunks - 1)
+            nvtx_range_push(f"chunk_{c}")
+            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
+
+            off = c * chunk_total
+            chunk_recv = _combine_out_all[off:off + chunk_total]
+
+            # R2E directly into final buffer (contiguous slice)
+            fc2_slice = grad_all_fc2[off:off + chunk_total]
+            row_gather(chunk_recv, chunk_row_r2e, out=fc2_slice)
+
+            # FC2 dx directly into final buffer (contiguous slice)
+            act_slice = grad_exp_act[off:off + chunk_total]
+            grouped_fc2_dx(fc2_slice, weight2[c * nle_c:(c + 1) * nle_c],
+                           chunk_tpe, out=act_slice)
+            nvtx_range_pop()
     else:
-        chunk_row_r2e, _ = _get_chunk_row_indices(nle, ep_size, cap_c, device)
-        chunk_tpe = [ep_size * cap_c] * nle
+        # Cap-dim: needs scatter via precomputed indices
+        _fc2_chunk_buf = _BWD_POOL.get_2d(
+            tag="combine_fc2_chunk_buf", rows=chunk_total, cols=hidden_size,
+            dtype=dtype, device=device,
+        )
+        _act_chunk_buf = _BWD_POOL.get_2d(
+            tag="combine_act_chunk_buf", rows=chunk_total, cols=ffn_hidden,
+            dtype=dtype, device=device,
+        )
+        if _r1_cfg is not None:
+            scatter_indices = _r1_cfg['scatter_idx']
+        else:
+            scatter_indices = _build_chunk_scatter_indices(
+                nle, ep_size, cap, num_chunks, device)
 
-    # Temp buffer for per-chunk layout convert
-    _chunk_fc2 = _BWD_POOL.get_2d(
-        tag="chunk_fc2_temp", rows=chunk_total, cols=hidden_size,
-        dtype=dtype, device=device,
-    )
+        for c in range(num_chunks):
+            is_last = (c == num_chunks - 1)
+            nvtx_range_push(f"chunk_{c}")
+            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
 
-    # 4D views for strided scatter into full expert-major tensors
-    grad_fc2_4d = grad_all_fc2.view(nle, ep_size, cap, hidden_size)
-    grad_act_4d = grad_exp_act.view(nle, ep_size, cap, ffn_hidden)
+            off_r = c * chunk_total
+            chunk_recv = _combine_out_all[off_r:off_r + chunk_total]
+            scatter_c = scatter_indices[c]
 
-    # Step 5: Per-chunk wait → layout convert → FC2 dx → scatter
-    for c in range(num_chunks):
-        is_last = (c == num_chunks - 1)
-        nvtx_range_push(f"chunk_{c}")
-        scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
-
-        off_r = c * chunk_total
-        chunk_recv = _combine_out_all[off_r:off_r + chunk_total]
-
-        # Layout convert: rank-major → expert-major for this chunk
-        row_gather(chunk_recv, chunk_row_r2e, out=_chunk_fc2)
-
-        # Scatter into full expert-major grad_all_fc2
-        t0 = c * cap_c
-        t1 = t0 + cap_c
-        grad_fc2_4d[:, :, t0:t1, :].copy_(_chunk_fc2.view(nle, ep_size, cap_c, hidden_size))
-
-        # FC2 dx with full weights, fewer tokens per expert
-        # Don't pass out= to avoid extra copy when GroupedGEMM is used;
-        # scatter directly from the returned tensor.
-        _chunk_act_result = grouped_fc2_dx(_chunk_fc2, weight2, chunk_tpe)
-
-        # Scatter into full expert-major grad_exp_act
-        grad_act_4d[:, :, t0:t1, :].copy_(_chunk_act_result.view(nle, ep_size, cap_c, ffn_hidden))
-        nvtx_range_pop()
+            row_gather(chunk_recv, chunk_row_r2e, out=_fc2_chunk_buf)
+            row_scatter(_fc2_chunk_buf, scatter_c, grad_all_fc2)
+            grouped_fc2_dx(_fc2_chunk_buf, weight2, chunk_tpe, out=_act_chunk_buf)
+            row_scatter(_act_chunk_buf, scatter_c, grad_exp_act)
+            nvtx_range_pop()
 
     # Step 6: Activation backward on full expert-major tensor
     nvtx_range_push("act_backward")
@@ -847,13 +967,12 @@ def fc1_dispatch_backward(
     Region 2: FC1 dx + Dispatch AllToAll (compute-first pipeline).
 
     Pipeline (token-dim chunking, C chunks of cap/C tokens per expert per rank):
-      1. Rearrange grad_all_fc1 to chunk-first expert-major
-      2. Per chunk: FC1 dx (full weights) → layout convert → submit AllToAll
-      3. dW tasks overlap with remaining AllToAll
-      4. Wait all chunks → reassemble grad_tokens
+      1. Per chunk: lazy-extract from expert-major → FC1 dx → layout convert → submit AllToAll
+      2. dW tasks overlap with remaining AllToAll
+      3. Wait all chunks → reassemble grad_tokens
 
-    default_stream: |rearrange|fc1dx0+lc0+submit0|fc1dx1+lc1+submit1|...|dW|wait+reassemble|
-    comm_stream:                            |A2A_0|A2A_1|...|A2A_{C-1}|
+    default_stream: |extract0+fc1dx0+lc0+submit0|extract1+fc1dx1+...|dW|wait+reassemble|
+    comm_stream:                           |A2A_0|A2A_1|...|A2A_{C-1}|
 
     Args:
         grad_all_fc1: [total_recv, ffn_hidden] gradient w.r.t. FC1 output
@@ -889,8 +1008,10 @@ def fc1_dispatch_backward(
         elif (input_splits_list[0] % num_chunks != 0 or
               output_splits_list[0] % num_chunks != 0):
             num_chunks = 1
-        elif (output_splits_list[0] // num_local_experts) % num_chunks != 0:
-            num_chunks = 1  # cap not divisible by C
+        else:
+            _cap = output_splits_list[0] // num_local_experts
+            if num_local_experts % num_chunks != 0 and _cap % num_chunks != 0:
+                num_chunks = 1
 
     total_send = sum(input_splits_list)
 
@@ -949,18 +1070,18 @@ def fc1_dispatch_backward(
         return grad_tokens
 
     # ========================================================================
-    # Chunked compute-first pipeline (token-dimension)
-    # Each chunk has all nle experts, cap/C tokens per expert per rank.
-    # Per-chunk overlap: FC1 dx (full weights) → layout convert → submit AllToAll
+    # Chunked compute-first pipeline
+    # Two modes: expert-dim (zero scatter/extract) or cap-dim (with scatter)
+    # Per-chunk overlap: FC1 dx → layout convert → submit AllToAll
     # ========================================================================
     nvtx_range_push("fc1_dispatch_chunked")
 
+    _r2_mode = _r2_cfg.get('mode', 'cap') if _r2_cfg is not None else 'cap'
+
     if _r2_cfg is not None:
-        # Use pre-computed static shapes
         nle = chunk_config['nle']
         ep_size = chunk_config['ep_size']
         cap = chunk_config['cap']
-        cap_c = _r2_cfg['cap_c']
         chunk_S_send = chunk_S_recv = _r2_cfg['chunk_S']
         chunk_total = _r2_cfg['chunk_total']
         chunk_send_splits = chunk_recv_splits = _r2_cfg['chunk_splits']
@@ -972,31 +1093,22 @@ def fc1_dispatch_backward(
         S_a2a_send = output_splits_list[0]
         S_a2a_recv = input_splits_list[0]
         cap = S_a2a_send // nle
-        cap_c = cap // num_chunks
         chunk_S_send = S_a2a_send // num_chunks
         chunk_S_recv = S_a2a_recv // num_chunks
         chunk_total = ep_size * chunk_S_send
         chunk_send_splits = [chunk_S_send] * ep_size
         chunk_recv_splits = [chunk_S_recv] * ep_size
-        _, chunk_row_e2r = _get_chunk_row_indices(nle, ep_size, cap_c, device)
-        chunk_tpe = [ep_size * cap_c] * nle
+        if nle % num_chunks == 0:
+            _r2_mode = 'expert'
+            nle_c = nle // num_chunks
+            _, chunk_row_e2r = _get_chunk_row_indices(nle_c, ep_size, cap, device)
+            chunk_tpe = [ep_size * cap] * nle_c
+        else:
+            _r2_mode = 'cap'
+            cap_c = cap // num_chunks
+            _, chunk_row_e2r = _get_chunk_row_indices(nle, ep_size, cap_c, device)
+            chunk_tpe = [ep_size * cap_c] * nle
     ffn_hidden_size = grad_all_fc1.shape[1]
-
-    # Step 1: Rearrange grad_all_fc1 to chunk-first expert-major
-    # [nle, ep, cap, F] → [nle, ep, C, cap_c, F] → [C, nle, ep, cap_c, F]
-    nvtx_range_push("rearrange_fc1")
-    _fc1_chunked = _BWD_POOL.get_2d(
-        tag="dispatch_fc1_chunked", rows=total_recv, cols=ffn_hidden_size,
-        dtype=dtype, device=device,
-    )
-    _fc1_chunked.view(
-        num_chunks, nle, ep_size, cap_c, ffn_hidden_size
-    ).copy_(
-        grad_all_fc1.view(
-            nle, ep_size, num_chunks, cap_c, ffn_hidden_size
-        ).permute(2, 0, 1, 3, 4)
-    )
-    nvtx_range_pop()
 
     # Allocate AllToAll buffers (per-chunk slices, no aliasing)
     _dispatch_in_all = _BWD_POOL.get_2d(
@@ -1008,7 +1120,7 @@ def fc1_dispatch_backward(
         dtype=dtype, device=device,
     )
 
-    # Step 2: Per-chunk: FC1 dx → layout convert → submit AllToAll
+    # Step 1+2: Per-chunk: extract → FC1 dx → layout convert → submit AllToAll
     task_ids = []
 
     def _make_dispatch_a2a(ib, ob):
@@ -1020,33 +1132,66 @@ def fc1_dispatch_backward(
             return ob
         return fn
 
-    for c in range(num_chunks):
-        nvtx_range_push(f"chunk_{c}")
-        off = c * chunk_total
+    if _r2_mode == 'expert':
+        nle_c = _r2_cfg['nle_c'] if _r2_cfg is not None else nle // num_chunks
+        for c in range(num_chunks):
+            nvtx_range_push(f"chunk_{c}")
+            off = c * chunk_total
 
-        # FC1 dx: full weights, fewer tokens per expert
-        chunk_grad_tokens = grouped_fc1_dx(
-            _fc1_chunked[off:off + chunk_total],
-            weight1,
-            chunk_tpe,
+            # Expert-dim: input is already contiguous — no extraction needed!
+            fc1_chunk = grad_all_fc1[off:off + chunk_total]
+
+            # FC1 dx with chunk's weight slice
+            chunk_grad_tokens = grouped_fc1_dx(
+                fc1_chunk,
+                weight1[c * nle_c:(c + 1) * nle_c],
+                chunk_tpe,
+            )
+
+            # Expert-major → rank-major layout convert
+            in_buf = _dispatch_in_all[off:off + chunk_total]
+            row_gather(chunk_grad_tokens, chunk_row_e2r, out=in_buf)
+
+            # Submit AllToAll
+            out_buf = _dispatch_out_all[off:off + chunk_total]
+            task_ids.append(scheduler.submit_alltoall(
+                _make_dispatch_a2a(in_buf, out_buf)
+            ))
+            nvtx_range_pop()
+    else:
+        cap_c = _r2_cfg['cap_c'] if _r2_cfg is not None else cap // num_chunks
+        _fc1_chunk_buf = _BWD_POOL.get_2d(
+            tag="dispatch_fc1_chunk_buf", rows=chunk_total, cols=ffn_hidden_size,
+            dtype=dtype, device=device,
         )
+        grad_all_fc1_5d = grad_all_fc1.view(nle, ep_size, cap, ffn_hidden_size)
 
-        # Expert-major → rank-major layout convert
-        in_buf = _dispatch_in_all[off:off + chunk_total]
-        row_gather(chunk_grad_tokens, chunk_row_e2r, out=in_buf)
+        for c in range(num_chunks):
+            nvtx_range_push(f"chunk_{c}")
+            off = c * chunk_total
 
-        # Submit AllToAll
-        out_buf = _dispatch_out_all[off:off + chunk_total]
-        task_ids.append(scheduler.submit_alltoall(
-            _make_dispatch_a2a(in_buf, out_buf)
-        ))
-        nvtx_range_pop()
+            # Lazy extraction: strided copy from expert-major
+            _fc1_chunk_buf.view(nle, ep_size, cap_c, ffn_hidden_size).copy_(
+                grad_all_fc1_5d[:, :, c * cap_c:(c + 1) * cap_c, :]
+            )
+
+            chunk_grad_tokens = grouped_fc1_dx(
+                _fc1_chunk_buf, weight1, chunk_tpe,
+            )
+
+            in_buf = _dispatch_in_all[off:off + chunk_total]
+            row_gather(chunk_grad_tokens, chunk_row_e2r, out=in_buf)
+
+            out_buf = _dispatch_out_all[off:off + chunk_total]
+            task_ids.append(scheduler.submit_alltoall(
+                _make_dispatch_a2a(in_buf, out_buf)
+            ))
+            nvtx_range_pop()
 
     # Step 3: dW tasks overlap with remaining AllToAll
     _maybe_execute_dw_tasks(scheduler, for_dispatch=True)
 
-    # Step 4: Wait last chunk (implies all prior chunks completed) + reassemble
-    # [C, ep, S/C, H] → [ep, C, S/C, H] → [total_send, H]
+    # Step 4: Wait all chunks + reassemble
     nvtx_range_push("wait_reassemble")
     scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids), try_trickle=True)
 
@@ -1054,15 +1199,37 @@ def fc1_dispatch_backward(
         tag="dispatch_grad_tokens", rows=total_send, cols=hidden_size,
         dtype=dtype, device=device,
     )
-    # Reassemble: [C, ep, nle, cap_c, H] → [ep, nle, C, cap_c, H] → [ep, nle*cap, H]
-    # Must interleave chunks within each expert to match non-chunked layout.
-    grad_tokens.view(
-        ep_size, nle, num_chunks, cap_c, hidden_size
-    ).copy_(
-        _dispatch_out_all.view(
-            num_chunks, ep_size, nle, cap_c, hidden_size
-        ).permute(1, 2, 0, 3, 4)
-    )
+
+    if _r2_mode == 'expert':
+        # Expert-dim reassembly: strided copy [C, ep, nle_c, cap, H] → [ep, nle, cap, H]
+        nle_c = _r2_cfg['nle_c'] if _r2_cfg is not None else nle // num_chunks
+        grad_tokens_4d = grad_tokens.view(ep_size, nle, cap, hidden_size)
+        for c in range(num_chunks):
+            off = c * chunk_total
+            grad_tokens_4d[:, c * nle_c:(c + 1) * nle_c, :, :].copy_(
+                _dispatch_out_all[off:off + chunk_total].view(
+                    ep_size, nle_c, cap, hidden_size)
+            )
+    else:
+        # Cap-dim reassembly: scatter
+        cap_c = _r2_cfg['cap_c'] if _r2_cfg is not None else cap // num_chunks
+        if _r2_cfg is not None:
+            r2_scatter_indices = _r2_cfg['scatter_idx']
+        else:
+            j = torch.arange(chunk_total, dtype=torch.int64, device=device)
+            _r = j // (nle * cap_c)
+            _rem = j % (nle * cap_c)
+            _e = _rem // cap_c
+            _t = _rem % cap_c
+            _base = _r * (nle * cap) + _e * cap
+            r2_scatter_indices = [_base + c * cap_c + _t for c in range(num_chunks)]
+        for c in range(num_chunks):
+            off = c * chunk_total
+            row_scatter(
+                _dispatch_out_all[off:off + chunk_total],
+                r2_scatter_indices[c],
+                grad_tokens,
+            )
     nvtx_range_pop()
 
     nvtx_range_pop()  # fc1_dispatch_chunked
