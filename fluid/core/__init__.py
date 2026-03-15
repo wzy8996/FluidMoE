@@ -12,12 +12,9 @@ from .comm import (
     _all_to_all,
     _all_to_all_sp2hp_forward,
     _all_to_all_hp2sp_forward,
-    _sort_chunks_by_idxs,
     # P2P Scheduling
     compute_round_robin_schedule,
     get_partner_for_round,
-    get_all_partners_ordered,
-    get_num_rounds,
     # Overlap Context
     MultiCardOverlapContext,
 )
@@ -31,9 +28,6 @@ from .nvtx import (
     nvtx_range,
     nvtx_range_push,
     nvtx_range_pop,
-    nvtx_mark,
-    nvtx_annotate,
-    Colors,
     NVTX_ENABLED,
 )
 
@@ -42,12 +36,9 @@ __all__ = [
     '_all_to_all',
     '_all_to_all_sp2hp_forward',
     '_all_to_all_hp2sp_forward',
-    '_sort_chunks_by_idxs',
     # P2P Schedule
     'compute_round_robin_schedule',
     'get_partner_for_round',
-    'get_all_partners_ordered',
-    'get_num_rounds',
     # Overlap Context
     'MultiCardOverlapContext',
     # Scheduler
@@ -57,8 +48,5 @@ __all__ = [
     'nvtx_range',
     'nvtx_range_push',
     'nvtx_range_pop',
-    'nvtx_mark',
-    'nvtx_annotate',
-    'Colors',
     'NVTX_ENABLED',
 ]

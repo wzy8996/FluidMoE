@@ -42,7 +42,7 @@ import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
 from fluid.core.comm import MultiCardOverlapContext
-from fluid.core.nvtx import nvtx_range, nvtx_range_push, nvtx_range_pop
+from fluid.core.nvtx import nvtx_range_push, nvtx_range_pop
 from fluid.core.triton_kernels import permute_by_row_idx
 
 try:
@@ -466,7 +466,6 @@ def dispatch_fc1_p2p_forward(
     activation_func,
     num_local_experts: int,
     tokens_per_expert: torch.Tensor,
-    needs_backward: bool = True,
     pre_tokens_cpu: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor]:
@@ -494,7 +493,6 @@ def dispatch_fc1_p2p_forward(
         activation_func: Activation function
         num_local_experts: Number of local experts
         tokens_per_expert: [num_global_experts] local tokens per expert from router
-        needs_backward: Whether backward is needed (unused, kept for API compatibility)
         pre_tokens_cpu: Optional [ep_size, nle] CPU int64 tensor. When provided,
             metadata piggybacking is skipped (no .cpu() syncs, no torch.cat).
 
@@ -517,10 +515,6 @@ def dispatch_fc1_p2p_forward(
     hidden_size = tokens.shape[-1]
     element_size = torch.finfo(dtype).bits // 8
     use_metadata = pre_tokens_cpu is None  # skip piggybacking when metadata is known
-
-    # Weight dimensions - weight1 is already 3D: [num_local_experts, hidden, ffn_hidden]
-    ffn_hidden = weight1.shape[-1]
-    w1 = weight1  # No permute needed - already in correct shape
 
     # Compute offsets
     input_offsets = [0]
@@ -560,7 +554,6 @@ def dispatch_fc1_p2p_forward(
     recv_buffers = {}
     if use_metadata:
         # Metadata piggybacking: encode per-expert token counts as extra row
-        send_buffers_with_metadata = {}
         int32_as_elements = 4 // element_size
         metadata_elements = num_local_experts * int32_as_elements
         for partner in partners:
@@ -571,8 +564,7 @@ def dispatch_fc1_p2p_forward(
                 metadata_row = torch.zeros(1, hidden_size, dtype=dtype, device=device)
                 metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
                 metadata_row[0, :metadata_elements] = metadata_as_dtype
-                send_buffers_with_metadata[partner] = torch.cat([metadata_row, token_chunk], dim=0)
-                send_chunks[partner] = send_buffers_with_metadata[partner]
+                send_chunks[partner] = torch.cat([metadata_row, token_chunk], dim=0)
         for partner in partners:
             recv_size = output_splits[partner]
             if recv_size > 0:
@@ -596,19 +588,15 @@ def dispatch_fc1_p2p_forward(
             offset += output_splits[i]
 
     # =========================================================================
-    # Dispatch Phase Pipeline with delayed req.wait()
-    # Key insight: Start P2P_i first, then wait for P2P_{i-1} to complete
-    # This ensures P2P_i runs in background while we process P2P_{i-1}'s data
+    # Dispatch Phase Pipeline with event-based sync (no CPU blocking)
+    # Key insight: Use CUDA events instead of req.wait() to avoid CPU idle gaps
+    # P2P_i runs on comm_stream while FC1 for P2P_{i-1}'s data runs on default_stream
     # =========================================================================
     prev_partner = None
-    prev_reqs = []
+    all_reqs = []
+    p2p_events = []
     recv_act_results = {}
     local_act = None
-
-    if use_metadata:
-        # Compute metadata layout (same as encoding)
-        _int32_as_elems = 4 // element_size
-        _meta_elems = num_local_experts * _int32_as_elems
 
     def extract_metadata_and_tokens(partner):
         """Extract metadata from received buffer and update tokens_cpu."""
@@ -616,7 +604,7 @@ def dispatch_fc1_p2p_forward(
             full_buffer = recv_buffers_with_metadata[partner]
             if use_metadata:
                 # Decode metadata from first row (GPU -> CPU sync)
-                metadata_as_dtype = full_buffer[0, :_meta_elems]
+                metadata_as_dtype = full_buffer[0, :metadata_elements]
                 metadata_int32 = metadata_as_dtype.view(torch.int8).view(torch.int32)
                 tokens_cpu[partner] = metadata_int32[:num_local_experts].cpu().to(torch.int64)
                 recv_buffers[partner] = full_buffer[1:]
@@ -637,49 +625,47 @@ def dispatch_fc1_p2p_forward(
             if partner in send_chunks:
                 p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], global_partner, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
+            all_reqs.extend(curr_reqs)
+            evt = torch.cuda.Event()
+            evt.record(comm_stream)
+            p2p_events.append(evt)
         nvtx_range_pop()
 
-        # 2. Wait for PREVIOUS round's P2P to complete (current round runs in background)
-        if round_idx > 0:
-            nvtx_range_push(f"dispatch_wait_R{round_idx-1}")
-            for req in prev_reqs:
-                req.wait()
-            nvtx_range_pop()
-
-        # 3. Extract metadata and compute FC1 + Act (overlaps with current round's P2P)
+        # 2. Compute FC1 + Act (overlaps with current round's P2P, no CPU blocking)
         nvtx_range_push(f"fc1_compute_R{round_idx}")
         if round_idx == 0:
             # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0:
-                local_act = grouped_fc1_act(local_tokens, w1, local_tokens_per_expert_cpu, activation_func)
+                local_act = grouped_fc1_act(local_tokens, weight1, local_tokens_per_expert_cpu, activation_func)
         elif prev_partner is not None:
+            # GPU-level wait for previous P2P (no CPU blocking)
+            default_stream.wait_event(p2p_events[round_idx - 1])
             # Extract metadata from previous round's received data
             extract_metadata_and_tokens(prev_partner)
             if prev_partner in recv_buffers:
                 # Compute previous round's received data (now guaranteed complete)
                 recv_data = recv_buffers[prev_partner]
-                recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
+                recv_act = grouped_fc1_act(recv_data, weight1, tokens_cpu[prev_partner], activation_func)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
 
         prev_partner = partner
-        prev_reqs = curr_reqs
 
-    # Process last round: wait for last P2P and compute
+    # Process last round
     if len(partners) > 0:
-        nvtx_range_push("dispatch_wait_last")
-        for req in prev_reqs:
-            req.wait()
-        nvtx_range_pop()
-
         nvtx_range_push("fc1_compute_last")
+        default_stream.wait_event(p2p_events[-1])
         if prev_partner is not None:
             extract_metadata_and_tokens(prev_partner)
             if prev_partner in recv_buffers:
                 recv_data = recv_buffers[prev_partner]
-                recv_act = grouped_fc1_act(recv_data, w1, tokens_cpu[prev_partner], activation_func)
+                recv_act = grouped_fc1_act(recv_data, weight1, tokens_cpu[prev_partner], activation_func)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
+
+    # NCCL work cleanup (P2P already done at this point)
+    for req in all_reqs:
+        req.wait()
 
     nvtx_range_pop()  # dispatch_fc1_p2p
     return (
@@ -729,10 +715,6 @@ def fc2_combine_p2p_forward(
     dtype = local_tokens.dtype
     hidden_size = weight2.shape[-1]
 
-    # Weight dimensions - weight2 is already 3D: [num_local_experts, ffn_hidden, hidden]
-    ffn_hidden = weight2.shape[1]
-    w2 = weight2  # No permute needed - already in correct shape
-
     # Compute offsets
     input_offsets = [0]
     for s in input_splits:
@@ -766,7 +748,7 @@ def fc2_combine_p2p_forward(
         if first_partner in recv_act_results:
             nvtx_range_push("fc2_compute_first")
             peer_fc2_results[first_partner] = grouped_fc2(
-                recv_act_results[first_partner], w2, tokens_cpu[first_partner])
+                recv_act_results[first_partner], weight2, tokens_cpu[first_partner])
             fc2_event.record(default_stream)
             has_pending_fc2 = True
             nvtx_range_pop()
@@ -797,14 +779,14 @@ def fc2_combine_p2p_forward(
             if next_partner in recv_act_results:
                 nvtx_range_push(f"fc2_compute_R{round_idx+1}")
                 peer_fc2_results[next_partner] = grouped_fc2(
-                    recv_act_results[next_partner], w2, tokens_cpu[next_partner])
+                    recv_act_results[next_partner], weight2, tokens_cpu[next_partner])
                 fc2_event.record(default_stream)
                 has_pending_fc2 = True
                 nvtx_range_pop()
         elif local_act is not None:
             # Last round: compute local FC2 (parallel with last P2P)
             nvtx_range_push("fc2_compute_local")
-            local_fc2 = grouped_fc2(local_act, w2, local_tokens_per_expert)
+            local_fc2 = grouped_fc2(local_act, weight2, local_tokens_per_expert)
             nvtx_range_pop()
 
     # =========================================================================
@@ -898,7 +880,7 @@ def fc2_combine_p2p_forward(
 
     # Handle no partners case (ep_size=1): compute local FC2
     if len(partners) == 0 and local_act is not None:
-        local_fc2 = grouped_fc2(local_act, w2, local_tokens_per_expert)
+        local_fc2 = grouped_fc2(local_act, weight2, local_tokens_per_expert)
 
     # Write local result to combined_output
     if local_fc2 is not None:

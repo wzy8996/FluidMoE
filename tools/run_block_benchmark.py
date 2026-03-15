@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
     parser.add_argument("--model", type=str, default="mixtral_8x7b", help="模型名称 (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe",
-                        choices=["megatron", "fluidmoe"],
+                        choices=["megatron", "fluidmoe", "native", "deepspeed"],
                         help="选择运行的实现")
     parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
@@ -48,18 +48,73 @@ def p0(rank, *args):
         print(*args, flush=True)
 
 
-def allreduce_grads(model, dp_size, all_group, dp_group):
+_ar_bufs = {}  # cache: model_id -> (shared_flat, expert_flat, shared_params, expert_params)
+
+
+def _build_ar_buffers(model):
+    """Build flat buffers for bucketized AllReduce (once per model)."""
+    mid = id(model)
+    if mid in _ar_bufs:
+        return _ar_bufs[mid]
+
+    shared_params, expert_params = [], []
     for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
+        is_expert = "moe_w1" in name or "moe_w2" in name or ".experts." in name
+        if is_expert:
+            expert_params.append(p)
+        else:
+            shared_params.append(p)
 
-        is_expert_param = ".experts." in name
-        if is_expert_param:
-            if dp_size > 1:
-                dist.all_reduce(p.grad, group=dp_group)
-            continue
+    shared_numel = sum(p.numel() for p in shared_params)
+    expert_numel = sum(p.numel() for p in expert_params)
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
 
-        dist.all_reduce(p.grad, group=all_group)
+    shared_flat = torch.zeros(shared_numel, dtype=dtype, device=device) if shared_numel > 0 else None
+    expert_flat = torch.zeros(expert_numel, dtype=dtype, device=device) if expert_numel > 0 else None
+
+    _ar_bufs[mid] = (shared_flat, expert_flat, shared_params, expert_params)
+    return _ar_bufs[mid]
+
+
+def allreduce_grads(model, dp_size, all_group, dp_group):
+    shared_flat, expert_flat, shared_params, expert_params = _build_ar_buffers(model)
+
+    # Bucketized shared AllReduce (all GPUs: cp + dp)
+    if shared_flat is not None:
+        offset = 0
+        for p in shared_params:
+            n = p.numel()
+            if p.grad is not None:
+                shared_flat[offset:offset + n].copy_(p.grad.view(-1))
+            else:
+                shared_flat[offset:offset + n].zero_()
+            offset += n
+        dist.all_reduce(shared_flat, group=all_group)
+        offset = 0
+        for p in shared_params:
+            n = p.numel()
+            if p.grad is not None:
+                p.grad.view(-1).copy_(shared_flat[offset:offset + n])
+            offset += n
+
+    # Bucketized expert AllReduce (dp replicas only)
+    if dp_size > 1 and expert_flat is not None:
+        offset = 0
+        for p in expert_params:
+            n = p.numel()
+            if p.grad is not None:
+                expert_flat[offset:offset + n].copy_(p.grad.view(-1))
+            else:
+                expert_flat[offset:offset + n].zero_()
+            offset += n
+        dist.all_reduce(expert_flat, group=dp_group)
+        offset = 0
+        for p in expert_params:
+            n = p.numel()
+            if p.grad is not None:
+                p.grad.view(-1).copy_(expert_flat[offset:offset + n])
+            offset += n
 
 
 def bench(run_fn, scheduler, ev_s, ev_e, warmup, iters):
@@ -166,35 +221,72 @@ def main():
     ev_s = torch.cuda.Event(enable_timing=True)
     ev_e = torch.cuda.Event(enable_timing=True)
 
-    if args.impl == "megatron":
-        from megatron_baseline import MegatronBaselineTransformerModel
+    if args.impl in ("megatron", "native", "deepspeed"):
+        if args.impl == "megatron":
+            from megatron_baseline import MegatronBaselineTransformerModel
 
-        model = MegatronBaselineTransformerModel(
-            num_layers=num_layers,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            ffn_hidden_size=ffn_hidden,
-            num_experts=num_experts,
-            top_k=top_k,
-            cp_group=cp_group,
-            ep_group=ep_group,
-            shared_dp_group=all_group,
-            expert_dp_group=dp_group if dp_size > 1 else None,
-            capacity_factor=capacity_factor,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+            model = MegatronBaselineTransformerModel(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                ffn_hidden_size=ffn_hidden,
+                num_experts=num_experts,
+                top_k=top_k,
+                cp_group=cp_group,
+                ep_group=ep_group,
+                shared_dp_group=all_group,
+                expert_dp_group=dp_group if dp_size > 1 else None,
+                capacity_factor=capacity_factor,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        elif args.impl == "deepspeed":
+            from deepspeed_ulysses_baseline import DeepSpeedBlockBaselineTransformerModel
+
+            model = DeepSpeedBlockBaselineTransformerModel(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                ffn_hidden_size=ffn_hidden,
+                num_experts=num_experts,
+                top_k=top_k,
+                cp_group=cp_group,
+                ep_group=ep_group,
+                capacity_factor=capacity_factor,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        else:
+            from baseline import BaselineTransformerModel
+
+            model = BaselineTransformerModel(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                ffn_hidden_size=ffn_hidden,
+                num_experts=num_experts,
+                top_k=top_k,
+                cp_group=cp_group,
+                ep_group=ep_group,
+                capacity_factor=capacity_factor,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+
+        impl_name = args.impl.capitalize()
         scheduler = _NullScheduler()
 
-        def run_megatron_bwd():
+        def run_baseline_bwd():
             x_grad.grad = None
             for p in model.parameters():
                 p.grad = None
             model(x_grad).sum().backward()
             allreduce_grads(model, dp_size, all_group, dp_group)
 
-        p0(rank, "Megatron warmup...")
+        p0(rank, f"{impl_name} warmup...")
         for _ in range(args.warmup):
             with torch.no_grad():
                 model(x)
@@ -208,9 +300,9 @@ def main():
         ev_e.record()
         torch.cuda.synchronize()
         fwd_ms = ev_s.elapsed_time(ev_e) / args.iters
-        iter_ms = bench(run_megatron_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
-        p0(rank, f"Megatron: forward={fwd_ms:.2f}ms  iter={iter_ms:.2f}ms")
-        p0(rank, f"RESULT impl=megatron forward_ms={fwd_ms:.6f} iter_ms={iter_ms:.6f}")
+        iter_ms = bench(run_baseline_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+        p0(rank, f"{impl_name}: forward={fwd_ms:.2f}ms  iter={iter_ms:.2f}ms")
+        p0(rank, f"RESULT impl={args.impl} forward_ms={fwd_ms:.6f} iter_ms={iter_ms:.6f}")
         dist.destroy_process_group()
         p0(rank, "Done!")
         return

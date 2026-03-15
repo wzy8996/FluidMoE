@@ -150,7 +150,7 @@ def _debug_check_alltoallv_splits(
         )
 
 
-def _all_to_all_sp2hp_forward(input_: torch.Tensor, group) -> torch.Tensor:
+def _all_to_all_sp2hp_forward(input_: torch.Tensor, group, output: torch.Tensor = None) -> torch.Tensor:
     """
     Forward-only sp2hp AllToAll (no autograd).
     Used in Attention for sequence parallel to head parallel conversion.
@@ -160,6 +160,8 @@ def _all_to_all_sp2hp_forward(input_: torch.Tensor, group) -> torch.Tensor:
     Args:
         input_: Input tensor [seq_local, batch, heads, dim]
         group: Context parallel process group
+        output: Optional pre-allocated output [seq_full, batch, heads_local, dim].
+                If provided, AllToAll writes directly into it (no extra copy).
 
     Returns:
         Output tensor [seq_full, batch, heads_local, dim]
@@ -173,19 +175,26 @@ def _all_to_all_sp2hp_forward(input_: torch.Tensor, group) -> torch.Tensor:
     x = x.view(seq_local * cp, -1)
 
     # AllToAll communication (no grad)
-    output = torch.empty_like(x)
+    # sp2hp: AllToAll output is [seq_full, batch * heads_local * dim] which
+    # reshapes directly to [seq_full, batch, heads_local, dim] — no permute needed,
+    # so we can write directly into pre-allocated output.
+    if output is not None:
+        out_buf = output.view(seq_local * cp, -1)
+    else:
+        out_buf = torch.empty_like(x)
     dist.all_to_all_single(
-        output, x,
+        out_buf, x,
         output_split_sizes=[seq_local] * cp,
         input_split_sizes=[seq_local] * cp,
         group=group,
     )
 
-    # Reshape to output format
-    return output.view(seq_local * cp, batch, heads // cp, dim)
+    if output is not None:
+        return output
+    return out_buf.view(seq_local * cp, batch, heads // cp, dim)
 
 
-def _all_to_all_hp2sp_forward(input_: torch.Tensor, group) -> torch.Tensor:
+def _all_to_all_hp2sp_forward(input_: torch.Tensor, group, output: torch.Tensor = None) -> torch.Tensor:
     """
     Forward-only hp2sp AllToAll (no autograd).
     Used in Attention for head parallel to sequence parallel conversion.
@@ -195,6 +204,8 @@ def _all_to_all_hp2sp_forward(input_: torch.Tensor, group) -> torch.Tensor:
     Args:
         input_: Input tensor [seq_full, batch, heads_local, dim]
         group: Context parallel process group
+        output: Optional pre-allocated output [seq_local, batch, heads, dim].
+                If provided, permute-copies directly into it (no extra allocation).
 
     Returns:
         Output tensor [seq_local, batch, heads, dim]
@@ -207,45 +218,23 @@ def _all_to_all_hp2sp_forward(input_: torch.Tensor, group) -> torch.Tensor:
     x = input_.contiguous().view(seq, batch * heads_local * dim)
 
     # AllToAll communication (no grad)
-    output = torch.empty_like(x)
+    raw_out = torch.empty_like(x)
     dist.all_to_all_single(
-        output, x,
+        raw_out, x,
         output_split_sizes=[seq_local] * cp,
         input_split_sizes=[seq_local] * cp,
         group=group,
     )
 
     # Rearrange: unflatten, permute, merge heads
-    output = output.view(cp, seq_local, batch, heads_local, dim)
-    output = output.permute(1, 2, 0, 3, 4).contiguous()
-    return output.view(seq_local, batch, heads_local * cp, dim)
-
-
-def _sort_chunks_by_idxs(input_tensor, split_sizes, sorted_idxs):
-    """
-    Sort chunks of input tensor by indices.
-    Used in MoE for reordering tokens between rank-major and expert-major layouts.
-
-    Args:
-        input_tensor: [total_tokens, hidden] tensor
-        split_sizes: list or tensor of chunk sizes (can contain zeros)
-        sorted_idxs: list or tensor of new order indices
-
-    Returns:
-        Reordered tensor
-    """
-    if input_tensor.numel() == 0:
-        return input_tensor
-
-    # Convert to list (avoid GPU sync)
-    if torch.is_tensor(split_sizes):
-        split_sizes = split_sizes.tolist()
-    if torch.is_tensor(sorted_idxs):
-        sorted_idxs = sorted_idxs.tolist()
-
-    # Direct split and cat (Megatron style, simple and efficient)
-    chunks = torch.split(input_tensor, split_sizes, dim=0)
-    return torch.cat([chunks[i] for i in sorted_idxs], dim=0)
+    # hp2sp requires a permute after AllToAll, so we permute-copy into output
+    raw_5d = raw_out.view(cp, seq_local, batch, heads_local, dim)
+    if output is not None:
+        output.view(seq_local, batch, cp, heads_local, dim).copy_(
+            raw_5d.permute(1, 2, 0, 3, 4))
+        return output
+    result = raw_5d.permute(1, 2, 0, 3, 4).contiguous()
+    return result.view(seq_local, batch, heads_local * cp, dim)
 
 
 # =============================================================================
@@ -330,47 +319,6 @@ def get_partner_for_round(my_rank: int, round_idx: int, num_ranks: int) -> int:
     return -1  # Idle this round
 
 
-def get_all_partners_ordered(my_rank: int, num_ranks: int) -> List[Tuple[int, int]]:
-    """
-    Get all partners in order of communication rounds.
-
-    Args:
-        my_rank: Current rank
-        num_ranks: Total number of ranks
-
-    Returns:
-        partners: List[(round_idx, partner_rank)]
-            Ordered by round, -1 partner means idle
-    """
-    schedule = compute_round_robin_schedule(num_ranks)
-    partners = []
-
-    for round_idx, pairs in enumerate(schedule):
-        found = False
-        for a, b in pairs:
-            if a == my_rank:
-                partners.append((round_idx, b))
-                found = True
-                break
-            if b == my_rank:
-                partners.append((round_idx, a))
-                found = True
-                break
-        if not found:
-            partners.append((round_idx, -1))  # Idle
-
-    return partners
-
-
-def get_num_rounds(num_ranks: int) -> int:
-    """Get number of rounds needed for complete exchange."""
-    if num_ranks <= 1:
-        return 0
-    if num_ranks % 2 == 0:
-        return num_ranks - 1
-    return num_ranks  # Odd case with dummy
-
-
 # =============================================================================
 # Multi-Card Overlap Context
 # =============================================================================
@@ -435,12 +383,9 @@ __all__ = [
     '_all_to_all',
     '_all_to_all_sp2hp_forward',
     '_all_to_all_hp2sp_forward',
-    '_sort_chunks_by_idxs',
     # P2P Scheduling
     'compute_round_robin_schedule',
     'get_partner_for_round',
-    'get_all_partners_ordered',
-    'get_num_rounds',
     # Overlap Context
     'MultiCardOverlapContext',
 ]

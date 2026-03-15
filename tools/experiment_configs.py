@@ -10,16 +10,16 @@ from typing import Any, Dict
 BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'dp_size': 1,
  'cp_size': 2,
  'ep_size': 2,
- 'moe_combine_chunks': 4,
- 'moe_dispatch_chunks': 1,
- 'attn_proj_chunks': 1,
- 'attn_qkv_chunks': 8,
+ 'moe_combine_chunks': 2,
+ 'moe_dispatch_chunks': 2,
+ 'attn_proj_chunks': 4,
+ 'attn_qkv_chunks': 4,
  'warmup': 10,
  'iters': 50,
- 'ar_trickle_sizes': {'moe_combine': 112197632,
-                      'moe_dispatch': 106954752,
+ 'ar_trickle_sizes': {'moe_combine': 85983232,
+                      'moe_dispatch': 123731968,
                       'attn_proj': 34603008,
-                      'attn_qkv': 38797312}}
+                      'attn_qkv': 52428800}}
 
 TUNE_DEFAULTS: Dict[str, Any] = {
     "dp_size": 1,

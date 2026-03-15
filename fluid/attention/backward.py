@@ -131,18 +131,15 @@ def outproj_sp2hp_backward(
         grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
 
         if scheduler_enabled:
-            def make_alltoall_fn(data, o_s, o_e):
+            def make_alltoall_fn(data, out_slice):
                 def do_alltoall():
-                    result = _all_to_all_sp2hp_forward(data, cp_group)
-                    grad_attn_output[o_s:o_e].copy_(result)
-                    return result
+                    return _all_to_all_sp2hp_forward(data, cp_group, output=out_slice)
                 return do_alltoall
 
-            task_id = scheduler.submit_alltoall(make_alltoall_fn(grad_chunk, o_start, o_end))
+            task_id = scheduler.submit_alltoall(make_alltoall_fn(grad_chunk, grad_attn_output[o_start:o_end]))
             task_ids.append(task_id)
         else:
-            result = _all_to_all_sp2hp_forward(grad_chunk, cp_group)
-            grad_attn_output[o_start:o_end].copy_(result)
+            _all_to_all_sp2hp_forward(grad_chunk, cp_group, output=grad_attn_output[o_start:o_end])
 
     # ============================================
     # During AllToAll: dW tasks
@@ -288,7 +285,15 @@ def hp2sp_qkv_backward(
     seq_chunk_full = seq_full // num_chunks
     seq_chunk_local = seq_local // num_chunks
 
-    chunk_results = [None] * num_chunks
+    # Pre-allocate chunk results buffer to avoid per-chunk allocation inside AllToAll
+    # hp2sp output shape: [seq_chunk_local, batch, num_kv_heads, group_size]
+    group_size = grad_qkv_hp.shape[3]
+    total_proj = num_kv_heads * group_size
+    chunk_results_buf = torch.empty(
+        num_chunks, seq_chunk_local, batch, num_kv_heads, group_size,
+        dtype=dtype, device=device,
+    )
+
     # Prepare all input chunks
     input_chunks = []
     for chunk_idx in range(num_chunks):
@@ -296,15 +301,13 @@ def hp2sp_qkv_backward(
         s_end = s_start + seq_chunk_full
         input_chunks.append(grad_qkv_hp[s_start:s_end])
 
-    def make_alltoall_fn(idx, data):
+    def make_alltoall_fn(idx, data, out_slice):
         def do_alltoall():
-            result = _all_to_all_hp2sp_forward(data, cp_group)
-            chunk_results[idx] = result
-            return result
+            return _all_to_all_hp2sp_forward(data, cp_group, output=out_slice)
         return do_alltoall
 
     # Batch submit: single stream switch for all chunks
-    comm_fns = [make_alltoall_fn(i, input_chunks[i]) for i in range(num_chunks)]
+    comm_fns = [make_alltoall_fn(i, input_chunks[i], chunk_results_buf[i]) for i in range(num_chunks)]
     task_ids = scheduler.submit_alltoall_batch(comm_fns)
 
     # Execute dW tasks during AllToAll
@@ -313,8 +316,6 @@ def hp2sp_qkv_backward(
     # Process each chunk as it arrives: QKV dX
     # After hp2sp AllToAll: [seq_chunk_local, batch, num_kv_heads, group_size]
     # total_proj = num_kv_heads * group_size (NOT kv_heads_local * group_size)
-    group_size = grad_qkv_hp.shape[3]
-    total_proj = num_kv_heads * group_size
     grad_tokens = torch.empty(seq_local, batch, hidden_size, dtype=tokens.dtype, device=device)
 
     # Shared accumulator for partial dW results.
@@ -331,7 +332,7 @@ def hp2sp_qkv_backward(
         # Wait for this chunk (only trickle AR on last chunk)
         is_last = (chunk_idx == num_chunks - 1)
         scheduler.wait_alltoall(task_ids[chunk_idx], try_trickle=is_last)
-        grad_qkv_sp_chunk = chunk_results[chunk_idx]
+        grad_qkv_sp_chunk = chunk_results_buf[chunk_idx]
 
         # Flatten and compute dX
         grad_qkv_chunk_flat = grad_qkv_sp_chunk.reshape(seq_chunk_local, batch, -1)

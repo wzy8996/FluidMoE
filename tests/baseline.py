@@ -1,7 +1,8 @@
 """
 Baseline Transformer Layer (No P2P Overlap)
 
-Uses standard PyTorch AllToAll without overlap for fair comparison.
+Uses standard PyTorch operators (F.layer_norm, F.gelu, per-expert torch.mm).
+Uses the SAME padding/capacity/uniform-splits as FluidMoE for fair comparison.
 Uses attention recomputation (same as FluidMoE) for fair memory comparison.
 """
 
@@ -14,7 +15,8 @@ import torch.distributed as dist
 from contextlib import contextmanager
 from typing import Optional, Callable, List
 
-from fluid.attention.forward import scaled_dot_product_attention_forward  # noqa: F401 (used in forward)
+from fluid.attention.forward import scaled_dot_product_attention_forward  # noqa: F401
+from fluid.moe.forward import pad_moe_dispatch
 
 
 # ---------------------------------------------------------------------------
@@ -31,16 +33,7 @@ def set_compute_timer(timer) -> None:
 
 @contextmanager
 def _timed_overlap(phase: str, key: str = ""):
-    """对一段可重叠计算块计时并累加到 timer。
-
-    phase: 'fwd' 或 'bwd'
-    key:   区域标识，对应 OverlapComputeTracker 的 {phase}_{key}_ms 字段。
-           前向: 'qkv' / 'proj' / 'fc1' / 'fc2'
-           后向: 'fc2_dx' / 'fc2_dw' / 'act_recomp' / 'act_bwd' /
-                 'fc1_dx' / 'fc1_dw' / 'router_dx' / 'router_dw' /
-                 'ln2_dw' / 'ln2_dx' / 'proj_dw' / 'proj_dx' /
-                 'sdpa_dx' / 'qkv_dw' / 'qkv_dx' / 'ln1_dw' / 'ln1_dx'
-    """
+    """对一段可重叠计算块计时并累加到 timer。"""
     timer = _g_compute_timer
     if timer is None:
         yield
@@ -54,7 +47,6 @@ def _timed_overlap(phase: str, key: str = ""):
     ms = ev_s.elapsed_time(ev_e)
     attr = f"{phase}_{key}_ms"
     setattr(timer, attr, getattr(timer, attr) + ms)
-    # 特殊追踪：反向第一层的 FC2 dX (R1, ÷n1) 和 FC1 dX (R2, ÷n2)，用于计算暴露计算量
     if phase == "bwd":
         if key == "fc2_dx":
             timer._bwd_fc2_dx_count += 1
@@ -66,7 +58,8 @@ def _timed_overlap(phase: str, key: str = ""):
                 timer.bwd_first_fc1_dx_ms += ms
 
 
-_baseline_fc1_buf = {}  # (cols, dtype, device_idx) -> Tensor, grow-only
+_baseline_fc1_buf = {}
+
 
 def _get_fc1_buf(rows: int, cols: int, dtype, device):
     key = (cols, dtype, device.index)
@@ -78,7 +71,7 @@ def _get_fc1_buf(rows: int, cols: int, dtype, device):
 
 
 class BaselineTransformerFunction(torch.autograd.Function):
-    """Baseline transformer with attention recomputation (fair comparison with FluidMoE)."""
+    """Baseline transformer with PyTorch ops + same padding as FluidMoE."""
 
     @staticmethod
     def forward(
@@ -107,7 +100,7 @@ class BaselineTransformerFunction(torch.autograd.Function):
 
         # ===================== Attention =====================
         ln1_out = F.layer_norm(hidden_states, (hidden_size,), ln1_weight, ln1_bias)
-        with _timed_overlap("fwd", "qkv"):  # [可重叠] R4 QKV GEMM
+        with _timed_overlap("fwd", "qkv"):
             qkv = F.linear(ln1_out, qkv_weight)
 
         # Reshape QKV
@@ -120,8 +113,8 @@ class BaselineTransformerFunction(torch.autograd.Function):
         k_sp = qkv[:, :, :, q_dim:q_dim + head_dim]
         v_sp = qkv[:, :, :, q_dim + head_dim:]
 
-        # AllToAll: sp2hp (combined QKV)
-        qkv_sp = torch.cat([q_sp, k_sp, v_sp], dim=2)  # [seq, batch, heads+2*kv_heads, dim]
+        # AllToAll: sp2hp
+        qkv_sp = torch.cat([q_sp, k_sp, v_sp], dim=2)
         qkv_hp = _all_to_all_sp2hp(qkv_sp, cp_group)
         q_heads_local = num_heads // cp_size
         kv_heads_local = num_kv_heads // cp_size
@@ -129,29 +122,27 @@ class BaselineTransformerFunction(torch.autograd.Function):
         k_hp = qkv_hp[:, :, q_heads_local:q_heads_local + kv_heads_local, :]
         v_hp = qkv_hp[:, :, q_heads_local + kv_heads_local:, :]
 
-        # Attention with native GQA support (PyTorch 2.5+)
-        q_bf = q_hp.permute(1, 2, 0, 3)  # [batch, q_heads_local, seq, head_dim]
-        k_bf = k_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
-        v_bf = v_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
+        # SDPA
+        q_bf = q_hp.permute(1, 2, 0, 3)
+        k_bf = k_hp.permute(1, 2, 0, 3)
+        v_bf = v_hp.permute(1, 2, 0, 3)
 
         enable_gqa = (q_heads_local != kv_heads_local)
         scale = 1.0 / (head_dim ** 0.5)
 
-        # Keep computation graph for backward (avoids redundant SDPA forward in backward)
         with torch.enable_grad():
             q_for_attn = q_bf.detach().requires_grad_(True)
             k_for_attn = k_bf.detach().requires_grad_(True)
             v_for_attn = v_bf.detach().requires_grad_(True)
             attn_out_bf = scaled_dot_product_attention_forward(
-                q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
-            )
+                q_for_attn, k_for_attn, v_for_attn, scale=scale,
+                is_causal=True, enable_gqa=enable_gqa)
         attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
 
         # AllToAll: hp2sp
         attn_out_sp = _all_to_all_hp2sp(attn_out, cp_group)
 
-        # Output projection
-        with _timed_overlap("fwd", "proj"):  # [可重叠] R3 OutProj GEMM
+        with _timed_overlap("fwd", "proj"):
             proj_out = F.linear(attn_out_sp.view(seq_len, batch_size, -1), proj_weight)
         hidden_after_attn = hidden_states + proj_out
 
@@ -176,63 +167,61 @@ class BaselineTransformerFunction(torch.autograd.Function):
         permuted_probs = expanded_probs[sorted_indices]
         sorted_expert_indices = expanded_expert_indices[sorted_indices]
 
-        # Count and splits
         tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=num_experts)
 
-        # Capacity dropping (vectorized)
+        # Capacity dropping
         expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
         offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
         torch.cumsum(tokens_per_expert, dim=0, out=offsets[1:])
         within_expert_pos = torch.arange(num_tokens * top_k, device=device) - offsets[sorted_expert_indices]
         keep_mask = within_expert_pos < expert_capacity
         sorted_indices = sorted_indices[keep_mask]
-        token_ids = sorted_indices // top_k  # precompute for reuse
+        token_ids = sorted_indices // top_k
         permuted_tokens = expanded_tokens[sorted_indices]
         permuted_probs = expanded_probs[sorted_indices]
         tokens_per_expert = tokens_per_expert.clamp(max=expert_capacity)
 
-        experts_per_rank = num_experts // ep_size
+        # Capacity padding (same as FluidMoE)
+        cap_per_rank = expert_capacity
+        (padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids,
+         padded_tpe, real_mask) = pad_moe_dispatch(
+            permuted_tokens, permuted_probs, sorted_indices, token_ids,
+            tokens_per_expert, cap_per_rank, num_experts,
+        )
 
-        input_splits = [tokens_per_expert[i * experts_per_rank:(i + 1) * experts_per_rank].sum().item()
-                        for i in range(ep_size)]
+        # Uniform AllToAll splits (same as FluidMoE)
+        S = num_local_experts * cap_per_rank
+        input_splits = [S] * ep_size
+        output_splits = [S] * ep_size
 
-        # AllGather splits
-        all_splits = [None] * ep_size
-        dist.all_gather_object(all_splits, input_splits, group=ep_group)
-        output_splits = [all_splits[r][ep_rank] for r in range(ep_size)]
+        # Dispatch AllToAll (uniform splits)
+        recv_tokens = _moe_all_to_all_uniform(padded_tokens, S, ep_size, ep_group)
 
-        # Dispatch AllToAll
-        recv_tokens = _moe_all_to_all(permuted_tokens, input_splits, output_splits, ep_group)
+        # All tokens per local expert (uniform)
+        tokens_per_local_expert = [ep_size * cap_per_rank] * num_local_experts
 
-        # Get expert token counts
-        all_tpe = [None] * ep_size
-        local_tpe = tokens_per_expert[ep_rank * num_local_experts:(ep_rank + 1) * num_local_experts].tolist()
-        dist.all_gather_object(all_tpe, local_tpe, group=ep_group)
-
-        tokens_per_local_expert = [sum(all_tpe[r][e] for r in range(ep_size)) for e in range(num_local_experts)]
-
-        # Expert compute (fc1 不再保存，反向重算)
+        # Expert compute (per-expert loop, PyTorch native)
         total_recv = recv_tokens.shape[0]
         expert_output = torch.zeros(total_recv, hidden_size, dtype=dtype, device=device)
         offset = 0
         for exp_idx in range(num_local_experts):
             n_tok = tokens_per_local_expert[exp_idx]
             if n_tok > 0:
-                with _timed_overlap("fwd", "fc1"):  # [可重叠] R2 FC1 GEMM + activation
+                with _timed_overlap("fwd", "fc1"):
                     fc1 = torch.matmul(recv_tokens[offset:offset + n_tok], moe_w1[exp_idx])
                     act = activation_func(fc1)
-                with _timed_overlap("fwd", "fc2"):  # [可重叠] R1 FC2 GEMM
+                with _timed_overlap("fwd", "fc2"):
                     expert_output[offset:offset + n_tok] = torch.matmul(act, moe_w2[exp_idx])
                 offset += n_tok
 
-        # Combine AllToAll
-        combined_output = _moe_all_to_all(expert_output, output_splits, input_splits, ep_group)
+        # Combine AllToAll (uniform splits)
+        combined_output = _moe_all_to_all_uniform(expert_output, S, ep_size, ep_group)
 
-        # Restore via scatter_add (token_ids precomputed above)
-        weighted = combined_output * permuted_probs.unsqueeze(-1).to(dtype)
+        # Restore via scatter_add
+        weighted = combined_output * padded_probs.unsqueeze(-1).to(dtype)
         moe_output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
         moe_output.scatter_add_(
-            0, token_ids.unsqueeze(1).expand_as(weighted), weighted)
+            0, padded_token_ids.unsqueeze(1).expand_as(weighted), weighted)
         moe_output = moe_output.view(seq_len, batch_size, hidden_size)
 
         output = hidden_after_attn + moe_output
@@ -240,17 +229,16 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Save for backward
         ctx.save_for_backward(
             hidden_states, ln1_out, hidden_after_attn, ln2_flat,
-            permuted_tokens, permuted_probs, sorted_indices, token_ids,
+            padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids,
             router_probs, top_probs, top_indices, recv_tokens, combined_output,
             ln1_weight, ln1_bias, ln2_weight, ln2_bias,
             qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
         )
-        # Save SDPA computation graph (avoids redundant forward in backward)
         ctx._q_for_attn = q_for_attn
         ctx._k_for_attn = k_for_attn
         ctx._v_for_attn = v_for_attn
         ctx._attn_out_bf = attn_out_bf
-        ctx._attn_out_sp = attn_out_sp  # Save SP format to avoid extra hp2sp in backward
+        ctx._attn_out_sp = attn_out_sp
         ctx._enable_gqa = enable_gqa
         ctx.cp_group = cp_group
         ctx.ep_group = ep_group
@@ -275,7 +263,6 @@ class BaselineTransformerFunction(torch.autograd.Function):
          qkv_weight, proj_weight, router_weight, moe_w1, moe_w2,
          ) = ctx.saved_tensors
 
-        # Retrieve SDPA computation graph
         q_for_attn = ctx._q_for_attn
         k_for_attn = ctx._k_for_attn
         v_for_attn = ctx._v_for_attn
@@ -304,31 +291,30 @@ class BaselineTransformerFunction(torch.autograd.Function):
         head_dim = hidden_size // num_heads
         num_local_experts = num_experts // ep_size
         num_tokens = seq_len * batch_size
+        S = input_splits[0]
 
         # ===================== MoE Backward =====================
         grad_output_flat = grad_output.view(num_tokens, hidden_size)
         grad_hidden_after_attn = grad_output.clone()
 
-        # Restore backward (capacity mode: scatter_add, token_ids precomputed)
         grad_weighted = grad_output_flat[token_ids]
         grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(dtype)
 
-        # Combine AllToAll backward
-        grad_expert_output = _moe_all_to_all(grad_combined, input_splits, output_splits, ep_group)
+        # Combine AllToAll backward (uniform splits)
+        grad_expert_output = _moe_all_to_all_uniform(grad_combined, S, ep_size, ep_group)
 
-        # Expert backward: FC2 and FC1 timed separately (analogous to forward fwd_fc2/fwd_fc1)
         grad_recv_tokens = torch.zeros_like(recv_tokens)
         grad_moe_w1 = torch.zeros_like(moe_w1)
         grad_moe_w2 = torch.zeros_like(moe_w2)
 
-        # Pre-compute per-expert offsets
+        # Per-expert offsets
         expert_offsets = []
         off = 0
         for exp_idx in range(num_local_experts):
             expert_offsets.append(off)
             off += tokens_per_local_expert[exp_idx]
 
-        # FC1 recomputation (no longer saved from forward)
+        # FC1 recomputation (per-expert loop)
         with _timed_overlap("bwd", "fc1_recomp"):
             total = recv_tokens.shape[0]
             ffn = moe_w1.shape[2]
@@ -336,188 +322,165 @@ class BaselineTransformerFunction(torch.autograd.Function):
                 fc1_all = torch.empty(0, ffn, dtype=dtype, device=device)
             else:
                 fc1_all = _get_fc1_buf(total, ffn, dtype, device)
-                if num_local_experts == 1:
-                    torch.mm(recv_tokens, moe_w1[0], out=fc1_all)
-                else:
-                    for exp_idx in range(num_local_experts):
-                        n_tok = tokens_per_local_expert[exp_idx]
-                        if n_tok > 0:
-                            o = expert_offsets[exp_idx]
-                            torch.mm(recv_tokens[o:o + n_tok], moe_w1[exp_idx], out=fc1_all[o:o + n_tok])
+                for exp_idx in range(num_local_experts):
+                    n_tok = tokens_per_local_expert[exp_idx]
+                    if n_tok > 0:
+                        o = expert_offsets[exp_idx]
+                        torch.mm(recv_tokens[o:o + n_tok], moe_w1[exp_idx],
+                                 out=fc1_all[o:o + n_tok])
 
-        # FC2 dX matmul (pipeline 关键路径, 暴露: 1/n1)
-        grad_act_per_expert = [None] * num_local_experts
+        # FC2 dX (per-expert loop)
         with _timed_overlap("bwd", "fc2_dx"):
+            grad_exp_act = torch.empty_like(fc1_all)
             for exp_idx in range(num_local_experts):
                 n_tok = tokens_per_local_expert[exp_idx]
                 if n_tok > 0:
                     o = expert_offsets[exp_idx]
-                    grad_act_per_expert[exp_idx] = torch.matmul(
-                        grad_expert_output[o:o + n_tok], moe_w2[exp_idx].t())
+                    torch.mm(grad_expert_output[o:o + n_tok], moe_w2[exp_idx].t(),
+                             out=grad_exp_act[o:o + n_tok])
 
-        # Activation backward (AR 可重叠): single activation graph + autograd.grad
-        # Also reuse detached act output for FC2 dW to avoid duplicate activation compute.
+        # Activation backward (PyTorch autograd)
         with _timed_overlap("bwd", "act_bwd"):
             if fc1_all.numel() == 0:
                 grad_fc1_all = torch.empty_like(fc1_all)
                 act_all_detached = torch.empty_like(fc1_all)
             else:
-                grad_act_all = torch.zeros_like(fc1_all)
-                for exp_idx in range(num_local_experts):
-                    grad_act_slice = grad_act_per_expert[exp_idx]
-                    if grad_act_slice is None:
-                        continue
-                    o = expert_offsets[exp_idx]
-                    n_valid = grad_act_slice.shape[0]
-                    if n_valid > 0:
-                        grad_act_all[o:o + n_valid] = grad_act_slice
                 with torch.enable_grad():
                     fc1_with_grad = fc1_all.detach().requires_grad_(True)
                     act_all = activation_func(fc1_with_grad)
                     grad_fc1_all, = torch.autograd.grad(
-                        act_all, fc1_with_grad, grad_act_all, retain_graph=False
-                    )
+                        act_all, fc1_with_grad, grad_exp_act, retain_graph=False)
                 act_all_detached = act_all.detach()
 
-        # FC2 dW matmul (AllToAll 可重叠) - reuse activation output from act_bwd stage
+        # FC2 dW (per-expert loop)
         with _timed_overlap("bwd", "fc2_dw"):
             for exp_idx in range(num_local_experts):
                 n_tok = tokens_per_local_expert[exp_idx]
                 if n_tok > 0:
                     o = expert_offsets[exp_idx]
-                    act_slice = act_all_detached[o:o + n_tok]
                     grad_moe_w2[exp_idx] = torch.matmul(
-                        act_slice.t(), grad_expert_output[o:o + n_tok])
+                        act_all_detached[o:o + n_tok].t(),
+                        grad_expert_output[o:o + n_tok])
 
-        # FC1 dX matmul (pipeline 关键路径, 暴露: 1/n2)
+        # FC1 dX (per-expert loop)
         with _timed_overlap("bwd", "fc1_dx"):
             for exp_idx in range(num_local_experts):
                 n_tok = tokens_per_local_expert[exp_idx]
                 if n_tok > 0:
                     o = expert_offsets[exp_idx]
-                    grad_fc1_slice = grad_fc1_all[o:o + n_tok]
                     grad_recv_tokens[o:o + n_tok] = torch.matmul(
-                        grad_fc1_slice, moe_w1[exp_idx].t())
+                        grad_fc1_all[o:o + n_tok], moe_w1[exp_idx].t())
 
-        # FC1 dW matmul (AllToAll 可重叠)
+        # FC1 dW (per-expert loop)
         with _timed_overlap("bwd", "fc1_dw"):
             for exp_idx in range(num_local_experts):
                 n_tok = tokens_per_local_expert[exp_idx]
                 if n_tok > 0:
                     o = expert_offsets[exp_idx]
-                    grad_fc1_slice = grad_fc1_all[o:o + n_tok]
                     grad_moe_w1[exp_idx] = torch.matmul(
-                        recv_tokens[o:o + n_tok].t(), grad_fc1_slice)
+                        recv_tokens[o:o + n_tok].t(),
+                        grad_fc1_all[o:o + n_tok])
 
-        # Dispatch AllToAll backward
-        grad_permuted_tokens = _moe_all_to_all(grad_recv_tokens, output_splits, input_splits, ep_group)
+        # Dispatch AllToAll backward (uniform splits)
+        grad_permuted_tokens = _moe_all_to_all_uniform(grad_recv_tokens, S, ep_size, ep_group)
 
-        # Scatter-reduce back to [num_tokens, hidden] (token_ids precomputed)
+        # Scatter-reduce
         grad_ln2_flat_from_tokens = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
         grad_ln2_flat_from_tokens.scatter_add_(
             0, token_ids.unsqueeze(1).expand_as(grad_permuted_tokens), grad_permuted_tokens)
 
-        # Router backward dX (AR 可重叠)
+        # Router backward
         with _timed_overlap("bwd", "router_dx"):
             grad_permuted_probs = (grad_weighted * combined_output.to(dtype)).sum(dim=-1)
             grad_top_probs = torch.zeros(num_tokens, top_k, dtype=grad_permuted_probs.dtype, device=device)
             slot_ids = sorted_indices % top_k
             grad_top_probs[token_ids, slot_ids] = grad_permuted_probs
-            top_probs_saved = top_probs  # already normalized in forward
+            top_probs_saved = top_probs
             grad_dot = (grad_top_probs * top_probs_saved).sum(dim=-1, keepdim=True)
             grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs_saved) / top_probs_saved.sum(dim=-1, keepdim=True).clamp(min=1e-6)
             grad_router_probs = torch.zeros_like(router_probs)
             grad_router_probs.scatter_(1, top_indices, grad_raw_top_probs)
             sum_grad_probs = (grad_router_probs * router_probs).sum(dim=-1, keepdim=True)
             grad_router_logits = router_probs * (grad_router_probs - sum_grad_probs)
-            grad_ln2_flat_from_router = torch.matmul(grad_router_logits.float(), router_weight.t().float()).to(dtype)
+            grad_ln2_flat_from_router = torch.matmul(
+                grad_router_logits.float(), router_weight.t().float()).to(dtype)
 
-        # Router dW (AllToAll 可重叠)
         with _timed_overlap("bwd", "router_dw"):
             grad_router_weight = torch.matmul(ln2_flat.t().float(), grad_router_logits.float())
 
-        # Combine gradients from tokens and router
         grad_ln2_flat = grad_ln2_flat_from_tokens + grad_ln2_flat_from_router
 
-        # LayerNorm2 backward
+        # LayerNorm2 backward (PyTorch)
         mean2 = hidden_after_attn.mean(dim=-1, keepdim=True)
         var2 = hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
         std2 = (var2 + 1e-5).sqrt()
         normalized2 = (hidden_after_attn - mean2) / std2
 
         grad_ln2_out = grad_ln2_flat.view(seq_len, batch_size, hidden_size)
-        with _timed_overlap("bwd", "ln2_dw"):  # LN2 dW (AllToAll 可重叠)
+        with _timed_overlap("bwd", "ln2_dw"):
             grad_ln2_weight = (grad_ln2_out * normalized2).sum(dim=(0, 1))
             grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
-        with _timed_overlap("bwd", "ln2_dx"):  # LN2 dX (AR 可重叠)
+        with _timed_overlap("bwd", "ln2_dx"):
             grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std2
 
         # ===================== Attention Backward =====================
-        # OutProj dW (AllToAll 可重叠)
         grad_proj_out = grad_hidden_after_attn.view(seq_len, batch_size, hidden_size)
         with _timed_overlap("bwd", "proj_dw"):
             grad_proj_weight = torch.matmul(
                 grad_proj_out.view(-1, hidden_size).t(),
-                attn_out_sp.view(-1, num_heads * head_dim)
-            )
-        # OutProj dX (pipeline 关键路径, 暴露: 1/n3)
+                attn_out_sp.view(-1, num_heads * head_dim))
         with _timed_overlap("bwd", "proj_dx"):
-            grad_attn_out_sp = torch.matmul(grad_proj_out.view(-1, hidden_size), proj_weight)
-            grad_attn_out_sp = grad_attn_out_sp.view(seq_len, batch_size, num_heads, head_dim)
+            grad_attn_out_sp = torch.matmul(
+                grad_proj_out.view(-1, hidden_size), proj_weight)
+            grad_attn_out_sp = grad_attn_out_sp.view(
+                seq_len, batch_size, num_heads, head_dim)
 
-        # sp2hp AllToAll backward
         grad_attn_out = _all_to_all_sp2hp(grad_attn_out_sp, cp_group)
 
-        # SDPA backward (AR 可重叠)
         grad_attn_bf = grad_attn_out.permute(1, 2, 0, 3)
         with _timed_overlap("bwd", "sdpa_dx"):
             grad_q_bf, grad_k_bf, grad_v_bf = torch.autograd.grad(
                 attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
-                grad_attn_bf, retain_graph=False,
-            )
+                grad_attn_bf, retain_graph=False)
 
         grad_q_hp = grad_q_bf.permute(2, 0, 1, 3)
         grad_k_hp = grad_k_bf.permute(2, 0, 1, 3)
         grad_v_hp = grad_v_bf.permute(2, 0, 1, 3)
 
-        # hp2sp AllToAll backward (combined QKV)
         grad_qkv_hp = torch.cat([grad_q_hp, grad_k_hp, grad_v_hp], dim=2)
         grad_qkv_sp = _all_to_all_hp2sp(grad_qkv_hp, cp_group)
         grad_q_sp = grad_qkv_sp[:, :, :num_heads, :]
         grad_k_sp = grad_qkv_sp[:, :, num_heads:num_heads + num_kv_heads, :]
         grad_v_sp = grad_qkv_sp[:, :, num_heads + num_kv_heads:, :]
 
-        # QKV reshape (shared setup)
         q_per_kv = num_heads // num_kv_heads
-        grad_qkv = torch.zeros(seq_len, batch_size, num_kv_heads, (q_per_kv + 2) * head_dim,
-                               dtype=dtype, device=device)
+        grad_qkv = torch.zeros(seq_len, batch_size, num_kv_heads,
+                                (q_per_kv + 2) * head_dim, dtype=dtype, device=device)
         q_dim = q_per_kv * head_dim
-        grad_qkv[:, :, :, :q_dim] = grad_q_sp.view(seq_len, batch_size, num_kv_heads, q_dim)
+        grad_qkv[:, :, :, :q_dim] = grad_q_sp.view(
+            seq_len, batch_size, num_kv_heads, q_dim)
         grad_qkv[:, :, :, q_dim:q_dim + head_dim] = grad_k_sp
         grad_qkv[:, :, :, q_dim + head_dim:] = grad_v_sp
         grad_qkv_flat = grad_qkv.view(seq_len * batch_size, -1)
 
-        # QKV dW (AllToAll 可重叠)
         with _timed_overlap("bwd", "qkv_dw"):
-            grad_qkv_weight = torch.matmul(grad_qkv_flat.t(), ln1_out.view(-1, hidden_size))
-        # QKV dX (pipeline 关键路径, 暴露: 1/n4)
+            grad_qkv_weight = torch.matmul(
+                grad_qkv_flat.t(), ln1_out.view(-1, hidden_size))
         with _timed_overlap("bwd", "qkv_dx"):
-            grad_ln1_out = torch.matmul(grad_qkv_flat, qkv_weight).view(seq_len, batch_size, hidden_size)
+            grad_ln1_out = torch.matmul(
+                grad_qkv_flat, qkv_weight).view(seq_len, batch_size, hidden_size)
 
-        # Residual
         grad_hidden_states = grad_hidden_after_attn.clone()
 
-        # LayerNorm1 backward
+        # LayerNorm1 backward (PyTorch)
         mean1 = hidden_states.mean(dim=-1, keepdim=True)
         var1 = hidden_states.var(dim=-1, unbiased=False, keepdim=True)
         std1 = (var1 + 1e-5).sqrt()
         normalized1 = (hidden_states - mean1) / std1
 
-        # LN1 dW (AllToAll 可重叠)
         with _timed_overlap("bwd", "ln1_dw"):
             grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
             grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
-        # LN1 dX (AR 可重叠)
         with _timed_overlap("bwd", "ln1_dx"):
             grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
 
@@ -528,9 +491,9 @@ class BaselineTransformerFunction(torch.autograd.Function):
             grad_qkv_weight, grad_proj_weight,
             grad_router_weight,
             grad_moe_w1, grad_moe_w2,
-            None, None,  # groups
-            None, None, None, None, None,  # num_heads, num_kv_heads, num_experts, top_k, activation_func
-            None,  # capacity_factor
+            None, None,
+            None, None, None, None, None,
+            None,
         )
 
 
@@ -538,16 +501,13 @@ def _all_to_all_sp2hp(x: torch.Tensor, group) -> torch.Tensor:
     """sp2hp AllToAll (Ulysses style)."""
     cp = group.size()
     seq_local, batch, heads, dim = x.shape
-
     x = x.contiguous().view(seq_local, batch, cp, heads // cp, dim)
     x = x.permute(2, 0, 1, 3, 4).contiguous().view(seq_local * cp, -1)
-
     output = torch.empty_like(x)
     dist.all_to_all_single(output, x,
                            output_split_sizes=[seq_local] * cp,
                            input_split_sizes=[seq_local] * cp,
                            group=group)
-
     return output.view(seq_local * cp, batch, heads // cp, dim)
 
 
@@ -556,31 +516,32 @@ def _all_to_all_hp2sp(x: torch.Tensor, group) -> torch.Tensor:
     cp = group.size()
     seq_full, batch, heads_local, dim = x.shape
     seq_local = seq_full // cp
-
     x = x.contiguous().view(seq_full, batch * heads_local * dim)
-
     output = torch.empty_like(x)
     dist.all_to_all_single(output, x,
                            output_split_sizes=[seq_local] * cp,
                            input_split_sizes=[seq_local] * cp,
                            group=group)
-
     output = output.view(cp, seq_local, batch, heads_local, dim)
     output = output.permute(1, 2, 0, 3, 4).contiguous()
     return output.view(seq_local, batch, heads_local * cp, dim)
 
 
-def _moe_all_to_all(x: torch.Tensor, send_splits: List[int], recv_splits: List[int], group) -> torch.Tensor:
-    """MoE AllToAll."""
-    output = torch.empty(sum(recv_splits), x.shape[1], dtype=x.dtype, device=x.device)
-    input_list = list(x.split(send_splits, dim=0))
-    output_list = list(output.split(recv_splits, dim=0))
-    dist.all_to_all(output_list, input_list, group=group)
-    return torch.cat(output_list, dim=0)
+def _moe_all_to_all_uniform(
+    x: torch.Tensor, S: int, ep_size: int, group,
+) -> torch.Tensor:
+    """MoE AllToAll with uniform splits (capacity-padded)."""
+    output = torch.empty_like(x)
+    splits = [S] * ep_size
+    dist.all_to_all_single(output, x,
+                           output_split_sizes=splits,
+                           input_split_sizes=splits,
+                           group=group)
+    return output
 
 
 class BaselineTransformerLayer(nn.Module):
-    """Baseline Transformer layer with attention recomputation (fair comparison)."""
+    """Baseline Transformer layer with PyTorch ops + same padding as FluidMoE."""
 
     def __init__(
         self,
@@ -617,7 +578,6 @@ class BaselineTransformerLayer(nn.Module):
         self.ep_size = ep_group.size()
 
         num_local_experts = num_experts // self.ep_size
-        head_dim = hidden_size // num_heads
 
         # LayerNorm
         self.ln1_weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
@@ -626,6 +586,7 @@ class BaselineTransformerLayer(nn.Module):
         self.ln2_bias = nn.Parameter(torch.zeros(hidden_size, dtype=dtype, device=device))
 
         # Attention weights
+        head_dim = hidden_size // num_heads
         q_per_kv = num_heads // num_kv_heads
         qkv_size = num_kv_heads * (q_per_kv + 2) * head_dim
         self.qkv_weight = nn.Parameter(torch.empty(qkv_size, hidden_size, dtype=dtype, device=device))

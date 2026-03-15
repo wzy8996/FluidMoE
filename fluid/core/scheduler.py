@@ -81,23 +81,32 @@ class _FlatARBuffer:
                 (self.fp32 is not None and self.read_fp32 < self.fp32.numel()))
 
     def trickle(self, group, budget, min_numel):
-        """Submit budgeted AR, return number of ops submitted."""
+        """Submit budgeted AR, return (ops_submitted, bytes_submitted)."""
         ops = 0
+        bytes_sub = 0
         if self.bf16 is not None and self.read_bf16 < self.write_bf16:
             start = self.read_bf16
             end = min(start + budget // 2, self.write_bf16) if budget > 0 else self.write_bf16
             if (end - start) >= min_numel:
                 dist.all_reduce(self.bf16[start:end], group=group)
                 self.read_bf16 = end
+                bytes_sub += (end - start) * 2
                 ops += 1
         if self.fp32 is not None and self.read_fp32 < self.write_fp32:
             start = self.read_fp32
-            end = self.write_fp32
+            if budget > 0:
+                remaining = budget - bytes_sub
+                if remaining <= 0:
+                    return ops, bytes_sub
+                end = min(start + remaining // 4, self.write_fp32)
+            else:
+                end = self.write_fp32
             if (end - start) >= min_numel:
                 dist.all_reduce(self.fp32[start:end], group=group)
                 self.read_fp32 = end
+                bytes_sub += (end - start) * 4
                 ops += 1
-        return ops
+        return ops, bytes_sub
 
     def flush(self, group):
         """Submit AR for all remaining buffer elements, return number of ops."""
@@ -294,13 +303,10 @@ class BackwardScheduler:
     def setup_ar_buffer(self, params):
         """Set up flat AR buffer for shared parameters in backward execution order."""
         self._shared_ar.setup(params)
-        # Merge param_map into legacy accessor (used by execute_dw_tasks)
-        self._ar_param_map = self._shared_ar.param_map
 
     def setup_expert_ar_buffer(self, params):
         """Set up flat AR buffer for expert parameters."""
         self._expert_ar.setup(params)
-        self._expert_ar_param_map = self._expert_ar.param_map
 
     def _use_interleaved_ar(self) -> bool:
         return self.ar_enabled and (not self.ar_safe_mode)
@@ -521,9 +527,11 @@ class BackwardScheduler:
             ops = 0
             if has_shared:
                 # Unlimited budget: flush everything written so far
-                ops += self._shared_ar.trickle(ar_group, 0, _MIN)
+                s_ops, _ = self._shared_ar.trickle(ar_group, 0, _MIN)
+                ops += s_ops
             if has_expert:
-                ops += self._expert_ar.trickle(expert_group, 0, _MIN)
+                e_ops, _ = self._expert_ar.trickle(expert_group, 0, _MIN)
+                ops += e_ops
             while self._pending_ar_tensors:
                 grad = self._pending_ar_tensors.popleft()
                 if grad is not None:
@@ -560,20 +568,25 @@ class BackwardScheduler:
         with torch.cuda.stream(self.comm_stream):
             self.comm_stream.wait_stream(self.default_stream)
             ops = 0
+            bytes_used = 0
             if has_shared:
-                ops += self._shared_ar.trickle(ar_group, budget, _MIN)
+                s_ops, s_bytes = self._shared_ar.trickle(ar_group, budget, _MIN)
+                ops += s_ops
+                bytes_used += s_bytes
             if has_expert:
-                ops += self._expert_ar.trickle(expert_group, budget, _MIN)
+                remaining = max(budget - bytes_used, 0) if budget > 0 else 0
+                e_ops, e_bytes = self._expert_ar.trickle(expert_group, remaining, _MIN)
+                ops += e_ops
+                bytes_used += e_bytes
             # Fallback: pending tensors
-            bytes_sub = 0
             while self._pending_ar_tensors:
-                if budget > 0 and bytes_sub >= budget:
+                if budget > 0 and bytes_used >= budget:
                     break
                 grad = self._pending_ar_tensors.popleft()
                 if grad is None:
                     continue
                 dist.all_reduce(grad, group=ar_group)
-                bytes_sub += grad.numel() * grad.element_size()
+                bytes_used += grad.numel() * grad.element_size()
                 ops += 1
 
         self._ar_task_count += ops

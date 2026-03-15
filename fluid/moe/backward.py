@@ -587,12 +587,20 @@ def recompute_fc1_gemm(
     if weight1.shape[0] == 1:
         torch.mm(all_expert_tokens, weight1[0], out=all_fc1)
     else:
-        offset = 0
-        for i, n in enumerate(all_tokens_per_expert):
-            n = int(n)
-            if n > 0:
-                torch.mm(all_expert_tokens[offset:offset + n], weight1[i], out=all_fc1[offset:offset + n])
-                offset += n
+        # Use GroupedGEMM (same as Megatron): tokens @ w1 (trans_b=False)
+        gmm_result = _grouped_gemm_or_none(
+            all_expert_tokens, weight1, all_tokens_per_expert, trans_b=False)
+        if gmm_result is not None:
+            all_fc1.copy_(gmm_result)
+        else:
+            # Fallback: per-expert loop
+            offset = 0
+            for i, n in enumerate(all_tokens_per_expert):
+                n = int(n)
+                if n > 0:
+                    torch.mm(all_expert_tokens[offset:offset + n], weight1[i],
+                             out=all_fc1[offset:offset + n])
+                    offset += n
     return all_fc1
 
 
@@ -1191,9 +1199,8 @@ def fc1_dispatch_backward(
     # Step 3: dW tasks overlap with remaining AllToAll
     _maybe_execute_dw_tasks(scheduler, for_dispatch=True)
 
-    # Step 4: Wait all chunks + reassemble
+    # Step 4: Per-chunk wait + reassemble (overlaps reassembly copy with remaining AllToAll)
     nvtx_range_push("wait_reassemble")
-    scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids), try_trickle=True)
 
     grad_tokens = _BWD_POOL.get_2d(
         tag="dispatch_grad_tokens", rows=total_send, cols=hidden_size,
@@ -1205,6 +1212,8 @@ def fc1_dispatch_backward(
         nle_c = _r2_cfg['nle_c'] if _r2_cfg is not None else nle // num_chunks
         grad_tokens_4d = grad_tokens.view(ep_size, nle, cap, hidden_size)
         for c in range(num_chunks):
+            is_last = (c == num_chunks - 1)
+            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
             off = c * chunk_total
             grad_tokens_4d[:, c * nle_c:(c + 1) * nle_c, :, :].copy_(
                 _dispatch_out_all[off:off + chunk_total].view(
@@ -1224,6 +1233,8 @@ def fc1_dispatch_backward(
             _base = _r * (nle * cap) + _e * cap
             r2_scatter_indices = [_base + c * cap_c + _t for c in range(num_chunks)]
         for c in range(num_chunks):
+            is_last = (c == num_chunks - 1)
+            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
             off = c * chunk_total
             row_scatter(
                 _dispatch_out_all[off:off + chunk_total],
@@ -1277,13 +1288,12 @@ def router_backward(
     token_ids = sorted_indices // top_k
     slot_ids = sorted_indices % top_k
     grad_top_probs[token_ids, slot_ids] = grad_permuted_probs
-    top_probs_saved = top_probs  # already normalized in forward
 
     # Step 2: Backward through normalization
     # top_probs = raw_top_probs / sum(raw_top_probs)
     # grad_raw[i] = grad_top[i] / s - (grad_top · top_probs) * top_probs[i] / s
-    grad_dot = (grad_top_probs * top_probs_saved).sum(dim=-1, keepdim=True)
-    grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs_saved) / top_probs_saved.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    grad_dot = (grad_top_probs * top_probs).sum(dim=-1, keepdim=True)
+    grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs) / top_probs.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
     # Step 3: Backward through top-k selection
     # top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)

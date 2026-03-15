@@ -10,11 +10,14 @@ import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from typing import Optional, Callable, Tuple, List
+from typing import Optional, Callable
 
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.scheduler import get_backward_scheduler
-from fluid.core.te_ops import te_layernorm_fwd
+from fluid.core.te_ops import (
+    te_layernorm_fwd_with_stats, te_layernorm_bwd,
+    create_te_dpa, create_te_linear,
+)
 # Import forward operations
 from fluid.attention.forward import (
     qkv_projection_p2p_forward,
@@ -88,6 +91,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         activation_func: Callable,
         capacity_factor: float,
         chunk_config: Optional[dict] = None,
+        # TE modules (None if TE unavailable)
+        te_qkv_linear=None,
+        te_proj_linear=None,
+        te_attn=None,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
         needs_grad = hidden_states.requires_grad
@@ -114,21 +121,16 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Attention Block: LN1 -> Attention -> Residual
         # =====================================================================
 
-        # LayerNorm 1
-        ln1_out = te_layernorm_fwd(hidden_states, ln1_weight, ln1_bias)
+        # LayerNorm 1 (save stats for TE fused backward)
+        ln1_out, ln1_mu, ln1_rsigma = te_layernorm_fwd_with_stats(
+            hidden_states, ln1_weight, ln1_bias)
 
-        # QKV Projection with P2P overlap
+        # QKV Projection with P2P overlap (uses TE Linear when available)
         # Returns q, k, v in format [seq_full, batch, heads_local, head_dim]
         q_hp, k_hp, v_hp = qkv_projection_p2p_forward(
             ln1_out, qkv_weight_d, num_heads, num_kv_heads, head_dim,
-            cp_group, attn_overlap_ctx
+            cp_group, attn_overlap_ctx, te_qkv_linear=te_qkv_linear
         )
-
-        # Convert to batch-first format for attention: [seq, batch, heads, dim] -> [batch, heads, seq, dim]
-        # Note: permute creates a view, matmul works with non-contiguous tensors
-        q_bf = q_hp.permute(1, 2, 0, 3)  # [batch, q_heads_local, seq, head_dim]
-        k_bf = k_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
-        v_bf = v_hp.permute(1, 2, 0, 3)  # [batch, kv_heads_local, seq, head_dim]
 
         # Compute scale for attention
         scale = 1.0 / (head_dim ** 0.5)
@@ -138,32 +140,49 @@ class TransformerLayerFunction(torch.autograd.Function):
         kv_heads_local = num_kv_heads // cp_size
         enable_gqa = (q_heads_local != kv_heads_local)
 
-        # Scaled Dot-Product Attention with native GQA support (PyTorch 2.5+)
-        # Input: Q [batch, q_heads, seq, dim], K/V [batch, kv_heads, seq, dim]
-        # Output: [batch, q_heads, seq, head_dim]
-        #
-        # Keep computation graph for backward: avoids redundant SDPA forward in backward.
-        # FlashAttention only stores logsumexp (O(seq) memory), not full attention matrix.
-        if needs_grad:
-            with torch.enable_grad():
-                q_for_attn = q_bf.detach().requires_grad_(True)
-                k_for_attn = k_bf.detach().requires_grad_(True)
-                v_for_attn = v_bf.detach().requires_grad_(True)
-                attn_out_bf = scaled_dot_product_attention_forward(
-                    q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
-                )
+        # Scaled Dot-Product Attention
+        # Keep computation graph for backward: avoids redundant forward in backward.
+        if te_attn is not None:
+            # TE DotProductAttention: uses sbhd format [seq, batch, heads, dim]
+            # Output is 3D [seq, batch, hidden] (heads*head_dim flattened)
+            if needs_grad:
+                with torch.enable_grad():
+                    q_for_attn = q_hp.detach().requires_grad_(True)
+                    k_for_attn = k_hp.detach().requires_grad_(True)
+                    v_for_attn = v_hp.detach().requires_grad_(True)
+                    attn_out_te = te_attn(
+                        q_for_attn, k_for_attn, v_for_attn,
+                        attention_mask=None,
+                    )
+            else:
+                attn_out_te = te_attn(q_hp, k_hp, v_hp, attention_mask=None)
+            # Reshape TE output from 3D [seq, batch, hidden] to 4D [seq, batch, heads, dim]
+            attn_out = attn_out_te.view(
+                q_hp.shape[0], q_hp.shape[1], q_heads_local, head_dim
+            ).contiguous()
         else:
-            attn_out_bf = scaled_dot_product_attention_forward(
-                q_bf, k_bf, v_bf, scale=scale, is_causal=True, enable_gqa=enable_gqa
-            )
+            # PyTorch SDPA: needs bhsd format [batch, heads, seq, dim]
+            q_bf = q_hp.permute(1, 2, 0, 3)
+            k_bf = k_hp.permute(1, 2, 0, 3)
+            v_bf = v_hp.permute(1, 2, 0, 3)
+            if needs_grad:
+                with torch.enable_grad():
+                    q_for_attn = q_bf.detach().requires_grad_(True)
+                    k_for_attn = k_bf.detach().requires_grad_(True)
+                    v_for_attn = v_bf.detach().requires_grad_(True)
+                    attn_out_bf = scaled_dot_product_attention_forward(
+                        q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
+                    )
+            else:
+                attn_out_bf = scaled_dot_product_attention_forward(
+                    q_bf, k_bf, v_bf, scale=scale, is_causal=True, enable_gqa=enable_gqa
+                )
+            attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
 
-        # Convert back to seq-first: [batch, heads, seq, dim] -> [seq, batch, heads, dim]
-        # Need contiguous for output_projection_p2p_forward's P2P slicing
-        attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
-
-        # Output Projection with P2P overlap
+        # Output Projection with P2P overlap (uses TE Linear when available)
         proj_out, attn_input_full = output_projection_p2p_forward(
-            attn_out, proj_weight_d, None, cp_group, attn_overlap_ctx
+            attn_out, proj_weight_d, None, cp_group, attn_overlap_ctx,
+            te_proj_linear=te_proj_linear
         )
 
         # Residual connection
@@ -173,8 +192,9 @@ class TransformerLayerFunction(torch.autograd.Function):
         # MoE Block: LN2 -> MoE -> Residual
         # =====================================================================
 
-        # LayerNorm 2
-        ln2_out = te_layernorm_fwd(hidden_after_attn, ln2_weight, ln2_bias)
+        # LayerNorm 2 (save stats for TE fused backward)
+        ln2_out, ln2_mu, ln2_rsigma = te_layernorm_fwd_with_stats(
+            hidden_after_attn, ln2_weight, ln2_bias)
 
         # Flatten for MoE: [seq, batch, hidden] -> [seq*batch, hidden]
         ln2_flat = ln2_out.view(-1, hidden_size)
@@ -213,10 +233,10 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Dispatch + FC1 with P2P overlap
         (local_tokens, local_act, recv_act_results, recv_buffers,
-         moe_partners, recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
+         moe_partners, _recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
-            tokens_per_expert, needs_backward=needs_grad,
+            tokens_per_expert,
             pre_tokens_cpu=pre_tokens_cpu,
         )
 
@@ -263,6 +283,8 @@ class TransformerLayerFunction(torch.autograd.Function):
                 ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                 qkv_weight.detach(), proj_weight.detach(),
                 router_weight.detach(), moe_w1.detach(), moe_w2.detach(),
+                # LN stats for TE fused backward
+                ln1_mu, ln1_rsigma, ln2_mu, ln2_rsigma,
             )
             # Store non-tensor merge results on ctx
             ctx.all_tokens_per_expert = all_tokens_per_expert
@@ -272,7 +294,11 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx._q_for_attn = q_for_attn
             ctx._k_for_attn = k_for_attn
             ctx._v_for_attn = v_for_attn
-            ctx._attn_out_bf = attn_out_bf
+            ctx._used_te_attn = (te_attn is not None)
+            if te_attn is not None:
+                ctx._attn_out_bf = attn_out_te  # TE DPA output: 3D [seq, batch, hidden]
+            else:
+                ctx._attn_out_bf = attn_out_bf  # PyTorch SDPA: bhsd [batch, heads, seq, dim]
             ctx._enable_gqa = enable_gqa
             # Store original weights for gradient assignment
             ctx._orig_ln1_weight = ln1_weight
@@ -337,7 +363,8 @@ class TransformerLayerFunction(torch.autograd.Function):
          combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight,
-         router_weight, moe_w1_2d, moe_w2_2d) = ctx.saved_tensors
+         router_weight, moe_w1_2d, moe_w2_2d,
+         ln1_mu, ln1_rsigma, ln2_mu, ln2_rsigma) = ctx.saved_tensors
 
         # Retrieve pre-computed merge results
         all_tokens_per_expert = ctx.all_tokens_per_expert
@@ -462,7 +489,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         # forward-saved tensors and pre-R1 grad computations.
         # =================================================================
         router_result = [None, None]  # [grad_hidden_from_router, grad_router_logits]
-        ln2_cache = [None, None]      # [std, normalized]
         grad_router_weight = None
         grad_ln2_weight = None
         grad_ln2_bias = None
@@ -511,26 +537,9 @@ class TransformerLayerFunction(torch.autograd.Function):
                 weight_param=orig_router_weight,
             )
 
-            # --- LN2 normalize precompute (no weight, just cache std & normalized) ---
-            _hidden_after_attn = hidden_after_attn.detach()
-
-            def _ln2_norm_task():
-                mean = _hidden_after_attn.mean(dim=-1, keepdim=True)
-                var = _hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
-                ln2_cache[0] = (var + 1e-5).sqrt()
-                ln2_cache[1] = (_hidden_after_attn - mean) / ln2_cache[0]
-                return None
-
-            scheduler.register_dw_task(
-                layer_name=f"ln2_norm_L{layer_id}",
-                layer_id=layer_id,
-                compute_fn=_ln2_norm_task,
-                weight_param=None,
-            )
-
         # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
         # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
-        # dW window now also executes: router_bwd → router_dw → ln2_norm → moe dW
+        # dW window now also executes: router_bwd → router_dw → moe dW
         row_idx_exp_to_rank = backward_indices['row_idx_exp_to_rank']
 
         scheduler.begin_region('moe_dispatch')
@@ -574,50 +583,34 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Combine MoE gradients
         grad_ln2_flat = grad_hidden_from_moe_tokens + router_result[0]
 
-        # LayerNorm 2 backward
+        # LayerNorm 2 backward (TE fused kernel: computes dx, dw, db in one launch)
         grad_ln2_out = grad_ln2_flat.view(seq_len, batch_size, hidden_size)
-
-        if is_enabled:
-            # LN2 normalize was precomputed in R2 overlap window
-            std = ln2_cache[0]
-            normalized = ln2_cache[1]
-        else:
-            mean = hidden_after_attn.mean(dim=-1, keepdim=True)
-            var = hidden_after_attn.var(dim=-1, unbiased=False, keepdim=True)
-            std = (var + 1e-5).sqrt()
-            normalized = (hidden_after_attn - mean) / std
-
-        # dX: gradient through LayerNorm
-        grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_out * ln2_weight / std
+        grad_ln2_dx, grad_ln2_weight_val, grad_ln2_bias_val = te_layernorm_bwd(
+            grad_ln2_out, hidden_after_attn, ln2_mu, ln2_rsigma, ln2_weight)
+        grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_dx
 
         # Register dW tasks for LN2 (execute during R3 overlap)
         if is_enabled:
-            grad_ln2_out_saved = grad_ln2_out.detach()
-            normalized_saved = normalized.detach()
-
-            def compute_ln2_weight_dw():
-                return (grad_ln2_out_saved * normalized_saved).sum(dim=(0, 1))
-
-            def compute_ln2_bias_dw():
-                return grad_ln2_out_saved.sum(dim=(0, 1))
+            _ln2_dw = grad_ln2_weight_val.detach()
+            _ln2_db = grad_ln2_bias_val.detach()
 
             scheduler.register_dw_task(
                 layer_name=f"ln2_weight_L{layer_id}",
                 layer_id=layer_id,
-                compute_fn=compute_ln2_weight_dw,
+                compute_fn=lambda: _ln2_dw,
                 weight_param=orig_ln2_weight,
                 needs_ar=True,
             )
             scheduler.register_dw_task(
                 layer_name=f"ln2_bias_L{layer_id}",
                 layer_id=layer_id,
-                compute_fn=compute_ln2_bias_dw,
+                compute_fn=lambda: _ln2_db,
                 weight_param=orig_ln2_bias,
                 needs_ar=True,
             )
         else:
-            grad_ln2_weight = (grad_ln2_out * normalized).sum(dim=(0, 1))
-            grad_ln2_bias = grad_ln2_out.sum(dim=(0, 1))
+            grad_ln2_weight = grad_ln2_weight_val
+            grad_ln2_bias = grad_ln2_bias_val
 
         # =====================================================================
         # Attention Backward
@@ -640,37 +633,31 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Step 16: Attention score backward using saved computation graph
         # Direct autograd.grad on saved SDPA output - no redundant forward pass
         # FlashAttention internally does tiled recomputation (unavoidable by design)
-        grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
-        grad_q, grad_k, grad_v = torch.autograd.grad(
-            attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
-            grad_attn_hp, retain_graph=False
-        )
+        used_te_attn = getattr(ctx, '_used_te_attn', False)
+        if used_te_attn:
+            # TE DPA output is 3D [seq, batch, hidden]; grad_attn_output is 4D [seq, batch, heads, dim]
+            # Flatten grad to 3D to match TE DPA output shape
+            grad_attn_3d = grad_attn_output.view(
+                grad_attn_output.shape[0], grad_attn_output.shape[1], -1
+            )
+            grad_q, grad_k, grad_v = torch.autograd.grad(
+                attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
+                grad_attn_3d, retain_graph=False
+            )
+            # grad_q/k/v are sbhd 4D [seq, batch, heads, dim] → convert to bhsd for hp2sp_qkv_backward
+            grad_q = grad_q.permute(1, 2, 0, 3)
+            grad_k = grad_k.permute(1, 2, 0, 3)
+            grad_v = grad_v.permute(1, 2, 0, 3)
+        else:
+            # PyTorch SDPA: attn_out_bf is bhsd [batch, heads, seq, dim]
+            grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
+            grad_q, grad_k, grad_v = torch.autograd.grad(
+                attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
+                grad_attn_hp, retain_graph=False
+            )
 
-        # =================================================================
-        # Register LN1 normalize precompute as scheduler task.
-        # R4's dW window is otherwise empty (R3 already drained the queue).
-        # LN1 normalize only depends on hidden_states (forward-saved).
-        # =================================================================
-        ln1_cache = [None, None]  # [std1, normalized1]
         grad_ln1_weight = None
         grad_ln1_bias = None
-
-        if is_enabled:
-            _hidden_states_saved = hidden_states.detach()
-
-            def _ln1_norm_task():
-                mean1 = _hidden_states_saved.mean(dim=-1, keepdim=True)
-                var1 = _hidden_states_saved.var(dim=-1, unbiased=False, keepdim=True)
-                ln1_cache[0] = (var1 + 1e-5).sqrt()
-                ln1_cache[1] = (_hidden_states_saved - mean1) / ln1_cache[0]
-                return None
-
-            scheduler.register_dw_task(
-                layer_name=f"ln1_norm_L{layer_id}",
-                layer_id=layer_id,
-                compute_fn=_ln1_norm_task,
-                weight_param=None,
-            )
 
         # Region 4: hp2sp AllToAll → QKV dX (communication-first pipeline)
         scheduler.begin_region('attn_qkv')
@@ -686,48 +673,33 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Step 18: Residual backward - grad flows to hidden_states
         grad_hidden_states = grad_hidden_after_attn
 
-        # Step 19: LayerNorm 1 backward
-        if is_enabled:
-            # LN1 normalize was precomputed in R4 overlap window
-            std1 = ln1_cache[0]
-            normalized1 = ln1_cache[1]
-        else:
-            mean1 = hidden_states.mean(dim=-1, keepdim=True)
-            var1 = hidden_states.var(dim=-1, unbiased=False, keepdim=True)
-            std1 = (var1 + 1e-5).sqrt()
-            normalized1 = (hidden_states - mean1) / std1
-
-        # dX: gradient through LayerNorm
-        grad_hidden_states = grad_hidden_states + grad_ln1_out * ln1_weight / std1
+        # Step 19: LayerNorm 1 backward (TE fused kernel)
+        grad_ln1_dx, grad_ln1_weight_val, grad_ln1_bias_val = te_layernorm_bwd(
+            grad_ln1_out, hidden_states, ln1_mu, ln1_rsigma, ln1_weight)
+        grad_hidden_states = grad_hidden_states + grad_ln1_dx
 
         # Register dW tasks for LN1 (execute during next layer's R1)
         if is_enabled:
-            grad_ln1_out_saved = grad_ln1_out.detach()
-            normalized1_saved = normalized1.detach()
-
-            def compute_ln1_weight_dw():
-                return (grad_ln1_out_saved * normalized1_saved).sum(dim=(0, 1))
-
-            def compute_ln1_bias_dw():
-                return grad_ln1_out_saved.sum(dim=(0, 1))
+            _ln1_dw = grad_ln1_weight_val.detach()
+            _ln1_db = grad_ln1_bias_val.detach()
 
             scheduler.register_dw_task(
                 layer_name=f"ln1_weight_L{layer_id}",
                 layer_id=layer_id,
-                compute_fn=compute_ln1_weight_dw,
+                compute_fn=lambda: _ln1_dw,
                 weight_param=orig_ln1_weight,
                 needs_ar=True,
             )
             scheduler.register_dw_task(
                 layer_name=f"ln1_bias_L{layer_id}",
                 layer_id=layer_id,
-                compute_fn=compute_ln1_bias_dw,
+                compute_fn=lambda: _ln1_db,
                 weight_param=orig_ln1_bias,
                 needs_ar=True,
             )
         else:
-            grad_ln1_weight = (grad_ln1_out * normalized1).sum(dim=(0, 1))
-            grad_ln1_bias = grad_ln1_out.sum(dim=(0, 1))
+            grad_ln1_weight = grad_ln1_weight_val
+            grad_ln1_bias = grad_ln1_bias_val
 
         # Return gradients in same order as forward inputs
         return (
@@ -747,6 +719,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             None,                 # activation_func
             None,                 # capacity_factor
             None,                 # chunk_config
+            None, None, None,     # te_qkv_linear, te_proj_linear, te_attn
         )
 
 
@@ -840,8 +813,31 @@ class TransformerLayer(nn.Module):
         # Attention weights (QKV packed)
         q_per_kv = num_heads // num_kv_heads
         qkv_size = num_kv_heads * (q_per_kv + 2) * head_dim
-        self.qkv_weight = nn.Parameter(torch.empty(qkv_size, hidden_size, dtype=dtype, device=device))
-        self.proj_weight = nn.Parameter(torch.empty(hidden_size, num_heads * head_dim, dtype=dtype, device=device))
+
+        # TE modules for attention (DotProductAttention + Linear)
+        self.te_qkv_linear = create_te_linear(
+            hidden_size, qkv_size, bias=False,
+            params_dtype=dtype, device=device,
+            init_method=nn.init.xavier_uniform_,
+        )
+        self.te_proj_linear = create_te_linear(
+            num_heads * head_dim, hidden_size, bias=False,
+            params_dtype=dtype, device=device,
+            init_method=nn.init.xavier_uniform_,
+        )
+        q_heads_local = num_heads // cp_size
+        kv_heads_local = num_kv_heads // cp_size
+        self.te_attn = create_te_dpa(
+            q_heads_local, head_dim,
+            num_kv_heads=kv_heads_local,
+            layer_number=layer_id,
+        )
+
+        # If TE unavailable, fall back to raw nn.Parameter
+        if self.te_qkv_linear is None:
+            self.qkv_weight = nn.Parameter(torch.empty(qkv_size, hidden_size, dtype=dtype, device=device))
+        if self.te_proj_linear is None:
+            self.proj_weight = nn.Parameter(torch.empty(hidden_size, num_heads * head_dim, dtype=dtype, device=device))
 
         # MoE weights (stored in 3D shape to avoid permute overhead)
         # w1: [num_local_experts, hidden_size, ffn_hidden_size] for matmul(tokens, w1[exp])
@@ -856,9 +852,24 @@ class TransformerLayer(nn.Module):
 
         self._reset_parameters()
 
+    def _get_qkv_weight(self):
+        """Get QKV weight tensor (from TE Linear or raw Parameter)."""
+        if self.te_qkv_linear is not None:
+            return self.te_qkv_linear.weight
+        return self.qkv_weight
+
+    def _get_proj_weight(self):
+        """Get output projection weight tensor (from TE Linear or raw Parameter)."""
+        if self.te_proj_linear is not None:
+            return self.te_proj_linear.weight
+        return self.proj_weight
+
     def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.qkv_weight)
-        nn.init.xavier_uniform_(self.proj_weight)
+        # TE Linear handles its own initialization via init_method
+        if self.te_qkv_linear is None:
+            nn.init.xavier_uniform_(self.qkv_weight)
+        if self.te_proj_linear is None:
+            nn.init.xavier_uniform_(self.proj_weight)
         nn.init.xavier_uniform_(self.router_weight)
         nn.init.xavier_uniform_(self.moe_w1)
         nn.init.xavier_uniform_(self.moe_w2)
@@ -906,7 +917,7 @@ class TransformerLayer(nn.Module):
             x,
             self.ln1_weight, self.ln1_bias,
             self.ln2_weight, self.ln2_bias,
-            self.qkv_weight, self.proj_weight,
+            self._get_qkv_weight(), self._get_proj_weight(),
             self.router_weight, self.moe_w1, self.moe_w2,
             self.cp_group, self.ep_group,
             self.attn_overlap_ctx, self.moe_overlap_ctx,
@@ -919,6 +930,7 @@ class TransformerLayer(nn.Module):
             self.activation_func,
             self.capacity_factor,
             self._moe_chunk_config,
+            self.te_qkv_linear, self.te_proj_linear, self.te_attn,
         )
 
 
@@ -1043,12 +1055,12 @@ class TransformerModel(nn.Module):
         for layer in reversed(self.layers):
             # Expert params first (they execute earlier in MoE backward)
             expert_params.extend([layer.moe_w2, layer.moe_w1])
-            # Then shared params
+            # Then shared params (use accessors to handle TE Linear weights)
             shared_params.extend([
                 layer.router_weight,
                 layer.ln2_weight, layer.ln2_bias,
-                layer.proj_weight,
-                layer.qkv_weight,
+                layer._get_proj_weight(),
+                layer._get_qkv_weight(),
                 layer.ln1_weight, layer.ln1_bias,
             ])
         sched.setup_ar_buffer(shared_params)

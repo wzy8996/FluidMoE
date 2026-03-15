@@ -36,12 +36,9 @@ from .core import (
     _all_to_all,
     _all_to_all_sp2hp_forward,
     _all_to_all_hp2sp_forward,
-    _sort_chunks_by_idxs,
     # P2P scheduling
     compute_round_robin_schedule,
     get_partner_for_round,
-    get_all_partners_ordered,
-    get_num_rounds,
     # Overlap context
     MultiCardOverlapContext,
     # Scheduler
@@ -98,12 +95,9 @@ __all__ = [
     "_all_to_all",
     "_all_to_all_sp2hp_forward",
     "_all_to_all_hp2sp_forward",
-    "_sort_chunks_by_idxs",
     # Core - P2P scheduling
     "compute_round_robin_schedule",
     "get_partner_for_round",
-    "get_all_partners_ordered",
-    "get_num_rounds",
     # Core - Overlap context
     "MultiCardOverlapContext",
     # Core - Scheduler
