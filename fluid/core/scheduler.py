@@ -218,12 +218,13 @@ class BackwardScheduler:
         self._region_gaps = {}
         self.ar_trickle_sizes = {}
 
-        # Profiling
+        # Lightweight profiling
         self.profiling = False
         self._region_name = None
         self._region_profiles = {}
         self._region_a2a_times = []
-        self._region_dw_time = 0.0
+        self._region_dw_pairs = []
+        self._region_start_evt = None
 
         # Communication visibility metrics
         # - a2a_total_ms: sum of A2A kernel durations on comm_stream
@@ -332,11 +333,10 @@ class BackwardScheduler:
         self.total_dw += 1
 
     def execute_dw_tasks(self) -> bool:
+        dw_start_evt = None
         if self.profiling and self._region_name and self._dw_queue:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-        else:
-            t0 = None
+            dw_start_evt = torch.cuda.Event(enable_timing=True)
+            dw_start_evt.record(self.default_stream)
 
         while self._dw_queue:
             task = self._dw_queue.popleft()
@@ -363,9 +363,10 @@ class BackwardScheduler:
 
             self.completed_dw += 1
 
-        if t0 is not None:
-            torch.cuda.synchronize()
-            self._region_dw_time += (time.perf_counter() - t0) * 1000
+        if dw_start_evt is not None:
+            dw_end_evt = torch.cuda.Event(enable_timing=True)
+            dw_end_evt.record(self.default_stream)
+            self._region_dw_pairs.append((dw_start_evt, dw_end_evt))
 
         # Record event after dW writes on default_stream.
         # _trickle_ar uses wait_event to ensure data visibility on comm_stream.
@@ -777,39 +778,56 @@ class BackwardScheduler:
         self._first_a2a_in_region = True
         if not self.profiling:
             return
-        torch.cuda.synchronize()
         self._region_a2a_times = []
-        self._region_dw_time = 0.0
-        self._region_wall_start = time.perf_counter()
+        self._region_dw_pairs = []
+        self._region_start_evt = torch.cuda.Event(enable_timing=True)
+        self._region_start_evt.record(self.default_stream)
 
     def end_region(self):
         if not self.profiling or self._region_name is None:
             self._region_name = None
             return
-        torch.cuda.synchronize()
-        T_region = (time.perf_counter() - self._region_wall_start) * 1000
         name = self._region_name
-        # Resolve deferred event pairs to elapsed times
-        T_comm = sum(s.elapsed_time(e) for s, e in self._region_a2a_times)
-        T_dW = self._region_dw_time
+        region_end_evt = torch.cuda.Event(enable_timing=True)
+        region_end_evt.record(self.default_stream)
         if name not in self._region_profiles:
-            self._region_profiles[name] = {'T_region': 0.0, 'T_comm': 0.0, 'T_dW': 0.0, 'n_a2a': 0, 'count': 0}
+            self._region_profiles[name] = {'records': []}
         p = self._region_profiles[name]
-        p['T_region'] += T_region
-        p['T_comm'] += T_comm
-        p['T_dW'] += T_dW
-        p['n_a2a'] += len(self._region_a2a_times)
-        p['count'] += 1
+        p['records'].append({
+            'region_pair': (self._region_start_evt, region_end_evt),
+            'a2a_pairs': list(self._region_a2a_times),
+            'dw_pairs': list(self._region_dw_pairs),
+        })
+        self._region_start_evt = None
         self._region_name = None
 
     def get_region_profiles(self):
+        torch.cuda.synchronize()
         result = {}
         for name, p in self._region_profiles.items():
-            n = max(p['count'], 1)
-            T_region, T_comm, T_dW = p['T_region']/n, p['T_comm']/n, p['T_dW']/n
-            result[name] = {'T_region': T_region, 'T_comm': T_comm,
-                            'T_comp': max(0, T_region - max(T_comm, T_dW)),
-                            'T_dW': T_dW, 'n_a2a': p['n_a2a'] // n}
+            records = p.get('records', [])
+            if not records:
+                continue
+            region_ms = []
+            comm_ms = []
+            dw_ms = []
+            n_a2a = 0
+            for rec in records:
+                rs, re = rec['region_pair']
+                region_ms.append(rs.elapsed_time(re))
+                comm_ms.append(sum(s.elapsed_time(e) for s, e in rec['a2a_pairs']))
+                dw_ms.append(sum(s.elapsed_time(e) for s, e in rec['dw_pairs']))
+                n_a2a += len(rec['a2a_pairs'])
+            T_region = sum(region_ms) / len(region_ms)
+            T_comm = sum(comm_ms) / len(comm_ms)
+            T_dW = sum(dw_ms) / len(dw_ms)
+            result[name] = {
+                'T_region': T_region,
+                'T_comm': T_comm,
+                'T_comp': max(0, T_region - max(T_comm, T_dW)),
+                'T_dW': T_dW,
+                'n_a2a': n_a2a // len(records),
+            }
         return result
 
     # ========================================
@@ -870,6 +888,7 @@ class BackwardScheduler:
         }
 
     def process_gap_events(self):
+        torch.cuda.synchronize()
         for region, end_evt, start_evt in self._gap_event_pairs:
             gap_ms = end_evt.elapsed_time(start_evt)
             if region not in self._region_gaps:
@@ -907,7 +926,7 @@ class BackwardScheduler:
     def compute_bdp_trickle_size(self, bw_GBps=0.0, percentile=10.0,
                                   safety_factor=0.9, bw_profile=None) -> dict:
         if not self._region_gaps:
-            raise RuntimeError("No region gaps recorded. Run profiling iterations first.")
+            raise RuntimeError("No region gaps recorded. Run lightweight profiling iterations first.")
 
         def _pct(vals, p):
             n = len(vals)

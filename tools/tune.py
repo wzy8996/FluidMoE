@@ -345,7 +345,7 @@ for _ in range(N_AR_WARMUP):
     sched.clear_iteration()
 torch.cuda.synchronize()
 sched.reset_gap_times()
-sched.profiling = True  # 启用 timing events，否则 gap 无法记录
+sched.profiling = True  # 启用轻量事件 profiling，仅记录 gap/A2A 时序
 
 # 采集 per-region gap times (CUDA events) — 无 AR 干扰
 for _ in range(N_AR_ITER):

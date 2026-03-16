@@ -11,15 +11,15 @@ BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'dp_size': 1,
  'cp_size': 2,
  'ep_size': 2,
  'moe_combine_chunks': 2,
- 'moe_dispatch_chunks': 1,
+ 'moe_dispatch_chunks': 2,
  'attn_proj_chunks': 2,
  'attn_qkv_chunks': 4,
  'warmup': 10,
  'iters': 50,
- 'ar_trickle_sizes': {'moe_combine': 93323264,
-                      'moe_dispatch': 122683392,
-                      'attn_proj': 33554432,
-                      'attn_qkv': 29360128}}
+ 'ar_trickle_sizes': {'moe_combine': 105906176,
+                      'moe_dispatch': 63963136,
+                      'attn_proj': 22020096,
+                      'attn_qkv': 12582912}}
 
 TUNE_DEFAULTS: Dict[str, Any] = {
     "dp_size": 1,
