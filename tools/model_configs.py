@@ -38,7 +38,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "hf_model_id": "mistralai/Mixtral-8x7B-v0.1",
         "hidden_size": 4096,
         "num_heads": 32,
-        "num_kv_heads": 32,
+        "num_kv_heads": 8,
         "ffn_hidden": 14336,
         "num_experts": 16,
         "top_k": 2,

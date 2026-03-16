@@ -231,6 +231,9 @@ class BackwardScheduler:
         self.comm_metrics_enabled = False
         self._a2a_event_pairs = []         # [(start_evt, end_evt), ...]
         self._visible_wait_pairs = []      # [(wait_start_evt, wait_end_evt), ...]
+        # AR visibility metrics (same pattern as A2A)
+        self._ar_event_pairs = []          # [(start_evt, end_evt), ...] on comm_stream
+        self._ar_visible_wait_pairs = []   # [(wait_start, wait_end), ...] on default_stream
 
         # Event pool (initialized in _init_cuda, defaults here for safety)
         self._event_pool = []
@@ -248,6 +251,7 @@ class BackwardScheduler:
             from fluid.core.stream import get_stream_manager
             self.comm_stream = get_stream_manager().comm_stream
             self._ar_done_event = torch.cuda.Event()
+            self._dw_sync_event = torch.cuda.Event()
             # Pre-allocate event pool (non-timing events for sync)
             _POOL_SIZE = 64
             self._event_pool = [torch.cuda.Event() for _ in range(_POOL_SIZE)]
@@ -362,6 +366,10 @@ class BackwardScheduler:
         if t0 is not None:
             torch.cuda.synchronize()
             self._region_dw_time += (time.perf_counter() - t0) * 1000
+
+        # Record event after dW writes on default_stream.
+        # _trickle_ar uses wait_event to ensure data visibility on comm_stream.
+        self._dw_sync_event.record(self.default_stream)
         return False
 
     # ========================================
@@ -465,11 +473,20 @@ class BackwardScheduler:
             self._first_a2a_in_region = False
 
         if self.profiling and start_evt is not None:
-            torch.cuda.synchronize()
+            # Defer elapsed_time to process_gap_events (no sync here to avoid
+            # stalling CPU and artificially inflating comm_stream gaps).
             if self._region_name:
-                self._region_a2a_times.append(start_evt.elapsed_time(end_evt))
+                self._region_a2a_times.append((start_evt, end_evt))
+        # For batch waits (num_tasks > 1), record a single A2A pair
+        # spanning first_chunk_start → last_chunk_end to keep 1:1 with visible_wait.
         if self.comm_metrics_enabled and start_evt is not None and end_evt is not None:
-            self._a2a_event_pairs.append((start_evt, end_evt))
+            if num_tasks > 1:
+                first_tid = task_id - num_tasks + 1
+                first_td = self._alltoall_results.get(first_tid)
+                batch_start = first_td[2] if first_td is not None else start_evt
+                self._a2a_event_pairs.append((batch_start, end_evt))
+            else:
+                self._a2a_event_pairs.append((start_evt, end_evt))
 
         if end_evt is not None:
             if self.comm_metrics_enabled:
@@ -484,7 +501,7 @@ class BackwardScheduler:
 
         # Clean up waited tasks
         for tid in range(task_id - num_tasks + 1, task_id + 1):
-            self._alltoall_results.pop(tid, None)
+            td = self._alltoall_results.pop(tid, None)
 
         if not self._alltoall_results:
             self._last_a2a_end_event = end_evt
@@ -522,8 +539,14 @@ class BackwardScheduler:
         expert_group = self.expert_ar_group or self.expert_dp_group
         _MIN = 512 * 1024
 
+        need_ar_timing = self.comm_metrics_enabled
+
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_stream(self.default_stream)
+            # Wait only for dW writes, not subsequent compute
+            self.comm_stream.wait_event(self._dw_sync_event)
+            if need_ar_timing:
+                ar_s = torch.cuda.Event(enable_timing=True)
+                ar_s.record(self.comm_stream)
             ops = 0
             if has_shared:
                 # Unlimited budget: flush everything written so far
@@ -537,6 +560,10 @@ class BackwardScheduler:
                 if grad is not None:
                     dist.all_reduce(grad, group=ar_group)
                     ops += 1
+            if need_ar_timing and ops > 0:
+                ar_e = torch.cuda.Event(enable_timing=True)
+                ar_e.record(self.comm_stream)
+                self._ar_event_pairs.append((ar_s, ar_e))
 
         self._ar_task_count += ops
         self.total_ar += ops
@@ -565,8 +592,14 @@ class BackwardScheduler:
         ar_group = self.ar_group or self.shared_dp_group
         expert_group = self.expert_ar_group or self.expert_dp_group
 
+        need_ar_timing = self.comm_metrics_enabled
+
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_stream(self.default_stream)
+            # Wait only for dW writes, not subsequent chunk compute
+            self.comm_stream.wait_event(self._dw_sync_event)
+            if need_ar_timing:
+                ar_s = torch.cuda.Event(enable_timing=True)
+                ar_s.record(self.comm_stream)
             ops = 0
             bytes_used = 0
             if has_shared:
@@ -588,6 +621,10 @@ class BackwardScheduler:
                 dist.all_reduce(grad, group=ar_group)
                 bytes_used += grad.numel() * grad.element_size()
                 ops += 1
+            if need_ar_timing and ops > 0:
+                ar_e = torch.cuda.Event(enable_timing=True)
+                ar_e.record(self.comm_stream)
+                self._ar_event_pairs.append((ar_s, ar_e))
 
         self._ar_task_count += ops
         self.total_ar += ops
@@ -609,8 +646,14 @@ class BackwardScheduler:
         ar_group = self.ar_group or self.shared_dp_group
         expert_group = self.expert_ar_group or self.expert_dp_group
 
+        need_ar_timing = self.comm_metrics_enabled
+
         with torch.cuda.stream(self.comm_stream):
-            self.comm_stream.wait_stream(self.default_stream)
+            # Wait for latest dW writes before flushing entire buffer
+            self.comm_stream.wait_event(self._dw_sync_event)
+            if need_ar_timing:
+                ar_s = torch.cuda.Event(enable_timing=True)
+                ar_s.record(self.comm_stream)
             ops = self._shared_ar.flush(ar_group)
             if expert_group is not None:
                 ops += self._expert_ar.flush(expert_group)
@@ -621,6 +664,10 @@ class BackwardScheduler:
                     ops += 1
             self._ar_done_event.record(self.comm_stream)
             self._last_ar_cuda_event = self._ar_done_event
+            if need_ar_timing and ops > 0:
+                ar_e = torch.cuda.Event(enable_timing=True)
+                ar_e.record(self.comm_stream)
+                self._ar_event_pairs.append((ar_s, ar_e))
 
         self._ar_task_count += ops
         self.total_ar += ops
@@ -640,7 +687,15 @@ class BackwardScheduler:
     def _wait_all_ar(self):
         if self._last_ar_cuda_event is None:
             return
-        self.default_stream.wait_event(self._last_ar_cuda_event)
+        if self.comm_metrics_enabled:
+            w_s = torch.cuda.Event(enable_timing=True)
+            w_e = torch.cuda.Event(enable_timing=True)
+            w_s.record(self.default_stream)
+            self.default_stream.wait_event(self._last_ar_cuda_event)
+            w_e.record(self.default_stream)
+            self._ar_visible_wait_pairs.append((w_s, w_e))
+        else:
+            self.default_stream.wait_event(self._last_ar_cuda_event)
         self.completed_ar = self._ar_task_count
 
     def _sync_allreduce_all_params(self):
@@ -734,7 +789,8 @@ class BackwardScheduler:
         torch.cuda.synchronize()
         T_region = (time.perf_counter() - self._region_wall_start) * 1000
         name = self._region_name
-        T_comm = sum(self._region_a2a_times)
+        # Resolve deferred event pairs to elapsed times
+        T_comm = sum(s.elapsed_time(e) for s, e in self._region_a2a_times)
         T_dW = self._region_dw_time
         if name not in self._region_profiles:
             self._region_profiles[name] = {'T_region': 0.0, 'T_comm': 0.0, 'T_dW': 0.0, 'n_a2a': 0, 'count': 0}
@@ -775,31 +831,42 @@ class BackwardScheduler:
     def reset_comm_metrics(self):
         self._a2a_event_pairs = []
         self._visible_wait_pairs = []
+        self._ar_event_pairs = []
+        self._ar_visible_wait_pairs = []
 
     def get_comm_metrics(self):
-        """Return A2A total/visible communication time in ms."""
-        if not self._a2a_event_pairs and not self._visible_wait_pairs:
-            return {
-                'a2a_total_ms': 0.0,
-                'a2a_visible_ms': 0.0,
-                'overlap_ratio': 0.0,
-                'n_a2a': 0,
-                'n_waits': 0,
-            }
+        """Return A2A and AR total/visible communication time in ms."""
         torch.cuda.synchronize()
+
+        # A2A metrics
         a2a_total = 0.0
-        visible = 0.0
-        for s, e in self._a2a_event_pairs:
-            a2a_total += s.elapsed_time(e)
-        for s, e in self._visible_wait_pairs:
-            visible += s.elapsed_time(e)
-        overlap_ratio = 0.0 if a2a_total <= 1e-9 else max(0.0, min(1.0, 1.0 - visible / a2a_total))
+        a2a_visible = 0.0
+        for (a2a_s, a2a_e), (w_s, w_e) in zip(self._a2a_event_pairs, self._visible_wait_pairs):
+            a2a_ms = a2a_s.elapsed_time(a2a_e)
+            wait_ms = w_s.elapsed_time(w_e)
+            a2a_total += a2a_ms
+            a2a_visible += min(wait_ms, a2a_ms)
+        a2a_overlap = 0.0 if a2a_total <= 1e-9 else max(0.0, min(1.0, 1.0 - a2a_visible / a2a_total))
+
+        # AR metrics
+        ar_total = 0.0
+        for s, e in self._ar_event_pairs:
+            ar_total += s.elapsed_time(e)
+        ar_visible = 0.0
+        for s, e in self._ar_visible_wait_pairs:
+            ar_visible += s.elapsed_time(e)
+        ar_overlap = 0.0 if ar_total <= 1e-9 else max(0.0, min(1.0, 1.0 - ar_visible / ar_total))
+
         return {
             'a2a_total_ms': float(a2a_total),
-            'a2a_visible_ms': float(visible),
-            'overlap_ratio': float(overlap_ratio),
+            'a2a_visible_ms': float(a2a_visible),
+            'a2a_overlap_ratio': float(a2a_overlap),
             'n_a2a': len(self._a2a_event_pairs),
             'n_waits': len(self._visible_wait_pairs),
+            'ar_total_ms': float(ar_total),
+            'ar_visible_ms': float(ar_visible),
+            'ar_overlap_ratio': float(ar_overlap),
+            'n_ar': len(self._ar_event_pairs),
         }
 
     def process_gap_events(self):

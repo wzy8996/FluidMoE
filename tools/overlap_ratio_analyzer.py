@@ -27,7 +27,7 @@ from fluid.core.scheduler import get_backward_scheduler
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="Overlap ratio analyzer")
-    parser.add_argument("--model", type=str, default="qwen_moe_a2_7b")
+    parser.add_argument("--model", type=str, default="mixtral_8x7b")
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
     parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])
@@ -158,14 +158,20 @@ def main():
     comm_tensor = torch.tensor([
         local_comm["a2a_total_ms"] / args.iters,
         local_comm["a2a_visible_ms"] / args.iters,
+        local_comm["ar_total_ms"] / args.iters,
+        local_comm["ar_visible_ms"] / args.iters,
     ], dtype=torch.float32, device=device)
     dist.all_reduce(comm_tensor, op=dist.ReduceOp.MAX, group=all_group)
     a2a_total = float(comm_tensor[0].item())
     a2a_visible = float(comm_tensor[1].item())
-    overlap_ratio = 0.0 if a2a_total <= 1e-9 else max(0.0, min(1.0, 1.0 - a2a_visible / a2a_total))
+    ar_total = float(comm_tensor[2].item())
+    ar_visible = float(comm_tensor[3].item())
+    a2a_overlap = 0.0 if a2a_total <= 1e-9 else max(0.0, min(1.0, 1.0 - a2a_visible / a2a_total))
+    ar_overlap = 0.0 if ar_total <= 1e-9 else max(0.0, min(1.0, 1.0 - ar_visible / ar_total))
 
     if rank == 0:
-        print(f"{overlap_ratio:.6f}", flush=True)
+        print(f"a2a_overlap={a2a_overlap:.4f}  a2a_total={a2a_total:.2f}ms  a2a_visible={a2a_visible:.2f}ms", flush=True)
+        print(f"ar_overlap={ar_overlap:.4f}  ar_total={ar_total:.2f}ms  ar_visible={ar_visible:.2f}ms", flush=True)
     dist.destroy_process_group()
 
 

@@ -1199,7 +1199,8 @@ def fc1_dispatch_backward(
     # Step 3: dW tasks overlap with remaining AllToAll
     _maybe_execute_dw_tasks(scheduler, for_dispatch=True)
 
-    # Step 4: Per-chunk wait + reassemble (overlaps reassembly copy with remaining AllToAll)
+    # Step 4: Wait for last AllToAll (NCCL FIFO guarantees all prior chunks done),
+    #         then batch reassemble all chunks.
     nvtx_range_push("wait_reassemble")
 
     grad_tokens = _BWD_POOL.get_2d(
@@ -1207,13 +1208,14 @@ def fc1_dispatch_backward(
         dtype=dtype, device=device,
     )
 
+    # Single wait on last chunk
+    scheduler.wait_alltoall(task_ids[-1], num_tasks=len(task_ids), try_trickle=True)
+
     if _r2_mode == 'expert':
         # Expert-dim reassembly: strided copy [C, ep, nle_c, cap, H] → [ep, nle, cap, H]
         nle_c = _r2_cfg['nle_c'] if _r2_cfg is not None else nle // num_chunks
         grad_tokens_4d = grad_tokens.view(ep_size, nle, cap, hidden_size)
         for c in range(num_chunks):
-            is_last = (c == num_chunks - 1)
-            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
             off = c * chunk_total
             grad_tokens_4d[:, c * nle_c:(c + 1) * nle_c, :, :].copy_(
                 _dispatch_out_all[off:off + chunk_total].view(
@@ -1233,8 +1235,6 @@ def fc1_dispatch_backward(
             _base = _r * (nle * cap) + _e * cap
             r2_scatter_indices = [_base + c * cap_c + _t for c in range(num_chunks)]
         for c in range(num_chunks):
-            is_last = (c == num_chunks - 1)
-            scheduler.wait_alltoall(task_ids[c], try_trickle=is_last)
             off = c * chunk_total
             row_scatter(
                 _dispatch_out_all[off:off + chunk_total],
