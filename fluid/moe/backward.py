@@ -28,7 +28,6 @@ import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
 from fluid.core import _all_to_all
-from fluid.core.triton_kernels import row_gather, unpermute_by_row_idx as row_scatter
 from fluid.core.scheduler import get_backward_scheduler
 from fluid.core.nvtx import nvtx_range_push, nvtx_range_pop
 from fluid.moe.forward import (
@@ -903,7 +902,7 @@ def combine_fc2_backward(
 
             # R2E directly into final buffer (contiguous slice)
             fc2_slice = grad_all_fc2[off:off + chunk_total]
-            row_gather(chunk_recv, chunk_row_r2e, out=fc2_slice)
+            torch.index_select(chunk_recv, 0, chunk_row_r2e, out=fc2_slice)
 
             # FC2 dx directly into final buffer (contiguous slice)
             act_slice = grad_exp_act[off:off + chunk_total]
@@ -935,10 +934,10 @@ def combine_fc2_backward(
             chunk_recv = _combine_out_all[off_r:off_r + chunk_total]
             scatter_c = scatter_indices[c]
 
-            row_gather(chunk_recv, chunk_row_r2e, out=_fc2_chunk_buf)
-            row_scatter(_fc2_chunk_buf, scatter_c, grad_all_fc2)
+            torch.index_select(chunk_recv, 0, chunk_row_r2e, out=_fc2_chunk_buf)
+            grad_all_fc2.index_copy_(0, scatter_c, _fc2_chunk_buf)
             grouped_fc2_dx(_fc2_chunk_buf, weight2, chunk_tpe, out=_act_chunk_buf)
-            row_scatter(_act_chunk_buf, scatter_c, grad_exp_act)
+            grad_exp_act.index_copy_(0, scatter_c, _act_chunk_buf)
             nvtx_range_pop()
 
     # Step 6: Activation backward on full expert-major tensor
@@ -1158,7 +1157,7 @@ def fc1_dispatch_backward(
 
             # Expert-major → rank-major layout convert
             in_buf = _dispatch_in_all[off:off + chunk_total]
-            row_gather(chunk_grad_tokens, chunk_row_e2r, out=in_buf)
+            torch.index_select(chunk_grad_tokens, 0, chunk_row_e2r, out=in_buf)
 
             # Submit AllToAll
             out_buf = _dispatch_out_all[off:off + chunk_total]
@@ -1188,7 +1187,7 @@ def fc1_dispatch_backward(
             )
 
             in_buf = _dispatch_in_all[off:off + chunk_total]
-            row_gather(chunk_grad_tokens, chunk_row_e2r, out=in_buf)
+            torch.index_select(chunk_grad_tokens, 0, chunk_row_e2r, out=in_buf)
 
             out_buf = _dispatch_out_all[off:off + chunk_total]
             task_ids.append(scheduler.submit_alltoall(
@@ -1236,10 +1235,9 @@ def fc1_dispatch_backward(
             r2_scatter_indices = [_base + c * cap_c + _t for c in range(num_chunks)]
         for c in range(num_chunks):
             off = c * chunk_total
-            row_scatter(
+            grad_tokens.index_copy_(
+                0, r2_scatter_indices[c],
                 _dispatch_out_all[off:off + chunk_total],
-                r2_scatter_indices[c],
-                grad_tokens,
             )
     nvtx_range_pop()
 
@@ -1256,60 +1254,57 @@ def fc1_dispatch_backward(
 def router_backward(
     grad_permuted_probs: torch.Tensor,
     sorted_indices: torch.Tensor,
-    top_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
     router_probs: torch.Tensor,
-    top_indices: torch.Tensor,
     router_weight: torch.Tensor,
     num_tokens: int,
-    top_k: int,
+    num_experts: int,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute router backward: gradients through softmax, top-k, and linear projection.
+    Compute router backward: gradients through softmax and linear projection.
+    Aligned with Megatron's routing format (routing_map [T, E] + routing_probs [T, E]).
+
+    No renormalization backward — matches Megatron pre_softmax mode where
+    softmax is applied before topk selection, and selected probs are used directly.
 
     Args:
-        grad_permuted_probs: [kept_tokens] gradient w.r.t. permuted probabilities
-        sorted_indices: [kept_tokens] kept expanded indices (in [0, N*top_k))
-        top_probs: [num_tokens, top_k] normalized top-k probabilities (from forward)
+        grad_permuted_probs: [num_real] gradient w.r.t. permuted probabilities
+        sorted_indices: [num_real] original token indices (0..T-1, expert-major order)
+        tokens_per_expert: [num_experts] token count per expert (pre-padding)
         router_probs: [num_tokens, num_experts] full softmax probabilities
-        top_indices: [num_tokens, top_k] indices of top-k experts
         router_weight: [hidden_size, num_experts] router weight matrix
         num_tokens: Number of input tokens
-        top_k: Number of experts per token
+        num_experts: Number of experts
         dtype: Data type for output
 
     Returns:
         grad_hidden_from_router: [num_tokens, hidden_size] gradient w.r.t. hidden_states
         grad_router_logits: [num_tokens, num_experts] gradient w.r.t. router logits (for dW)
     """
-    # Step 1: Scatter grad back to [N, top_k]
     device = grad_permuted_probs.device
-    grad_top_probs = torch.zeros(num_tokens, top_k, dtype=grad_permuted_probs.dtype, device=device)
-    token_ids = sorted_indices // top_k
-    slot_ids = sorted_indices % top_k
-    grad_top_probs[token_ids, slot_ids] = grad_permuted_probs
 
-    # Step 2: Backward through normalization
-    # top_probs = raw_top_probs / sum(raw_top_probs)
-    # grad_raw[i] = grad_top[i] / s - (grad_top · top_probs) * top_probs[i] / s
-    grad_dot = (grad_top_probs * top_probs).sum(dim=-1, keepdim=True)
-    grad_raw_top_probs = (grad_top_probs - grad_dot * top_probs) / top_probs.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    # Step 1: Scatter grad from permuted [num_real] to [T, E]
+    # sorted_indices gives token id, tokens_per_expert gives expert boundaries
+    expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, device=device), tokens_per_expert
+    )
+    grad_routing_probs = torch.zeros(
+        num_tokens, num_experts, dtype=grad_permuted_probs.dtype, device=device
+    )
+    grad_routing_probs[sorted_indices, expert_ids] = grad_permuted_probs
 
-    # Step 3: Backward through top-k selection
-    # top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
-    # grad_router_probs is zero except at top_indices positions
-    grad_router_probs = torch.zeros_like(router_probs)
-    grad_router_probs.scatter_(1, top_indices, grad_raw_top_probs)
+    # Step 2: Backward through softmax
+    # router_probs = softmax(router_logits), routing_probs = router_probs * routing_map
+    # grad_logits = router_probs * (grad_routing_probs - sum(grad_routing_probs * router_probs))
+    sum_grad = (grad_routing_probs * router_probs).sum(dim=-1, keepdim=True)
+    grad_router_logits = router_probs * (grad_routing_probs - sum_grad)
 
-    # Step 4: Backward through softmax
-    # router_probs = softmax(router_logits)
-    # grad_logits = router_probs * (grad_probs - sum(grad_probs * router_probs))
-    sum_grad_probs = (grad_router_probs * router_probs).sum(dim=-1, keepdim=True)
-    grad_router_logits = router_probs * (grad_router_probs - sum_grad_probs)
-
-    # Step 5: Backward through router linear: logits = hidden @ weight
+    # Step 3: Backward through router linear: logits = hidden @ weight
     # grad_hidden = grad_logits @ weight.T
-    grad_hidden_from_router = torch.matmul(grad_router_logits.float(), router_weight.t().float()).to(dtype)
+    grad_hidden_from_router = torch.matmul(
+        grad_router_logits.float(), router_weight.t().float()
+    ).to(dtype)
 
     return grad_hidden_from_router, grad_router_logits
 

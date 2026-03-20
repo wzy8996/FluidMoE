@@ -3,7 +3,7 @@ FluidMoE 完整参数搜索
 
 搜索顺序:
   1. 同步 AR，逐 region 贪心搜索最优分块数 (R1~R4)
-  2. BDP 模型自动计算最优 AR trickle size
+  2. 测量 AR 带宽 + Profile per-region gap times
 
 用法:
     torchrun --nproc_per_node=<world_size> tools/tune.py --model <model_name>
@@ -286,16 +286,15 @@ dist.barrier()  # 确保两个 rank 同步后再进入 Step 2
 
 
 # ============================================================
-# Step 2: 分区域 BDP 模型计算最优 AR trickle size
+# Step 2: 测量 AR 带宽 + Profile per-region gap times
 # ============================================================
 p0(f"\n{'=' * 60}")
-p0("Step 2: 分区域 BDP 模型计算最优 AR trickle size")
+p0("Step 2: 测量 AR 带宽 + Profile per-region gap times")
 p0("=" * 60)
 p0(f"  (使用最优分块配置: {best_chunks})")
 
 REGION_ORDER = ['moe_combine', 'moe_dispatch', 'attn_proj', 'attn_qkv']
 REGION_LABELS = SEARCH_LABELS
-# Gap description: what compute fills the gap after each region
 REGION_GAP_DESC = {
     'moe_combine':  'R1→R2: last FC2 dX + act_bwd + FC1 dX(c0)',
     'moe_dispatch': 'R2→R3: permute + router + LN2 dX + proj dX(c0)',
@@ -305,20 +304,39 @@ REGION_GAP_DESC = {
 
 # --- 2a: 测量 AR 带宽 ---
 p0(f"\n  2a. 测量 AllReduce 带宽...")
-ar_group = sched.ar_group if sched.ar_group is not None else sched.shared_dp_group
+shared_ar_group = sched.shared_dp_group
 bw_result = BackwardScheduler.measure_ar_bandwidth(
-    ar_group=ar_group,
+    ar_group=shared_ar_group,
     sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),
     warmup=5, repeat=20,
 )
-p0(f"  AR 带宽 profile:")
+# peak_bw_GBps → bytes/ms:  1 GB/s = 1e6 bytes/ms
+shared_ar_bw = bw_result['peak_bw_GBps'] * 1e6  # bytes/ms
+p0(f"  Shared AR 带宽 profile (world_size={sched.shared_dp_world_size}):")
 for i, sz in enumerate(bw_result['sizes_mb']):
     p0(f"    {sz:>4d} MB: {bw_result['bw_GBps'][i]:.2f} GB/s  "
        f"(latency {bw_result['latency_ms'][i]:.3f} ms)")
-p0(f"  Peak BW: {bw_result['peak_bw_GBps']:.2f} GB/s")
+p0(f"  Shared AR Peak BW: {bw_result['peak_bw_GBps']:.2f} GB/s ({shared_ar_bw:.0f} bytes/ms)")
 
-# --- 2b: Profile per-region trickle windows (无 AR，纯净 gap) ---
-p0(f"\n  2b. Profile 分区域 trickle windows (ar_enabled=False, 纯净 gap)...")
+expert_ar_bw = 0.0
+expert_ar_group = sched.expert_dp_group
+if expert_ar_group is not None and sched.expert_dp_world_size > 1:
+    bw_result_expert = BackwardScheduler.measure_ar_bandwidth(
+        ar_group=expert_ar_group,
+        sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),
+        warmup=5, repeat=20,
+    )
+    expert_ar_bw = bw_result_expert['peak_bw_GBps'] * 1e6  # bytes/ms
+    p0(f"  Expert AR 带宽 profile (world_size={sched.expert_dp_world_size}):")
+    for i, sz in enumerate(bw_result_expert['sizes_mb']):
+        p0(f"    {sz:>4d} MB: {bw_result_expert['bw_GBps'][i]:.2f} GB/s  "
+           f"(latency {bw_result_expert['latency_ms'][i]:.3f} ms)")
+    p0(f"  Expert AR Peak BW: {bw_result_expert['peak_bw_GBps']:.2f} GB/s ({expert_ar_bw:.0f} bytes/ms)")
+else:
+    p0(f"  Expert AR: dp=1, 无需 AR")
+
+# --- 2b: Profile per-region gap times (无 AR，纯净 gap) ---
+p0(f"\n  2b. Profile 分区域 gap times (ar_enabled=False, 纯净 gap)...")
 sched.clear_iteration()
 ar_model = TransformerModel(
     **model_kwargs,
@@ -330,7 +348,7 @@ ar_model = TransformerModel(
 )
 sched.enable()
 sched.ar_enabled = False  # 无 AR，测纯净 gap
-sched.ar_trickle_sizes = {}
+sched.gap_budgets = {}
 ar_model.setup_ar_buffer()
 
 xg_ar = x_input.clone().detach().requires_grad_(True)
@@ -345,9 +363,9 @@ for _ in range(N_AR_WARMUP):
     sched.clear_iteration()
 torch.cuda.synchronize()
 sched.reset_gap_times()
-sched.profiling = True  # 启用轻量事件 profiling，仅记录 gap/A2A 时序
+sched.profiling = True
 
-# 采集 per-region gap times (CUDA events) — 无 AR 干扰
+# 采集 per-region gap times (CUDA events)
 for _ in range(N_AR_ITER):
     xg_ar.grad = None
     for p in ar_model.parameters():
@@ -356,47 +374,30 @@ for _ in range(N_AR_ITER):
     sched.finish_batch()
     sched.clear_iteration()
 torch.cuda.synchronize()
-sched.process_gap_events()  # convert CUDA event pairs → gap_ms
+sched.process_gap_events()
 sched.profiling = False
 
-# --- 2c: 分区域 BDP 计算 (使用 size-dependent BW) ---
-bdp_result = sched.compute_bdp_trickle_size(
-    bw_profile=bw_result,
-    percentile=10.0,
-    safety_factor=0.9,
-)
-
-p0(f"\n  2c. 分区域 BDP 分析 (BW_AR = {bdp_result['bw_GBps']:.2f} GB/s, "
-   f"safety = {bdp_result['safety_factor']}):")
-p0(f"  {'Region':<22s} {'Gap description':<42s} {'T_p10':>8s} {'T_mean':>8s} {'BDP_MB':>8s} {'BW':>8s} {'n':>4s}")
-p0(f"  {'-'*22} {'-'*42} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*4}")
-
-bdp_per_region = {}  # region -> MB
+# 提取 per-region gap 的 p10 作为 gap_budgets (ms)
+SAFETY_FACTOR = 0.9
+gap_budgets = {}
+p0(f"\n  Per-region gap times (safety_factor={SAFETY_FACTOR}):")
+p0(f"  {'Region':<22s} {'Gap description':<42s} {'T_p10':>8s} {'T_mean':>8s} {'budget':>8s} {'n':>4s}")
+p0(f"  {'-'*22} {'-'*42} {'-'*8} {'-'*8} {'-'*8} {'-'*4}")
 for region in REGION_ORDER:
-    rdata = bdp_result['per_region'].get(region)
-    if rdata is None:
+    gaps_ms = sched._region_gaps.get(region, [])
+    if not gaps_ms:
         p0(f"  {REGION_LABELS[region]:<22s} {'(no data)':<42s}")
-        bdp_per_region[region] = 0
+        gap_budgets[region] = 0.0
         continue
-    label = REGION_LABELS[region]
-    gap_desc = REGION_GAP_DESC[region]
-    T_pct = rdata['T_window_percentile_ms']
-    T_mean = rdata['T_window_mean_ms']
-    bdp_mb = rdata['trickle_size_MB']
-    bw_used = rdata.get('bw_GBps_used', bdp_result['bw_GBps'])
-    n = rdata['n_windows']
-    bdp_per_region[region] = bdp_mb
-    p0(f"  {label:<22s} {gap_desc:<42s} {T_pct:>7.3f}ms {T_mean:>7.3f}ms {bdp_mb:>7d}MB {bw_used:>6.2f}G {n:>4d}")
-
-# 也显示未预期的 region（如有）
-for region, rdata in bdp_result['per_region'].items():
-    if region not in REGION_ORDER:
-        p0(f"  {region:<22s} {'(unexpected)':<42s} "
-           f"{rdata['T_window_percentile_ms']:>7.3f}ms "
-           f"{rdata['T_window_mean_ms']:>7.3f}ms "
-           f"{rdata['trickle_size_MB']:>7d}MB "
-           f"{rdata['n_windows']:>4d}")
-        bdp_per_region[region] = rdata['trickle_size_MB']
+    gaps_sorted = sorted(gaps_ms)
+    n = len(gaps_sorted)
+    idx = max(0, int(n * 10.0 / 100.0) - 1)
+    T_p10 = gaps_sorted[idx]
+    T_mean = sum(gaps_ms) / n
+    budget = T_p10 * SAFETY_FACTOR
+    gap_budgets[region] = budget
+    p0(f"  {REGION_LABELS[region]:<22s} {REGION_GAP_DESC[region]:<42s} "
+       f"{T_p10:>7.3f}ms {T_mean:>7.3f}ms {budget:>7.3f}ms {n:>4d}")
 
 del ar_model, xg_ar
 gc.collect()
@@ -416,36 +417,30 @@ p0(f"    最优配置: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:
 for region in REGION_ORDER:
     p0(f"      {REGION_LABELS[region]}: C={best_chunks[region]}")
 
-p0(f"\n  Per-region AR trickle size (BDP, size-dependent BW):")
-p0(f"    safety = {bdp_result['safety_factor']}")
+p0(f"\n  AR 带宽:")
+p0(f"    Shared: {shared_ar_bw:.0f} bytes/ms ({shared_ar_bw/1e6:.2f} GB/s)")
+p0(f"    Expert: {expert_ar_bw:.0f} bytes/ms ({expert_ar_bw/1e6:.2f} GB/s)")
+
+p0(f"\n  Per-region gap budgets (p10 * {SAFETY_FACTOR}):")
 for region in REGION_ORDER:
-    rdata = bdp_result['per_region'].get(region)
-    mb = bdp_per_region.get(region, 0)
-    label = "unlimited" if mb == 0 else f"{mb} MB"
-    if rdata:
-        bw_used = rdata.get('bw_GBps_used', bdp_result['bw_GBps'])
-        p0(f"    {REGION_LABELS[region]}: {label}  (T_gap_p10={rdata['T_window_percentile_ms']:.3f}ms, BW={bw_used:.2f}GB/s)")
-    else:
-        p0(f"    {REGION_LABELS[region]}: {label}  (no data)")
+    budget = gap_budgets.get(region, 0.0)
+    p0(f"    {REGION_LABELS[region]}: {budget:.3f} ms")
 
 p0(f"\n  推荐设置:")
 for region in REGION_ORDER:
     p0(f"    {REGION_ATTRS[region]} = {best_chunks[region]}")
-p0(f"    scheduler.ar_trickle_sizes = {{")
-for region in REGION_ORDER:
-    mb = bdp_per_region.get(region, 0)
-    p0(f"        '{region}': {mb} * 1024 * 1024,  # {REGION_GAP_DESC[region]}")
-p0(f"    }}")
+p0(f"    scheduler.gap_budgets = {gap_budgets}")
+p0(f"    scheduler.shared_ar_bw = {shared_ar_bw}")
+p0(f"    scheduler.expert_ar_bw = {expert_ar_bw}")
 
 persist_updates = {
     "moe_combine_chunks": best_chunks['moe_combine'],
     "moe_dispatch_chunks": best_chunks['moe_dispatch'],
     "attn_proj_chunks": best_chunks['attn_proj'],
     "attn_qkv_chunks": best_chunks['attn_qkv'],
-    "ar_trickle_sizes": {
-        region: int(bdp_per_region.get(region, 0)) * 1024 * 1024
-        for region in REGION_ORDER
-    },
+    "gap_budgets": {region: round(gap_budgets.get(region, 0.0), 4) for region in REGION_ORDER},
+    "shared_ar_bw": round(shared_ar_bw, 2),
+    "expert_ar_bw": round(expert_ar_bw, 2),
 }
 
 if rank == 0:

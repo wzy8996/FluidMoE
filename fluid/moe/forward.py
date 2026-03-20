@@ -43,7 +43,6 @@ from typing import List, Tuple, Optional, Dict
 
 from fluid.core.comm import MultiCardOverlapContext
 from fluid.core.nvtx import nvtx_range_push, nvtx_range_pop
-from fluid.core.triton_kernels import permute_by_row_idx
 
 try:
     from grouped_gemm.backend import gmm as _cutlass_gmm
@@ -51,6 +50,12 @@ try:
 except Exception:
     _cutlass_gmm = None
     _HAS_GROUPED_GEMM = False
+
+try:
+    from transformer_engine.pytorch.router import fused_topk_with_score_function
+    _HAS_TE_FUSED_TOPK = True
+except ImportError:
+    _HAS_TE_FUSED_TOPK = False
 
 _LAYOUT_IDX_CACHE = {}
 _PADDED_ROW_IDX_CACHE = {}
@@ -187,11 +192,12 @@ def router_forward(
     top_k: int,
     ep_group: dist.ProcessGroup,
     capacity_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor, torch.Tensor, torch.Tensor]:
+           torch.Tensor]:
     """
     Router forward: token-to-expert assignment with top-k selection and capacity dropping.
+    Follows Megatron's routing format: routing_map [T, E] + routing_probs [T, E].
 
     Args:
         hidden_states: [num_tokens, hidden_size] input tokens
@@ -202,64 +208,71 @@ def router_forward(
         capacity_factor: Expert capacity = ceil(num_tokens * top_k / num_experts * capacity_factor)
 
     Returns:
-        permuted_tokens: [num_kept, hidden_size] tokens sorted by expert (after capacity drop)
-        permuted_probs: [num_kept] routing probabilities
-        sorted_indices: [num_kept] positions in expanded [N*top_k] space (= kept_expanded_indices)
-        token_ids: [num_kept] original token index (= sorted_indices // top_k, precomputed)
+        permuted_tokens: [num_permuted, hidden_size] tokens sorted by expert
+        permuted_probs: [num_permuted] routing probabilities (1D, expert-major order)
+        sorted_indices: [num_permuted] original token indices (0..T-1, expert-major order)
         input_splits: [ep_size] token count to send to each rank
         output_splits: [ep_size] token count to receive from each rank
-        tokens_per_expert: [num_experts] clamped token counts per expert
+        tokens_per_expert: [num_experts] token counts per expert (after capacity drop)
         router_probs: [num_tokens, num_experts] full softmax probabilities (for backward)
-        top_probs: [num_tokens, top_k] normalized top-k probabilities (for backward)
-        top_indices: [num_tokens, top_k] top-k expert indices (for backward)
     """
     nvtx_range_push("router_forward")
 
     ep_size = ep_group.size()
     my_rank = ep_group.rank()
     num_tokens = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[-1]
     device = hidden_states.device
 
     # Step 1: Router logits
     router_logits = torch.matmul(hidden_states.float(), router_weight.detach().float())
 
-    # Step 2: Softmax + top-k
-    router_probs = F.softmax(router_logits, dim=-1)
-    top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
-    top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+    # Step 2: Softmax + top-k → routing_map [T, E] + routing_probs [T, E]
+    # Aligned with Megatron pre_softmax mode: softmax first, then topk, no renormalization.
+    if _HAS_TE_FUSED_TOPK:
+        routing_probs, routing_map = fused_topk_with_score_function(
+            logits=router_logits, topk=top_k,
+            use_pre_softmax=True, num_groups=None, group_topk=None,
+            scaling_factor=None, score_function="softmax", expert_bias=None,
+        )
+        # Full softmax probs needed for backward (fused op doesn't expose them)
+        router_probs = F.softmax(router_logits, dim=-1)
+    else:
+        router_probs = F.softmax(router_logits, dim=-1)
+        top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
+        routing_probs = torch.zeros_like(router_logits).scatter(1, top_indices, top_probs)
+        routing_map = torch.zeros_like(router_logits).int().scatter(1, top_indices, 1).bool()
 
-    # Step 3: Flatten expert indices + sort by expert (stable for determinism)
-    expanded_expert_indices = top_indices.reshape(-1)
-    sorted_indices = torch.argsort(expanded_expert_indices, stable=True)
-    sorted_expert_indices = expanded_expert_indices[sorted_indices]
+    # Step 3: Capacity dropping
+    if capacity_factor > 0:
+        expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
+        # For each expert column, keep at most expert_capacity tokens
+        # Convert routing_map to int for argsort: non-zero positions sorted first
+        routing_map_int = routing_map.to(dtype=torch.int8).T.contiguous()  # [E, T]
+        cap_sorted = routing_map_int.argsort(dim=-1, descending=True, stable=True)
+        # Zero out positions beyond capacity
+        cap_mask = torch.zeros_like(routing_map_int)  # [E, T]
+        if expert_capacity < num_tokens:
+            cap_sorted_keep = cap_sorted[:, :expert_capacity]  # [E, cap]
+            cap_mask.scatter_(1, cap_sorted_keep, routing_map_int.gather(1, cap_sorted_keep))
+        else:
+            cap_mask = routing_map_int
+        # Apply capacity mask back to [T, E]
+        routing_map = cap_mask.T.contiguous().bool()
+        routing_probs = routing_probs * routing_map.float()
 
-    # Step 4: Count tokens per expert
-    tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=num_experts)
+    # Step 4: Permute tokens (Megatron non-fused style)
+    tokens_per_expert = routing_map.int().sum(dim=0).long()  # [E]
+    routing_map_T = routing_map.T.contiguous()  # [E, T]
+    token_indices = torch.arange(num_tokens, device=device).unsqueeze(0).expand(num_experts, -1)
+    sorted_indices = token_indices.masked_select(routing_map_T)  # [num_permuted]
+    permuted_probs = routing_probs.T.contiguous().masked_select(routing_map_T)  # [num_permuted]
+    permuted_tokens = hidden_states.index_select(0, sorted_indices)
 
-    # Step 5: Capacity dropping — vectorized (no Python loop)
-    expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
-    offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
-    torch.cumsum(tokens_per_expert, dim=0, out=offsets[1:])
-    within_expert_pos = torch.arange(num_tokens * top_k, device=device) - offsets[sorted_expert_indices]
-    keep_mask = within_expert_pos < expert_capacity
-
-    sorted_indices = sorted_indices[keep_mask]
-    tokens_per_expert = tokens_per_expert.clamp(max=expert_capacity)
-
-    # Step 6: Derive permuted_tokens/probs from sorted_indices directly
-    # (avoids materialising [N*K, H] expanded_tokens intermediate)
-    token_ids = sorted_indices // top_k
-    permuted_tokens = hidden_states.index_select(0, token_ids)
-    permuted_probs = top_probs.reshape(-1).index_select(0, sorted_indices)
-
-    # Step 7: Compute AllToAll splits — vectorized
+    # Step 5: Compute AllToAll splits
     experts_per_rank = num_experts // ep_size
     input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
 
     if capacity_factor > 0:
-        # Padding makes splits uniform — caller overrides splits anyway.
-        # Skip AllGather to avoid unnecessary collective synchronization.
         output_splits = input_splits  # placeholder, unused by caller
     else:
         all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
@@ -268,9 +281,9 @@ def router_forward(
         output_splits = all_input_splits[:, my_rank].clone()
 
     nvtx_range_pop()
-    return (permuted_tokens, permuted_probs, sorted_indices, token_ids,
+    return (permuted_tokens, permuted_probs, sorted_indices,
             input_splits, output_splits, tokens_per_expert,
-            router_probs, top_probs, top_indices)
+            router_probs)
 
 
 # =============================================================================
@@ -349,9 +362,9 @@ def merge_tokens_expert_major(
         device=device,
     )
 
-    # 3) Single reorder via Triton gather (avoids intermediate allocation).
+    # 3) Single reorder via index_select gather.
     all_expert_tokens = torch.empty(total_tokens, hidden_size, dtype=tok_dtype, device=device)
-    permute_by_row_idx(rank_major_tokens, row_idx_rank_to_exp, all_expert_tokens)
+    torch.index_select(rank_major_tokens, 0, row_idx_rank_to_exp, out=all_expert_tokens)
     return all_expert_tokens, all_tokens_per_expert
 
 
@@ -833,7 +846,7 @@ def fc2_combine_p2p_forward(
 
             # Reorder to expert-major using cached index
             all_expert_tokens = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
-            permute_by_row_idx(rank_major, row_idx_r2e, all_expert_tokens)
+            torch.index_select(rank_major, 0, row_idx_r2e, out=all_expert_tokens)
 
             all_tokens_per_expert = [ep_size * _cap] * num_local_experts
 
@@ -894,11 +907,10 @@ def pad_moe_dispatch(
     permuted_tokens: torch.Tensor,
     permuted_probs: torch.Tensor,
     sorted_indices: torch.Tensor,
-    token_ids: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     cap_per_rank: int,
     num_experts: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor]:
     """Pad dispatched tokens so every expert has exactly cap_per_rank tokens.
 
@@ -908,8 +920,16 @@ def pad_moe_dispatch(
 
     Fully vectorized — no Python loop, no per-expert GPU-CPU sync.
 
+    Args:
+        permuted_tokens: [num_permuted, hidden_size] expert-major ordered tokens
+        permuted_probs: [num_permuted] routing probabilities
+        sorted_indices: [num_permuted] original token indices (0..T-1)
+        tokens_per_expert: [num_experts] token counts per expert
+        cap_per_rank: capacity per expert (uniform)
+        num_experts: total number of experts
+
     Returns:
-        padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids,
+        padded_tokens, padded_probs, padded_sorted_indices,
         padded_tokens_per_expert, real_mask
     """
     device = permuted_tokens.device
@@ -923,13 +943,9 @@ def pad_moe_dispatch(
                                device=device)
     padded_sorted_indices = torch.zeros(total_padded, dtype=sorted_indices.dtype,
                                         device=device)
-    padded_token_ids = torch.zeros(total_padded, dtype=token_ids.dtype,
-                                   device=device)
     real_mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
 
     if num_real > 0:
-        # Vectorized scatter: compact expert-sorted → fixed-capacity padded layout.
-        # All ops are pure GPU — zero GPU-CPU sync.
         tpe = tokens_per_expert[:num_experts].to(dtype=torch.int64, device=device)
         n_copy = tpe.clamp(max=cap_per_rank)
 
@@ -937,7 +953,7 @@ def pad_moe_dispatch(
         cum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
         torch.cumsum(n_copy, dim=0, out=cum[1:])
 
-        # Per-token expert id via searchsorted (pure GPU, no sync unlike repeat_interleave)
+        # Per-token expert id via searchsorted
         row_ids = torch.arange(num_real, dtype=torch.int64, device=device)
         expert_ids = torch.searchsorted(cum[1:], row_ids, right=True)
         within_pos = row_ids - cum[:-1][expert_ids]
@@ -948,13 +964,12 @@ def pad_moe_dispatch(
         padded_tokens.index_copy_(0, dst_idx, permuted_tokens)
         padded_probs.index_copy_(0, dst_idx, permuted_probs)
         padded_sorted_indices.index_copy_(0, dst_idx, sorted_indices)
-        padded_token_ids.index_copy_(0, dst_idx, token_ids)
         real_mask[dst_idx] = True
 
     padded_tpe = torch.full((num_experts,), cap_per_rank,
                             dtype=tokens_per_expert.dtype, device=device)
     return (padded_tokens, padded_probs, padded_sorted_indices,
-            padded_token_ids, padded_tpe, real_mask)
+            padded_tpe, real_mask)
 
 
 __all__ = [

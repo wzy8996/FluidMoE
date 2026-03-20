@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
     parser.add_argument("--model", type=str, default="mixtral_8x7b", help="模型名称 (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe",
-                        choices=["megatron", "fluidmoe", "native", "deepspeed"],
+                        choices=["megatron", "megatron-overlap", "megatron-overlap-dw", "fluidmoe", "native", "deepspeed"],
                         help="选择运行的实现")
     parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
@@ -221,10 +221,12 @@ def main():
     ev_s = torch.cuda.Event(enable_timing=True)
     ev_e = torch.cuda.Event(enable_timing=True)
 
-    if args.impl in ("megatron", "native", "deepspeed"):
-        if args.impl == "megatron":
+    if args.impl in ("megatron", "megatron-overlap", "megatron-overlap-dw", "native", "deepspeed"):
+        if args.impl in ("megatron", "megatron-overlap", "megatron-overlap-dw"):
             from megatron_baseline import MegatronBaselineTransformerModel
 
+            use_overlap = args.impl in ("megatron-overlap", "megatron-overlap-dw")
+            use_delay_wgrad = args.impl == "megatron-overlap-dw"
             model = MegatronBaselineTransformerModel(
                 num_layers=num_layers,
                 hidden_size=hidden_size,
@@ -237,6 +239,8 @@ def main():
                 ep_group=ep_group,
                 shared_dp_group=all_group,
                 expert_dp_group=dp_group if dp_size > 1 else None,
+                overlap_a2a=use_overlap,
+                delay_wgrad=use_delay_wgrad,
                 capacity_factor=capacity_factor,
                 dtype=torch.bfloat16,
                 device=device,
@@ -310,7 +314,10 @@ def main():
     from fluid.core.scheduler import get_backward_scheduler
     from fluid.layer import TransformerModel
 
-    ar_trickle_sizes = get_block_benchmark_defaults()["ar_trickle_sizes"]
+    _bench_defaults = get_block_benchmark_defaults()
+    gap_budgets = _bench_defaults.get("gap_budgets", {})
+    shared_ar_bw = float(_bench_defaults.get("shared_ar_bw", 0.0))
+    expert_ar_bw = float(_bench_defaults.get("expert_ar_bw", 0.0))
     fluidmoe_model = TransformerModel(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -325,7 +332,6 @@ def main():
         moe_dispatch_chunks=args.moe_dispatch_chunks,
         attn_proj_chunks=args.attn_proj_chunks,
         attn_qkv_chunks=args.attn_qkv_chunks,
-        ar_trickle_sizes=ar_trickle_sizes,
         capacity_factor=capacity_factor,
         dtype=torch.bfloat16,
         device=device,
@@ -339,6 +345,9 @@ def main():
         enabled=True,
         shared_dp_group=all_group,
         expert_dp_group=dp_group if dp_size > 1 else None,
+        gap_budgets=gap_budgets,
+        shared_ar_bw=shared_ar_bw,
+        expert_ar_bw=expert_ar_bw,
     )
     fluidmoe_model.setup_ar_buffer()
 

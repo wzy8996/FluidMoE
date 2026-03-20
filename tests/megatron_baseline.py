@@ -80,6 +80,8 @@ class MegatronBaselineTransformerModel(nn.Module):
         *,
         shared_dp_group: Optional[dist.ProcessGroup] = None,
         expert_dp_group: Optional[dist.ProcessGroup] = None,
+        overlap_a2a: bool = False,
+        delay_wgrad: bool = False,
         capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
@@ -134,6 +136,8 @@ class MegatronBaselineTransformerModel(nn.Module):
             fp16=(dtype == torch.float16),
             params_dtype=dtype,
             pipeline_dtype=dtype,
+            overlap_moe_expert_parallel_comm=overlap_a2a,
+            delay_wgrad_compute=delay_wgrad,
         )
 
         layer_spec = get_gpt_layer_with_transformer_engine_spec(

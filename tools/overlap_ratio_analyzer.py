@@ -68,7 +68,9 @@ def main():
     moe_dispatch_chunks = int(bench_defaults.get("moe_dispatch_chunks", 1))
     attn_proj_chunks = int(bench_defaults.get("attn_proj_chunks", 1))
     attn_qkv_chunks = int(bench_defaults.get("attn_qkv_chunks", 1))
-    ar_trickle_sizes = bench_defaults.get("ar_trickle_sizes", {})
+    gap_budgets = bench_defaults.get("gap_budgets", {})
+    shared_ar_bw = float(bench_defaults.get("shared_ar_bw", 0.0))
+    expert_ar_bw = float(bench_defaults.get("expert_ar_bw", 0.0))
     dp_size = args.dp_size
     cp_size = args.cp_size
     ep_size = args.ep_size
@@ -109,7 +111,6 @@ def main():
         cp_group=cp_group, ep_group=ep_group,
         moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
         attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
-        ar_trickle_sizes=ar_trickle_sizes,
         capacity_factor=capacity_factor,
         dtype=torch.bfloat16, device=device,
     )
@@ -125,6 +126,9 @@ def main():
         enabled=True,
         shared_dp_group=all_group,
         expert_dp_group=dp_group if dp_size > 1 else None,
+        gap_budgets=gap_budgets,
+        shared_ar_bw=shared_ar_bw,
+        expert_ar_bw=expert_ar_bw,
     )
     model.setup_ar_buffer()
     scheduler.ar_enabled = (args.mode == "interleaved")

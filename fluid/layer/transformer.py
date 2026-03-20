@@ -200,13 +200,15 @@ class TransformerLayerFunction(torch.autograd.Function):
         ln2_flat = ln2_out.view(-1, hidden_size)
         num_tokens = ln2_flat.shape[0]
 
-        # Router forward (AllGather for tokens_per_expert_2d removed - metadata piggybacked on P2P)
-        (permuted_tokens, permuted_probs, sorted_indices, token_ids,
+        # Router forward (Megatron-aligned: routing_map + routing_probs format)
+        (permuted_tokens, permuted_probs, sorted_indices,
          input_splits, output_splits, tokens_per_expert,
-         router_probs, top_probs, top_indices) = router_forward(
+         router_probs) = router_forward(
             ln2_flat, router_weight, num_experts, top_k, ep_group,
             capacity_factor=capacity_factor,
         )
+        # Save pre-pad tokens_per_expert for router backward
+        tokens_per_expert_router = tokens_per_expert.clone()
 
         # Pad to fixed capacity for uniform splits (enables token-dim chunking in backward)
         pad_to_cap = capacity_factor > 0
@@ -214,9 +216,9 @@ class TransformerLayerFunction(torch.autograd.Function):
             expert_capacity = int(math.ceil(
                 num_tokens * top_k / num_experts * capacity_factor))
             cap_per_rank = expert_capacity
-            (permuted_tokens, permuted_probs, sorted_indices, token_ids,
+            (permuted_tokens, permuted_probs, sorted_indices,
              tokens_per_expert, real_mask) = pad_moe_dispatch(
-                permuted_tokens, permuted_probs, sorted_indices, token_ids,
+                permuted_tokens, permuted_probs, sorted_indices,
                 tokens_per_expert, cap_per_rank, num_experts,
             )
             S = num_local_experts * cap_per_rank
@@ -253,7 +255,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         weighted_output = combined_output * permuted_probs.unsqueeze(-1).to(dtype)
         moe_output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
         moe_output.scatter_add_(
-            0, token_ids.unsqueeze(1).expand_as(weighted_output), weighted_output)
+            0, sorted_indices.unsqueeze(1).expand_as(weighted_output), weighted_output)
 
         # Reshape back: [seq*batch, hidden] -> [seq, batch, hidden]
         moe_output = moe_output.view(seq_len, batch_size, hidden_size)
@@ -274,9 +276,9 @@ class TransformerLayerFunction(torch.autograd.Function):
                 hidden_states, ln1_out, hidden_after_attn, ln2_flat,
                 # Attention states - only attn_input_full needed (q/k/v saved with graph below)
                 attn_input_full,
-                # MoE states
-                permuted_tokens, permuted_probs, sorted_indices, token_ids,
-                router_probs, top_probs, top_indices,
+                # MoE states (Megatron-aligned format)
+                permuted_tokens, permuted_probs, sorted_indices,
+                router_probs,
                 all_expert_tokens,
                 combined_output,
                 # Weights (detached)
@@ -289,6 +291,8 @@ class TransformerLayerFunction(torch.autograd.Function):
             # Store non-tensor merge results on ctx
             ctx.all_tokens_per_expert = all_tokens_per_expert
             ctx.backward_indices = backward_indices
+            # Pre-pad tokens_per_expert for router backward (expert boundary reconstruction)
+            ctx.tokens_per_expert_router = tokens_per_expert_router
             # Save SDPA computation graph (avoids redundant forward in backward)
             # FlashAttention only stores logsumexp O(seq), not attention matrix O(seq²)
             ctx._q_for_attn = q_for_attn
@@ -354,11 +358,11 @@ class TransformerLayerFunction(torch.autograd.Function):
         if grad_output.dtype != ctx.dtype:
             grad_output = grad_output.to(ctx.dtype)
 
-        # Retrieve saved tensors
+        # Retrieve saved tensors (Megatron-aligned format: no token_ids/top_probs/top_indices)
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
          attn_input_full,
-         permuted_tokens, permuted_probs, sorted_indices, token_ids,
-         router_probs, top_probs, top_indices,
+         permuted_tokens, permuted_probs, sorted_indices,
+         router_probs,
          all_expert_tokens,
          combined_output,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
@@ -436,8 +440,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_moe_output = grad_output.view(num_tokens, hidden_size)
 
         # Step 1: Backward through sum and restore (capacity mode: scatter_add)
-        # token_ids precomputed in forward (= sorted_indices // top_k)
-        grad_weighted = grad_moe_output[token_ids]
+        # sorted_indices = original token indices (Megatron format)
+        grad_weighted = grad_moe_output[sorted_indices]
 
         # Step 2: Backward through prob weighting
         grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(grad_weighted.dtype)
@@ -446,6 +450,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Filter padded positions for router backward (padded grads are zero but
         # direct-assignment in router_backward could overwrite real gradients).
         real_mask = ctx.real_mask
+        tokens_per_expert_router = ctx.tokens_per_expert_router
         if real_mask is not None:
             grad_permuted_probs_real = grad_permuted_probs[real_mask]
             sorted_indices_real = sorted_indices[real_mask]
@@ -497,21 +502,19 @@ class TransformerLayerFunction(torch.autograd.Function):
             # --- router backward (no weight, just compute) ---
             _grad_permuted_probs = grad_permuted_probs_real.detach()
             _sorted_indices = sorted_indices_real
-            _top_probs = top_probs
+            _tokens_per_expert_router = tokens_per_expert_router
             _router_probs = router_probs
-            _top_indices = top_indices
             _router_weight = router_weight
 
             def _router_bwd_task():
                 router_result[0], router_result[1] = router_backward(
                     grad_permuted_probs=_grad_permuted_probs,
                     sorted_indices=_sorted_indices,
-                    top_probs=_top_probs,
+                    tokens_per_expert=_tokens_per_expert_router,
                     router_probs=_router_probs,
-                    top_indices=_top_indices,
                     router_weight=_router_weight,
                     num_tokens=num_tokens,
-                    top_k=top_k,
+                    num_experts=num_experts,
                     dtype=dtype,
                 )
                 return None  # no gradient to write
@@ -551,11 +554,11 @@ class TransformerLayerFunction(torch.autograd.Function):
             layer_id=layer_id, num_chunks=moe_dispatch_chunks,
             chunk_config=chunk_config,
         )
-        # token_ids precomputed in forward
+        # sorted_indices = original token indices (Megatron format)
         grad_hidden_from_moe_tokens = torch.zeros(
             num_tokens, hidden_size, dtype=dtype, device=device)
         grad_hidden_from_moe_tokens.scatter_add_(
-            0, token_ids.unsqueeze(1).expand_as(grad_dispatched), grad_dispatched)
+            0, sorted_indices.unsqueeze(1).expand_as(grad_dispatched), grad_dispatched)
 
         scheduler.end_region()
 
@@ -565,12 +568,11 @@ class TransformerLayerFunction(torch.autograd.Function):
             router_result[0], router_result[1] = router_backward(
                 grad_permuted_probs=grad_permuted_probs_real,
                 sorted_indices=sorted_indices_real,
-                top_probs=top_probs,
+                tokens_per_expert=tokens_per_expert_router,
                 router_probs=router_probs,
-                top_indices=top_indices,
                 router_weight=router_weight,
                 num_tokens=num_tokens,
-                top_k=top_k,
+                num_experts=num_experts,
                 dtype=dtype,
             )
             grad_router_weight = register_router_dw_task(
@@ -761,7 +763,6 @@ class TransformerLayer(nn.Module):
         moe_dispatch_chunks: int = 1,
         attn_proj_chunks: int = 1,
         attn_qkv_chunks: int = 1,
-        ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
@@ -787,14 +788,6 @@ class TransformerLayer(nn.Module):
         self.capacity_factor = capacity_factor
         self._moe_chunk_config = None  # lazily computed on first forward
         self._moe_chunk_signature = None
-
-        # Apply per-region AR trickle sizes to scheduler singleton
-        if ar_trickle_sizes is not None:
-            from fluid.core.scheduler import BackwardScheduler
-            sched = BackwardScheduler()
-            sched.ar_trickle_sizes = {
-                r: sz if sz > 0 else 0 for r, sz in ar_trickle_sizes.items()
-            }
 
         self.cp_group = cp_group
         self.ep_group = ep_group
@@ -952,7 +945,6 @@ class TransformerModel(nn.Module):
         moe_dispatch_chunks: int = 1,
         attn_proj_chunks: int = 1,
         attn_qkv_chunks: int = 1,
-        ar_trickle_sizes: Optional[dict] = None,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
@@ -976,7 +968,6 @@ class TransformerModel(nn.Module):
                 moe_dispatch_chunks=moe_dispatch_chunks,
                 attn_proj_chunks=attn_proj_chunks,
                 attn_qkv_chunks=attn_qkv_chunks,
-                ar_trickle_sizes=ar_trickle_sizes if i == 0 else None,  # set once
                 activation_func=activation_func,
                 capacity_factor=capacity_factor,
                 dtype=dtype,

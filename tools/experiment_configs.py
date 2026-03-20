@@ -13,13 +13,15 @@ BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'dp_size': 1,
  'moe_combine_chunks': 2,
  'moe_dispatch_chunks': 2,
  'attn_proj_chunks': 2,
- 'attn_qkv_chunks': 4,
+ 'attn_qkv_chunks': 8,
  'warmup': 10,
  'iters': 50,
- 'ar_trickle_sizes': {'moe_combine': 105906176,
-                      'moe_dispatch': 63963136,
-                      'attn_proj': 22020096,
-                      'attn_qkv': 12582912}}
+ 'gap_budgets': {'moe_combine': 23.4934,
+                 'moe_dispatch': 14.3309,
+                 'attn_proj': 4.841,
+                 'attn_qkv': 2.0865},
+ 'shared_ar_bw': 5338242.3,
+ 'expert_ar_bw': 0.0}
 
 TUNE_DEFAULTS: Dict[str, Any] = {
     "dp_size": 1,

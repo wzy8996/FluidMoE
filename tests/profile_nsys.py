@@ -47,12 +47,14 @@ moe_dispatch_chunks = 2
 attn_proj_chunks = 1
 attn_qkv_chunks = 2
 
-ar_trickle_sizes = {
-    'moe_combine': 220 * 1024 * 1024,
-    'moe_dispatch': 142 * 1024 * 1024,
-    'attn_proj': 24 * 1024 * 1024,
-    'attn_qkv': 26 * 1024 * 1024,
+gap_budgets = {
+    'moe_combine': 2.0,
+    'moe_dispatch': 1.5,
+    'attn_proj': 0.8,
+    'attn_qkv': 0.9,
 }
+shared_ar_bw = 20e6  # bytes/ms (placeholder, should come from tuning)
+expert_ar_bw = 0.0
 
 dp_size = 1
 cp_size = 2
@@ -145,7 +147,6 @@ elif args.mode == 'fluidmoe':
         cp_group=cp_group, ep_group=ep_group,
         moe_combine_chunks=moe_combine_chunks, moe_dispatch_chunks=moe_dispatch_chunks,
         attn_proj_chunks=attn_proj_chunks, attn_qkv_chunks=attn_qkv_chunks,
-        ar_trickle_sizes=ar_trickle_sizes,
         dtype=torch.bfloat16, device=device,
     )
 
@@ -155,6 +156,9 @@ elif args.mode == 'fluidmoe':
         enabled=True,
         shared_dp_group=all_group,
         expert_dp_group=dp_group if dp_size > 1 else None,
+        gap_budgets=gap_budgets,
+        shared_ar_bw=shared_ar_bw,
+        expert_ar_bw=expert_ar_bw,
     )
     model.setup_ar_buffer()
 

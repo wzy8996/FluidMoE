@@ -16,7 +16,42 @@ from contextlib import contextmanager
 from typing import Optional, Callable, List
 
 from fluid.attention.forward import scaled_dot_product_attention_forward  # noqa: F401
-from fluid.moe.forward import pad_moe_dispatch
+
+
+def _baseline_pad_moe_dispatch(
+    permuted_tokens, permuted_probs, sorted_indices, token_ids,
+    tokens_per_expert, cap_per_rank, num_experts,
+):
+    """Baseline-only padding: old expanded-space format with token_ids."""
+    device = permuted_tokens.device
+    hidden_size = permuted_tokens.shape[1]
+    num_real = permuted_tokens.shape[0]
+    total_padded = num_experts * cap_per_rank
+
+    padded_tokens = torch.zeros(total_padded, hidden_size, dtype=permuted_tokens.dtype, device=device)
+    padded_probs = torch.zeros(total_padded, dtype=permuted_probs.dtype, device=device)
+    padded_sorted_indices = torch.zeros(total_padded, dtype=sorted_indices.dtype, device=device)
+    padded_token_ids = torch.zeros(total_padded, dtype=token_ids.dtype, device=device)
+    real_mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
+
+    if num_real > 0:
+        tpe = tokens_per_expert[:num_experts].to(dtype=torch.int64, device=device)
+        n_copy = tpe.clamp(max=cap_per_rank)
+        cum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+        torch.cumsum(n_copy, dim=0, out=cum[1:])
+        row_ids = torch.arange(num_real, dtype=torch.int64, device=device)
+        expert_ids = torch.searchsorted(cum[1:], row_ids, right=True)
+        within_pos = row_ids - cum[:-1][expert_ids]
+        dst_idx = expert_ids * cap_per_rank + within_pos
+
+        padded_tokens.index_copy_(0, dst_idx, permuted_tokens)
+        padded_probs.index_copy_(0, dst_idx, permuted_probs)
+        padded_sorted_indices.index_copy_(0, dst_idx, sorted_indices)
+        padded_token_ids.index_copy_(0, dst_idx, token_ids)
+        real_mask[dst_idx] = True
+
+    padded_tpe = tokens_per_expert.clamp(max=cap_per_rank)
+    return padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids, padded_tpe, real_mask
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +219,7 @@ class BaselineTransformerFunction(torch.autograd.Function):
         # Capacity padding (same as FluidMoE)
         cap_per_rank = expert_capacity
         (padded_tokens, padded_probs, padded_sorted_indices, padded_token_ids,
-         padded_tpe, real_mask) = pad_moe_dispatch(
+         padded_tpe, real_mask) = _baseline_pad_moe_dispatch(
             permuted_tokens, permuted_probs, sorted_indices, token_ids,
             tokens_per_expert, cap_per_rank, num_experts,
         )

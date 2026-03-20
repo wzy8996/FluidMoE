@@ -22,10 +22,14 @@ Computation-Communication Overlap for MoE and Attention Layers.
 
 ```bash
 # Install
-pip install torch  # requires CUDA support
 git clone https://github.com/your-repo/FluidMoE.git
 cd FluidMoE
-export PYTHONPATH=$PWD:$PYTHONPATH
+
+# Install PyTorch separately first, then install repo deps
+export NVTE_FRAMEWORK=pytorch
+export APEX_CPP_EXT=1
+export APEX_CUDA_EXT=1
+pip install -r requirements.txt
 
 # Run tests
 torchrun --nproc_per_node=2 tests/test_correctness.py
@@ -176,6 +180,9 @@ torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
 - CUDA >= 11.8
 - NCCL >= 2.18
 - (Optional) Megatron-Core >= 0.5.0
+
+Dependency manifest:
+- `requirements.txt`: repo dependencies excluding PyTorch
 
 ## License
 

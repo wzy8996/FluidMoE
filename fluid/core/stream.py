@@ -42,6 +42,7 @@ class StreamManager:
                 return
             self._device = None
             self._comm_stream: Optional[torch.cuda.Stream] = None
+            self._ar_stream: Optional[torch.cuda.Stream] = None
             self._data_ready_event = None
             self._streams_initialized = False
             StreamManager._initialized = True
@@ -60,6 +61,7 @@ class StreamManager:
             else:
                 raise RuntimeError("CUDA is not available")
             self._comm_stream = torch.cuda.Stream(device=self._device)
+            self._ar_stream = torch.cuda.Stream(device=self._device)
             self._data_ready_event = torch.cuda.Event()
             self._streams_initialized = True
 
@@ -72,6 +74,11 @@ class StreamManager:
     def comm_stream(self) -> torch.cuda.Stream:
         self._ensure_initialized()
         return self._comm_stream
+
+    @property
+    def ar_stream(self) -> torch.cuda.Stream:
+        self._ensure_initialized()
+        return self._ar_stream
 
     @property
     def data_ready_event(self) -> torch.cuda.Event:
