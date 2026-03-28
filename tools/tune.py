@@ -80,12 +80,16 @@ num_gpus = dp_size * cp_size
 N_ITER = int(tune_defaults["chunk_search_iters"])              # 测量轮数
 MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大候选分块数
 MIN_SAVING = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值(ms)
-# 候选受限于本 rank 上的专家数 nle（expert-dim 切分要求 C | nle）
+# MoE 区域 (R1, R2): 候选受限于本 rank 上的专家数 nle（expert-dim 切分要求 C | nle）
 _nle = num_experts // ep_size
-_effective_max = min(MAX_C, _nle)
-CHUNK_CANDIDATES = [2**i for i in range(_effective_max.bit_length()) if 2**i <= _effective_max]
-if 1 not in CHUNK_CANDIDATES:
-    CHUNK_CANDIDATES.insert(0, 1)
+_moe_max = min(MAX_C, _nle)
+MOE_CHUNK_CANDIDATES = [2**i for i in range(_moe_max.bit_length()) if 2**i <= _moe_max]
+if 1 not in MOE_CHUNK_CANDIDATES:
+    MOE_CHUNK_CANDIDATES.insert(0, 1)
+# Attention 区域 (R3, R4): 不受专家数限制，仅受 MAX_C 限制
+ATTN_CHUNK_CANDIDATES = [2**i for i in range(MAX_C.bit_length()) if 2**i <= MAX_C]
+if 1 not in ATTN_CHUNK_CANDIDATES:
+    ATTN_CHUNK_CANDIDATES.insert(0, 1)
 
 # AR 搜索参数
 N_AR_WARMUP = int(tune_defaults["ar_warmup"])                  # 预热轮数
@@ -137,7 +141,7 @@ p0(f"Config: hidden={hidden_size}, heads={num_heads}, kv_heads={num_kv_heads}")
 p0(f"        ffn={ffn_hidden}, experts={num_experts}, top_k={top_k}")
 p0(f"        layers={num_layers}, seq={seq_len}, seq_local={seq_local}, batch={batch_size}, GPUs={num_gpus}")
 p0(f"        dp={dp_size}, cp={cp_size}, ep={ep_size}")
-p0(f"Chunk 搜索: iter={N_ITER}, candidates={CHUNK_CANDIDATES}, 早停阈值={MIN_SAVING}ms")
+p0(f"Chunk 搜索: iter={N_ITER}, MoE候选={MOE_CHUNK_CANDIDATES}, Attn候选={ATTN_CHUNK_CANDIDATES}, 早停阈值={MIN_SAVING}ms")
 p0(f"AR 搜索:    warmup={N_AR_WARMUP}, iter={N_AR_ITER}")
 p0("=" * 60)
 
@@ -169,7 +173,7 @@ sched.configure_allreduce(enabled=False, shared_dp_group=all_group,
 p0(f"\n{'=' * 60}")
 p0("Step 1: 逐区域 Chunk 贪心搜索 (同步 AR, 带早停)")
 p0("=" * 60)
-p0(f"候选值: {CHUNK_CANDIDATES}, 早停阈值: {MIN_SAVING}ms")
+p0(f"MoE候选: {MOE_CHUNK_CANDIDATES}, Attn候选: {ATTN_CHUNK_CANDIDATES}, 早停阈值: {MIN_SAVING}ms")
 
 SEARCH_ORDER = ['moe_combine', 'moe_dispatch', 'attn_proj', 'attn_qkv']
 SEARCH_LABELS = {
@@ -235,13 +239,14 @@ best_chunks = {r: 1 for r in SEARCH_ORDER}
 for region in SEARCH_ORDER:
     attr = REGION_ATTRS[region]
     label = SEARCH_LABELS[region]
-    p0(f"\n  搜索 {label} (候选: {CHUNK_CANDIDATES})...")
+    candidates = MOE_CHUNK_CANDIDATES if region in MOE_REGIONS else ATTN_CHUNK_CANDIDATES
+    p0(f"\n  搜索 {label} (候选: {candidates})...")
 
     region_results = {}
     best_c = 1
     best_t = float('inf')
 
-    for c in CHUNK_CANDIDATES:
+    for c in candidates:
         for layer in chunk_model.layers:
             setattr(layer, attr, c)
             if region in MOE_REGIONS:
@@ -278,7 +283,10 @@ T_chunk_best = bench_bwd()
 p0(f"\n最优分块配置: {best_chunks}")
 p0(f"  最终: {T_chunk_best:.3f} ms  (speedup={T_baseline/T_chunk_best:.4f}x)")
 
-del chunk_model, xg
+# 复用 Step 1 的模型和 AR buffer，避免 delete + recreate 导致 OOM
+# chunk_model 已设置为 best_chunks，AR buffer 已建好
+ar_model = chunk_model
+del bench_bwd  # 释放闭包对 chunk_model 的引用
 gc.collect()
 torch.cuda.empty_cache()
 sched.clear_iteration()
@@ -338,18 +346,8 @@ else:
 # --- 2b: Profile per-region gap times (无 AR，纯净 gap) ---
 p0(f"\n  2b. Profile 分区域 gap times (ar_enabled=False, 纯净 gap)...")
 sched.clear_iteration()
-ar_model = TransformerModel(
-    **model_kwargs,
-    moe_combine_chunks=best_chunks['moe_combine'],
-    moe_dispatch_chunks=best_chunks['moe_dispatch'],
-    attn_proj_chunks=best_chunks['attn_proj'],
-    attn_qkv_chunks=best_chunks['attn_qkv'],
-    dtype=torch.bfloat16, device=device,
-)
-sched.enable()
 sched.ar_enabled = False  # 无 AR，测纯净 gap
 sched.gap_budgets = {}
-ar_model.setup_ar_buffer()
 
 xg_ar = x_input.clone().detach().requires_grad_(True)
 

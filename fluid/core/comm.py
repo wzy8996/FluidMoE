@@ -55,6 +55,10 @@ def _all_to_all(
     if world_size == 1:
         return input.clone()
 
+    nccl_stream = torch.cuda.current_stream()
+    # The source tensor may be repacked on the current comm stream before NCCL
+    # consumes it. Keep its storage alive until this stream reaches that point.
+    input.record_stream(nccl_stream)
     input = input.contiguous()
 
     if output_split_sizes is None:
@@ -76,6 +80,11 @@ def _all_to_all(
         group=group,
         tag=debug_tag,
     )
+
+    # Record NCCL stream usage to prevent the caching allocator from
+    # reusing input/output memory before the NCCL kernel finishes.
+    input.record_stream(nccl_stream)
+    output.record_stream(nccl_stream)
 
     dist.all_to_all_single(
         output, input,
@@ -168,6 +177,10 @@ def _all_to_all_sp2hp_forward(input_: torch.Tensor, group, output: torch.Tensor 
     """
     cp = group.size()
     seq_local, batch, heads, dim = input_.shape
+    nccl_stream = torch.cuda.current_stream()
+    # sp2hp does a permute+contiguous pack on the current comm stream before
+    # launching NCCL. Protect the source storage across that cross-stream read.
+    input_.record_stream(nccl_stream)
 
     # Rearrange: split heads, move CP to front, flatten (ensure contiguous)
     x = input_.contiguous().view(seq_local, batch, cp, heads // cp, dim)
@@ -182,6 +195,8 @@ def _all_to_all_sp2hp_forward(input_: torch.Tensor, group, output: torch.Tensor 
         out_buf = output.view(seq_local * cp, -1)
     else:
         out_buf = torch.empty_like(x)
+    x.record_stream(nccl_stream)
+    out_buf.record_stream(nccl_stream)
     dist.all_to_all_single(
         out_buf, x,
         output_split_sizes=[seq_local] * cp,
@@ -213,12 +228,18 @@ def _all_to_all_hp2sp_forward(input_: torch.Tensor, group, output: torch.Tensor 
     cp = group.size()
     seq, batch, heads_local, dim = input_.shape
     seq_local = seq // cp
+    nccl_stream = torch.cuda.current_stream()
+    # hp2sp may materialize a contiguous input view on the current comm stream
+    # before NCCL runs. Protect the source storage across that handoff.
+    input_.record_stream(nccl_stream)
 
     # Flatten to 2D (ensure contiguous for view)
     x = input_.contiguous().view(seq, batch * heads_local * dim)
 
     # AllToAll communication (no grad)
     raw_out = torch.empty_like(x)
+    x.record_stream(nccl_stream)
+    raw_out.record_stream(nccl_stream)
     dist.all_to_all_single(
         raw_out, x,
         output_split_sizes=[seq_local] * cp,
@@ -376,6 +397,10 @@ class MultiCardOverlapContext:
 
     def get_stream(self) -> torch.cuda.Stream:
         return self.comm_stream
+
+    def get_round_event(self, tag: str, round_idx: int) -> torch.cuda.Event:
+        """Get a reusable synchronization event for a specific overlap round."""
+        return self._stream_manager.get_sync_event(("overlap", tag, round_idx))
 
 
 __all__ = [

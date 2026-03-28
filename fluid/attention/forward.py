@@ -124,8 +124,8 @@ def qkv_projection_p2p_forward(
         w_start = partner * proj_per_rank
         weight_per_partner[partner] = weight_qkv[w_start:w_start + proj_per_rank, :]
 
-    all_reqs = []
     send_bufs = []  # keep references alive until P2P completes
+    all_reqs = []  # Keep Work objects alive until the completion event is consumed.
     last_p2p_event = None
 
     for round_idx, partner in enumerate(partners):
@@ -142,13 +142,20 @@ def qkv_projection_p2p_forward(
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_stream(default_stream)
             global_partner = global_ranks[partner]
+            recv_buffer.record_stream(comm_stream)
+            send_buf.record_stream(comm_stream)
             p2p_ops = [
                 dist.P2POp(dist.irecv, recv_buffer, global_partner, group=cp_group),
                 dist.P2POp(dist.isend, send_buf, global_partner, group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
             all_reqs.extend(reqs)
-            last_p2p_event = torch.cuda.Event()
+            if reqs:
+                # NCCL serializes the batched P2P ops on the communicator, so
+                # the final work item is enough to fence the batch on this
+                # user-facing stream.
+                reqs[-1].wait()
+            last_p2p_event = overlap_ctx.get_round_event("attn_qkv", round_idx)
             last_p2p_event.record(comm_stream)
 
     # While last P2P is running, compute local QKV (overlaps with comm)
@@ -164,9 +171,11 @@ def qkv_projection_p2p_forward(
     if last_p2p_event is not None:
         default_stream.wait_event(last_p2p_event)
 
-    # NCCL cleanup (P2P already done, returns immediately)
-    for req in all_reqs:
-        req.wait()
+    # Also synchronize NCCL work onto default_stream before returning. The
+    # comm_stream-side wait above is not enough for allocator safety on
+    # default_stream consumers.
+    if all_reqs:
+        all_reqs[-1].wait()
 
     # Separate Q, K, V
     q_size = q_per_group * head_dim
@@ -319,7 +328,7 @@ def output_projection_p2p_forward(
     attn_input_full[:, :, local_dim_start:local_dim_start + input_dim_per_rank] = attn_local_flat
 
     prev_partner = None
-    all_reqs = []
+    all_reqs = []  # Keep Work objects alive until default_stream consumes the events.
     p2p_events = []
     output = None
 
@@ -328,13 +337,17 @@ def output_projection_p2p_forward(
             if round_idx == 0:
                 comm_stream.wait_stream(default_stream)
             global_partner = global_ranks[partner]
+            recv_buffers[partner].record_stream(comm_stream)
+            send_data_dict[partner].record_stream(comm_stream)
             p2p_ops = [
                 dist.P2POp(dist.irecv, recv_buffers[partner], global_partner, group=cp_group),
                 dist.P2POp(dist.isend, send_data_dict[partner], global_partner, group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
             all_reqs.extend(reqs)
-            evt = torch.cuda.Event()
+            if reqs:
+                reqs[-1].wait()
+            evt = overlap_ctx.get_round_event("attn_output", round_idx)
             evt.record(comm_stream)
             p2p_events.append(evt)
 
@@ -357,9 +370,8 @@ def output_projection_p2p_forward(
         attn_input_full[:, :, prev_dim_start:prev_dim_start + input_dim_per_rank] = recv_buffers_flat[prev_partner]
         output = output + torch.matmul(recv_buffers_flat[prev_partner], weight_per_partner[prev_partner].t())
 
-    # NCCL work cleanup (P2P already done at this point, returns immediately)
-    for req in all_reqs:
-        req.wait()
+    if all_reqs:
+        all_reqs[-1].wait()
 
     if bias_proj is not None:
         output = output + bias_proj

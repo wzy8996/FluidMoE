@@ -52,10 +52,19 @@ except Exception:
     _HAS_GROUPED_GEMM = False
 
 try:
-    from transformer_engine.pytorch.router import fused_topk_with_score_function
-    _HAS_TE_FUSED_TOPK = True
+    from transformer_engine.pytorch.triton.permutation import (
+        make_row_id_map as _te_make_row_id_map,
+        permute_with_mask_map as _te_permute_with_mask_map,
+    )
+    _HAS_TE_PERMUTE = True
 except ImportError:
-    _HAS_TE_FUSED_TOPK = False
+    _te_make_row_id_map = None
+    _te_permute_with_mask_map = None
+    _HAS_TE_PERMUTE = False
+
+import os as _os
+
+_FUSED_ACT_PROBS_CACHE = {}
 
 _LAYOUT_IDX_CACHE = {}
 _PADDED_ROW_IDX_CACHE = {}
@@ -113,17 +122,66 @@ def _grouped_gemm_or_none(
     return _cutlass_gmm(A, B, batch_sizes, trans_a=trans_a, trans_b=trans_b)
 
 
+def _fused_gelu_with_probs(x: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    return (torch.nn.functional.gelu(x) * probs).to(dtype)
+
+
+def _fused_silu_with_probs(x: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    return (torch.nn.functional.silu(x) * probs).to(dtype)
+
+
+# Pre-compile with torch.jit.script (ahead-of-time, no tracing, no hang risk)
+try:
+    _fused_gelu_with_probs = torch.jit.script(_fused_gelu_with_probs)
+    _fused_silu_with_probs = torch.jit.script(_fused_silu_with_probs)
+    _JIT_SCRIPT_OK = True
+except Exception:
+    _JIT_SCRIPT_OK = False
+
+
+def _get_fused_act_with_probs(activation_func):
+    """Return a fused activation*probs kernel.
+
+    Uses torch.jit.script for known activations (gelu, silu) to avoid the
+    torch.compile tracing hang in distributed P2P settings. Falls back to
+    unfused for unknown activations.
+    """
+    key = id(activation_func)
+    if key not in _FUSED_ACT_PROBS_CACHE:
+        if _JIT_SCRIPT_OK:
+            from fluid.core.te_ops import te_gelu
+            if activation_func is te_gelu or activation_func is torch.nn.functional.gelu:
+                _FUSED_ACT_PROBS_CACHE[key] = _fused_gelu_with_probs
+                return _fused_gelu_with_probs
+            if activation_func is torch.nn.functional.silu:
+                _FUSED_ACT_PROBS_CACHE[key] = _fused_silu_with_probs
+                return _fused_silu_with_probs
+        # Fallback: unfused
+        def unfused_act_with_probs(x, probs):
+            dtype = x.dtype
+            return (activation_func(x) * probs).to(dtype)
+        _FUSED_ACT_PROBS_CACHE[key] = unfused_act_with_probs
+    return _FUSED_ACT_PROBS_CACHE[key]
+
+
 def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
                     tokens_per_expert: torch.Tensor, activation_func,
-                    return_fc1: bool = False):
-    """Compute FC1 + activation for all experts.
+                    return_fc1: bool = False,
+                    probs: Optional[torch.Tensor] = None):
+    """Compute FC1 + activation (+ optional probs weighting) for all experts.
+
+    When ``probs`` is provided, the output is ``activation(FC1(tokens)) * probs``
+    (Megatron-aligned: probs applied between activation and FC2, fused via @jit_fuser).
 
     Args:
         tokens: [total_tokens, hidden] input tokens
         w1: [num_experts, hidden, ffn_hidden] FC1 weights
         tokens_per_expert: 1D CPU int64 tensor of token counts per expert
         activation_func: Activation function
-        return_fc1: If True, return (fc1, act); otherwise return act only.
+        return_fc1: If True, return (fc1, act_weighted); otherwise return act_weighted only.
+        probs: Optional [total_tokens] routing probabilities.
     """
     if tokens.shape[0] == 0:
         empty = torch.empty(0, w1.shape[-1], dtype=tokens.dtype, device=tokens.device)
@@ -132,9 +190,13 @@ def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
     num_experts = w1.shape[0]
     if num_experts == 1:
         fc1 = torch.matmul(tokens, w1[0])
+        if probs is not None:
+            act = _get_fused_act_with_probs(activation_func)(fc1, probs.unsqueeze(-1))
+        else:
+            act = activation_func(fc1)
         if return_fc1:
-            return fc1, activation_func(fc1)
-        return activation_func(fc1)
+            return fc1, act
+        return act
 
     # Multi-expert path: prefer grouped GEMM backend, fallback to for-loop.
     fc1 = _grouped_gemm_or_none(tokens, w1, tokens_per_expert, trans_b=False)
@@ -146,9 +208,13 @@ def grouped_fc1_act(tokens: torch.Tensor, w1: torch.Tensor,
             if n > 0:
                 torch.mm(tokens[offset:offset+n], w1[i], out=fc1[offset:offset+n])
                 offset += n
+    if probs is not None:
+        act = _get_fused_act_with_probs(activation_func)(fc1, probs.unsqueeze(-1))
+    else:
+        act = activation_func(fc1)
     if return_fc1:
-        return fc1, activation_func(fc1)
-    return activation_func(fc1)
+        return fc1, act
+    return act
 
 
 def grouped_fc2(act: torch.Tensor, w2: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
@@ -194,7 +260,7 @@ def router_forward(
     capacity_factor: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor]:
+           torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Router forward: token-to-expert assignment with top-k selection and capacity dropping.
     Follows Megatron's routing format: routing_map [T, E] + routing_probs [T, E].
@@ -214,7 +280,9 @@ def router_forward(
         input_splits: [ep_size] token count to send to each rank
         output_splits: [ep_size] token count to receive from each rank
         tokens_per_expert: [num_experts] token counts per expert (after capacity drop)
-        router_probs: [num_tokens, num_experts] full softmax probabilities (for backward)
+        top_indices: [num_tokens, top_k] selected expert indices per token (for backward)
+        top_probs: [num_tokens, top_k] softmax(top_k_logits) probabilities (for backward)
+        row_id_map: [num_tokens, 2*num_experts+1] TE permute map (None if TE unavailable)
     """
     nvtx_range_push("router_forward")
 
@@ -224,66 +292,89 @@ def router_forward(
     device = hidden_states.device
 
     # Step 1: Router logits
-    router_logits = torch.matmul(hidden_states.float(), router_weight.detach().float())
+    # Matmul in input dtype matching Megatron (bf16 when wrapped by Float16Module)
+    router_logits = torch.matmul(hidden_states, router_weight.detach().to(hidden_states.dtype))
 
-    # Step 2: Softmax + top-k → routing_map [T, E] + routing_probs [T, E]
-    # Aligned with Megatron pre_softmax mode: softmax first, then topk, no renormalization.
-    if _HAS_TE_FUSED_TOPK:
-        routing_probs, routing_map = fused_topk_with_score_function(
-            logits=router_logits, topk=top_k,
-            use_pre_softmax=True, num_groups=None, group_topk=None,
-            scaling_factor=None, score_function="softmax", expert_bias=None,
-        )
-        # Full softmax probs needed for backward (fused op doesn't expose them)
-        router_probs = F.softmax(router_logits, dim=-1)
-    else:
-        router_probs = F.softmax(router_logits, dim=-1)
-        top_probs, top_indices = torch.topk(router_probs, k=top_k, dim=-1)
-        routing_probs = torch.zeros_like(router_logits).scatter(1, top_indices, top_probs)
-        routing_map = torch.zeros_like(router_logits).int().scatter(1, top_indices, 1).bool()
+    # Step 2: Top-k + softmax → routing_map [T, E] + routing_probs [T, E]
+    # Aligned with Megatron post-softmax mode (default): topk first, then softmax on top-k.
+    top_logits, top_indices = torch.topk(router_logits, k=top_k, dim=-1)
+    top_probs = F.softmax(top_logits, dim=-1, dtype=torch.float32).to(router_logits.dtype)
+    routing_probs = torch.zeros_like(router_logits).scatter(1, top_indices, top_probs)
+    routing_map = torch.zeros_like(router_logits).int().scatter(1, top_indices, 1).bool()
 
-    # Step 3: Capacity dropping
+    # Step 3: Capacity dropping (probs policy, aligned with Megatron default)
     if capacity_factor > 0:
         expert_capacity = int(math.ceil(num_tokens * top_k / num_experts * capacity_factor))
-        # For each expert column, keep at most expert_capacity tokens
-        # Convert routing_map to int for argsort: non-zero positions sorted first
-        routing_map_int = routing_map.to(dtype=torch.int8).T.contiguous()  # [E, T]
-        cap_sorted = routing_map_int.argsort(dim=-1, descending=True, stable=True)
-        # Zero out positions beyond capacity
-        cap_mask = torch.zeros_like(routing_map_int)  # [E, T]
+        # For each expert column, keep top-capacity tokens by probability
         if expert_capacity < num_tokens:
-            cap_sorted_keep = cap_sorted[:, :expert_capacity]  # [E, cap]
-            cap_mask.scatter_(1, cap_sorted_keep, routing_map_int.gather(1, cap_sorted_keep))
+            _, capacity_indices = torch.topk(
+                routing_probs, k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1.0).bool()
         else:
-            cap_mask = routing_map_int
-        # Apply capacity mask back to [T, E]
-        routing_map = cap_mask.T.contiguous().bool()
+            capacity_mask = torch.ones_like(routing_probs).bool()
+        # Keep only tokens that are both selected AND within capacity
+        routing_map = torch.logical_and(routing_map, capacity_mask)
         routing_probs = routing_probs * routing_map.float()
 
-    # Step 4: Permute tokens (Megatron non-fused style)
-    tokens_per_expert = routing_map.int().sum(dim=0).long()  # [E]
-    routing_map_T = routing_map.T.contiguous()  # [E, T]
-    token_indices = torch.arange(num_tokens, device=device).unsqueeze(0).expand(num_experts, -1)
-    sorted_indices = token_indices.masked_select(routing_map_T)  # [num_permuted]
-    permuted_probs = routing_probs.T.contiguous().masked_select(routing_map_T)  # [num_permuted]
-    permuted_tokens = hidden_states.index_select(0, sorted_indices)
+    # Step 4: Permute tokens (Megatron-aligned)
+    hidden_size = hidden_states.shape[1]
 
-    # Step 5: Compute AllToAll splits
-    experts_per_rank = num_experts // ep_size
-    input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
+    if capacity_factor > 0 and _HAS_TE_PERMUTE:
+        # ---- Megatron fused path: argsort padding + TE permute ----
+        routing_map_int_T = routing_map.to(torch.int8).T.contiguous()  # [E, T]
+        sorted_per_expert = routing_map_int_T.argsort(
+            dim=-1, descending=True, stable=True
+        )[:, :expert_capacity].contiguous()  # [E, capacity]
+        sorted_indices = sorted_per_expert.reshape(-1)
 
-    if capacity_factor > 0:
-        output_splits = input_splits  # placeholder, unused by caller
+        padded_routing_map = torch.zeros(
+            num_tokens, num_experts, dtype=torch.bool, device=device)
+        expert_ids_expand = torch.arange(
+            num_experts, device=device
+        ).unsqueeze(1).expand(-1, expert_capacity).reshape(-1)
+        padded_routing_map[sorted_indices, expert_ids_expand] = True
+
+        num_out_tokens = num_experts * expert_capacity
+        tokens_per_expert = torch.full(
+            (num_experts,), expert_capacity, dtype=torch.int64, device=device)
+
+        with torch.no_grad():
+            row_id_map = _te_make_row_id_map(
+                padded_routing_map.int(), num_tokens, num_experts)
+            permuted_tokens, _, permuted_probs = _te_permute_with_mask_map(
+                hidden_states, row_id_map, routing_probs, None,
+                num_tokens, num_experts, num_out_tokens, hidden_size, None,
+            )
+
+        # Compute splits (uniform in padded mode)
+        experts_per_rank = num_experts // ep_size
+        input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
+        output_splits = input_splits  # symmetric in padded mode
     else:
-        all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
-        dist.all_gather(all_input_splits, input_splits, group=ep_group)
-        all_input_splits = torch.stack(all_input_splits)
-        output_splits = all_input_splits[:, my_rank].clone()
+        # ---- Fallback: PyTorch ops (non-fused or non-padded) ----
+        tokens_per_expert = routing_map.int().sum(dim=0).long()  # [E]
+        routing_map_T = routing_map.bool().T.contiguous()  # [E, T]
+        token_indices = torch.arange(
+            num_tokens, device=device).unsqueeze(0).expand(num_experts, -1)
+        sorted_indices = token_indices.masked_select(routing_map_T)
+        permuted_probs = routing_probs.T.contiguous().masked_select(routing_map_T)
+        permuted_tokens = hidden_states.index_select(0, sorted_indices)
+        row_id_map = None  # not available in fallback path
+
+        experts_per_rank = num_experts // ep_size
+        input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
+        if capacity_factor > 0:
+            output_splits = input_splits
+        else:
+            all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
+            dist.all_gather(all_input_splits, input_splits, group=ep_group)
+            all_input_splits = torch.stack(all_input_splits)
+            output_splits = all_input_splits[:, my_rank].clone()
 
     nvtx_range_pop()
     return (permuted_tokens, permuted_probs, sorted_indices,
             input_splits, output_splits, tokens_per_expert,
-            router_probs)
+            top_indices, top_probs, row_id_map)
 
 
 # =============================================================================
@@ -480,8 +571,10 @@ def dispatch_fc1_p2p_forward(
     num_local_experts: int,
     tokens_per_expert: torch.Tensor,
     pre_tokens_cpu: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
-           List[int], Dict[int, int], torch.Tensor]:
+           List[int], Dict[int, int], torch.Tensor,
+           Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
     """
     Dispatch phase with P2P overlap: parallel FC1+Act computation with P2P communication.
 
@@ -508,15 +601,19 @@ def dispatch_fc1_p2p_forward(
         tokens_per_expert: [num_global_experts] local tokens per expert from router
         pre_tokens_cpu: Optional [ep_size, nle] CPU int64 tensor. When provided,
             metadata piggybacking is skipped (no .cpu() syncs, no torch.cat).
+        permuted_probs: Optional [num_tokens] routing probabilities (Megatron-aligned:
+            probs applied between activation and FC2). Sent via P2P alongside tokens.
 
     Returns:
         local_tokens: [local_count, hidden] local tokens
-        local_act: [local_count, ffn_hidden] local activation output
+        local_act: [local_count, ffn_hidden] local activation output (probs-weighted if permuted_probs given)
         recv_act_results: Dict[partner -> act_tensor] - activation outputs from peers
         recv_buffers: Dict[partner -> token_tensor] - received tokens from peers
         partners: List of partner ranks
         recv_offsets: Dict of partner -> offset in buffer
         tokens_cpu: [ep_size, num_local_experts] CPU int64 tensor
+        local_probs: Optional [local_count] local routing probs (None if permuted_probs is None)
+        recv_probs: Optional Dict[partner -> probs_tensor] (None if permuted_probs is None)
     """
     nvtx_range_push("dispatch_fc1_p2p")
     my_rank = ep_group.rank()
@@ -561,6 +658,14 @@ def dispatch_fc1_p2p_forward(
     # Extract local tokens (no clone needed - data will be copied in merge_tokens_expert_major anyway)
     local_tokens = tokens[local_start:local_start + local_count] if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
 
+    # Extract local probs (Megatron-aligned: sent via P2P for act * probs weighting)
+    if permuted_probs is not None:
+        local_probs = permuted_probs[local_start:local_start + local_count] if local_count > 0 else torch.empty(0, dtype=permuted_probs.dtype, device=device)
+        probs_dtype = permuted_probs.dtype
+    else:
+        local_probs = None
+        probs_dtype = None
+
     # Prepare send data
     send_chunks = {}
     recv_buffers_with_metadata = {}
@@ -592,6 +697,17 @@ def dispatch_fc1_p2p_forward(
             if recv_size > 0:
                 recv_buffers_with_metadata[partner] = torch.empty(recv_size, hidden_size, dtype=dtype, device=device)
 
+    # Prepare probs send/recv buffers (Megatron-aligned: probs via P2P)
+    send_probs_chunks = {}
+    recv_probs_buffers = {}
+    if permuted_probs is not None:
+        for partner in partners:
+            if input_splits[partner] > 0:
+                send_probs_chunks[partner] = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
+            if output_splits[partner] > 0:
+                recv_probs_buffers[partner] = torch.empty(
+                    output_splits[partner], dtype=probs_dtype, device=device)
+
     # Compute each partner's offset in buffer
     recv_offsets = {}
     offset = 0
@@ -602,11 +718,12 @@ def dispatch_fc1_p2p_forward(
 
     # =========================================================================
     # Dispatch Phase Pipeline with event-based sync (no CPU blocking)
-    # Key insight: Use CUDA events instead of req.wait() to avoid CPU idle gaps
-    # P2P_i runs on comm_stream while FC1 for P2P_{i-1}'s data runs on default_stream
+    # Key insight: use a per-round event on comm_stream to hand completed P2P
+    # data to default_stream, while still overlapping P2P_i with FC1 for
+    # round i-1. The event must be recorded only after NCCL completion.
     # =========================================================================
     prev_partner = None
-    all_reqs = []
+    all_reqs = []  # Keep Work objects alive until round-completion events are consumed.
     p2p_events = []
     recv_act_results = {}
     local_act = None
@@ -634,12 +751,26 @@ def dispatch_fc1_p2p_forward(
             p2p_ops = []
             global_partner = global_ranks[partner]
             if partner in recv_buffers_with_metadata:
+                recv_buffers_with_metadata[partner].record_stream(comm_stream)
                 p2p_ops.append(dist.P2POp(dist.irecv, recv_buffers_with_metadata[partner], global_partner, group=ep_group))
             if partner in send_chunks:
+                send_chunks[partner].record_stream(comm_stream)
                 p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], global_partner, group=ep_group))
+            # Probs P2P (Megatron-aligned: probs sent alongside tokens)
+            if partner in recv_probs_buffers:
+                recv_probs_buffers[partner].record_stream(comm_stream)
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_probs_buffers[partner], global_partner, group=ep_group))
+            if partner in send_probs_chunks:
+                send_probs_chunks[partner].record_stream(comm_stream)
+                p2p_ops.append(dist.P2POp(dist.isend, send_probs_chunks[partner], global_partner, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
             all_reqs.extend(curr_reqs)
-            evt = torch.cuda.Event()
+            if curr_reqs:
+                # NCCL serializes P2P ops on the same communicator, so waiting
+                # on the last work item is sufficient to make the whole batch
+                # visible on this user-facing stream.
+                curr_reqs[-1].wait()
+            evt = overlap_ctx.get_round_event("moe_dispatch", round_idx)
             evt.record(comm_stream)
             p2p_events.append(evt)
         nvtx_range_pop()
@@ -649,7 +780,9 @@ def dispatch_fc1_p2p_forward(
         if round_idx == 0:
             # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0:
-                local_act = grouped_fc1_act(local_tokens, weight1, local_tokens_per_expert_cpu, activation_func)
+                local_act = grouped_fc1_act(
+                    local_tokens, weight1, local_tokens_per_expert_cpu,
+                    activation_func, probs=local_probs)
         elif prev_partner is not None:
             # GPU-level wait for previous P2P (no CPU blocking)
             default_stream.wait_event(p2p_events[round_idx - 1])
@@ -658,7 +791,10 @@ def dispatch_fc1_p2p_forward(
             if prev_partner in recv_buffers:
                 # Compute previous round's received data (now guaranteed complete)
                 recv_data = recv_buffers[prev_partner]
-                recv_act = grouped_fc1_act(recv_data, weight1, tokens_cpu[prev_partner], activation_func)
+                partner_probs = recv_probs_buffers.get(prev_partner)
+                recv_act = grouped_fc1_act(
+                    recv_data, weight1, tokens_cpu[prev_partner],
+                    activation_func, probs=partner_probs)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
 
@@ -672,18 +808,25 @@ def dispatch_fc1_p2p_forward(
             extract_metadata_and_tokens(prev_partner)
             if prev_partner in recv_buffers:
                 recv_data = recv_buffers[prev_partner]
-                recv_act = grouped_fc1_act(recv_data, weight1, tokens_cpu[prev_partner], activation_func)
+                partner_probs = recv_probs_buffers.get(prev_partner)
+                recv_act = grouped_fc1_act(
+                    recv_data, weight1, tokens_cpu[prev_partner],
+                    activation_func, probs=partner_probs)
                 recv_act_results[prev_partner] = recv_act
         nvtx_range_pop()
 
-    # NCCL work cleanup (P2P already done at this point)
-    for req in all_reqs:
-        req.wait()
+    # Make default_stream itself observe NCCL completion before returning.
+    # This second wait is required in addition to the comm_stream-side wait
+    # above: ProcessGroupNCCL tracks allocator safety against the user-facing
+    # streams that call wait()/synchronize().
+    if all_reqs:
+        all_reqs[-1].wait()
 
     nvtx_range_pop()  # dispatch_fc1_p2p
     return (
         local_tokens, local_act, recv_act_results, recv_buffers,
-        partners, recv_offsets, tokens_cpu
+        partners, recv_offsets, tokens_cpu,
+        local_probs, recv_probs_buffers if permuted_probs is not None else None,
     )
 
 
@@ -705,8 +848,11 @@ def fc2_combine_p2p_forward(
     partners: List[int],
     tokens_cpu: torch.Tensor,
     needs_backward: bool = True,
+    local_probs: Optional[torch.Tensor] = None,
+    recv_probs: Optional[Dict[int, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
-           Optional[torch.Tensor], Optional[list], Optional[dict]]:
+           Optional[torch.Tensor], Optional[list], Optional[dict],
+           Optional[torch.Tensor]]:
     """
     FC2 + Combine phase with P2P overlap.
 
@@ -717,7 +863,8 @@ def fc2_combine_p2p_forward(
 
     Returns:
         combined_output, local_fc2,
-        all_expert_tokens (expert-major), all_tokens_per_expert, backward_indices
+        all_expert_tokens (expert-major), all_tokens_per_expert, backward_indices,
+        all_expert_probs (expert-major, for backward probs gradient; None if local_probs is None)
     """
     nvtx_range_push("fc2_combine_p2p")
     my_rank = ep_group.rank()
@@ -767,7 +914,7 @@ def fc2_combine_p2p_forward(
             nvtx_range_pop()
 
     # Pipeline loop
-    all_combine_reqs = []
+    all_combine_reqs = []  # Keep Work objects alive until combine results are consumed.
     for round_idx, partner in enumerate(partners):
         # Start P2P (send FC2 result to partner, receive from partner)
         nvtx_range_push(f"combine_p2p_R{round_idx}")
@@ -777,12 +924,17 @@ def fc2_combine_p2p_forward(
             p2p_ops = []
             global_partner = global_ranks[partner]
             if input_splits[partner] > 0:
-                p2p_ops.append(dist.P2POp(dist.irecv,
-                    combined_output[input_offsets[partner]:input_offsets[partner+1]], global_partner, group=ep_group))
+                recv_slice = combined_output[input_offsets[partner]:input_offsets[partner+1]]
+                recv_slice.record_stream(comm_stream)
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_slice, global_partner, group=ep_group))
             if partner in peer_fc2_results:
+                peer_fc2_results[partner].record_stream(comm_stream)
                 p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], global_partner, group=ep_group))
             if p2p_ops:
-                all_combine_reqs.extend(dist.batch_isend_irecv(p2p_ops))
+                curr_reqs = dist.batch_isend_irecv(p2p_ops)
+                all_combine_reqs.extend(curr_reqs)
+                if curr_reqs:
+                    curr_reqs[-1].wait()
         nvtx_range_pop()
 
         # Parallel with current P2P: compute next round FC2 or local FC2
@@ -809,6 +961,7 @@ def fc2_combine_p2p_forward(
     all_expert_tokens = None
     all_tokens_per_expert = None
     backward_indices = None
+    all_expert_probs = None
     if needs_backward and tokens_cpu is not None:
         nvtx_range_push("merge_sort_fwd")
         # Build peer tokens concat
@@ -819,6 +972,17 @@ def fc2_combine_p2p_forward(
             all_peer_tokens = peer_tokens[0]
         else:
             all_peer_tokens = torch.cat(peer_tokens, dim=0)
+
+        # Build peer probs concat (Megatron-aligned: probs in expert-major for backward)
+        if local_probs is not None and recv_probs is not None:
+            peer_probs_list = [recv_probs[i] for i in range(ep_size)
+                               if i != my_rank and i in recv_probs]
+            if len(peer_probs_list) == 0:
+                all_peer_probs = torch.empty(0, dtype=local_probs.dtype, device=device)
+            elif len(peer_probs_list) == 1:
+                all_peer_probs = peer_probs_list[0]
+            else:
+                all_peer_probs = torch.cat(peer_probs_list, dim=0)
 
         # Check for uniform padding case (CPU tensor — no GPU sync)
         _cap = int(tokens_cpu.view(-1)[0])
@@ -847,6 +1011,20 @@ def fc2_combine_p2p_forward(
             # Reorder to expert-major using cached index
             all_expert_tokens = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
             torch.index_select(rank_major, 0, row_idx_r2e, out=all_expert_tokens)
+
+            # Merge probs to expert-major (same layout as tokens)
+            if local_probs is not None and recv_probs is not None:
+                rank_probs_parts = []
+                peer_probs_offset = 0
+                for rank in range(ep_size):
+                    if rank == my_rank:
+                        rank_probs_parts.append(local_probs)
+                    else:
+                        rank_probs_parts.append(
+                            all_peer_probs[peer_probs_offset:peer_probs_offset + n_per_rank])
+                        peer_probs_offset += n_per_rank
+                rank_major_probs = torch.cat(rank_probs_parts, dim=0) if len(rank_probs_parts) > 1 else rank_probs_parts[0]
+                all_expert_probs = rank_major_probs[row_idx_r2e]
 
             all_tokens_per_expert = [ep_size * _cap] * num_local_experts
 
@@ -881,14 +1059,27 @@ def fc2_combine_p2p_forward(
                 backward_indices['split_sizes_exp_major'],
                 backward_indices['sorted_idxs_exp_to_rank'], device,
             )
+            # Merge probs using same layout indices (general path)
+            if local_probs is not None and recv_probs is not None:
+                rank_probs_parts = []
+                peer_probs_offset = 0
+                for rank in range(ep_size):
+                    if rank == my_rank:
+                        rank_probs_parts.append(local_probs)
+                    else:
+                        rank_probs_parts.append(
+                            all_peer_probs[peer_probs_offset:peer_probs_offset + int(tokens_cpu[rank].sum().item())])
+                        peer_probs_offset += int(tokens_cpu[rank].sum().item())
+                rank_major_probs = torch.cat(rank_probs_parts, dim=0) if len(rank_probs_parts) > 1 else rank_probs_parts[0]
+                all_expert_probs = rank_major_probs[backward_indices['row_idx_rank_to_exp']]
         nvtx_range_pop()
 
-    # =========================================================================
-    # Wait for all Combine P2P to complete
-    # =========================================================================
+    # Same rationale as dispatch_fc1_p2p: make default_stream observe NCCL
+    # completion before local writes read from combined_output or the function
+    # returns and drops temporary tensors.
     nvtx_range_push("combine_wait_all")
-    for req in all_combine_reqs:
-        req.wait()
+    if all_combine_reqs:
+        all_combine_reqs[-1].wait()
     nvtx_range_pop()
 
     # Handle no partners case (ep_size=1): compute local FC2
@@ -900,7 +1091,7 @@ def fc2_combine_p2p_forward(
         combined_output[local_start:local_start + local_count] = local_fc2
 
     nvtx_range_pop()  # fc2_combine_p2p
-    return combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert, backward_indices
+    return combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert, backward_indices, all_expert_probs
 
 
 def pad_moe_dispatch(

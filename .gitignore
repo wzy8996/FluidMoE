@@ -36,6 +36,10 @@ training_output*.txt
 wandb/
 runs/
 tensorboard/
+examples/results/
+
+# Local dataset caches
+examples/.data_cache/
 
 # IDE
 .vscode/

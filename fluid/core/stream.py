@@ -44,6 +44,7 @@ class StreamManager:
             self._comm_stream: Optional[torch.cuda.Stream] = None
             self._ar_stream: Optional[torch.cuda.Stream] = None
             self._data_ready_event = None
+            self._sync_event_pool = {}
             self._streams_initialized = False
             StreamManager._initialized = True
 
@@ -84,6 +85,15 @@ class StreamManager:
     def data_ready_event(self) -> torch.cuda.Event:
         self._ensure_initialized()
         return self._data_ready_event
+
+    def get_sync_event(self, key) -> torch.cuda.Event:
+        """Get a reusable non-timing CUDA event keyed by a stable identifier."""
+        self._ensure_initialized()
+        evt = self._sync_event_pool.get(key)
+        if evt is None:
+            evt = torch.cuda.Event()
+            self._sync_event_pool[key] = evt
+        return evt
 
     def initialize(self, device: torch.device):
         """Explicitly initialize streams on a specific device."""

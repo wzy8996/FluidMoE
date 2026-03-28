@@ -281,8 +281,9 @@ def _post_combine_single_alltoall(
     ffn_hidden: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Common post-processing for non-chunked combine: layout -> fc2 dx -> act bwd."""
+    all_expert_probs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Common post-processing for non-chunked combine: layout -> fc2 dx -> probs bwd -> act bwd."""
     nvtx_range_push("layout_convert")
     row_idx_rank_to_exp = backward_indices['row_idx_rank_to_exp']
     if _should_keep_grad_all_fc2_stable():
@@ -313,10 +314,25 @@ def _post_combine_single_alltoall(
     grouped_fc2_dx(grad_all_fc2, weight2, all_tokens_per_expert, out=grad_exp_act)
     nvtx_range_pop()
 
+    # Probs backward: grad_exp_act is grad w.r.t. act_weighted = act * probs
+    grad_probs = None
+    if all_expert_probs is not None:
+        nvtx_range_push("probs_backward")
+        fc1_detached = all_fc1.detach()
+        act_pre_probs = activation_func(fc1_detached)
+        grad_probs = (grad_exp_act * act_pre_probs).sum(dim=-1)
+        grad_exp_act = grad_exp_act * all_expert_probs.unsqueeze(-1).to(grad_exp_act.dtype)
+        nvtx_range_pop()
+
     nvtx_range_push("act_backward")
     grad_all_fc1, act_output = _activation_backward(grad_exp_act, all_fc1, activation_func)
     nvtx_range_pop()
-    return grad_all_fc1, act_output, grad_all_fc2
+
+    # For w2 dW: act_output should be act_weighted = act * probs (the actual FC2 input)
+    if all_expert_probs is not None:
+        act_output = act_output * all_expert_probs.unsqueeze(-1).to(act_output.dtype)
+
+    return grad_all_fc1, act_output, grad_all_fc2, grad_probs
 
 
 def skip_all_dw() -> bool:
@@ -624,7 +640,11 @@ def combine_fc2_backward(
     backward_indices: Optional[Dict[str, torch.Tensor]] = None,
     # Pre-computed static chunk config (from build_moe_chunk_config)
     chunk_config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[int], Dict[str, torch.Tensor]]:
+    # Megatron-aligned: probs applied inside expert computation
+    all_expert_probs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, List[int], Dict[str, torch.Tensor],
+           Optional[torch.Tensor]]:
     """
     Region 1: Combine AllToAll overlap FC2 dx (communication-first pipeline).
 
@@ -656,12 +676,13 @@ def combine_fc2_backward(
 
     Returns:
         grad_all_fc1: [total_recv, ffn_hidden] gradient w.r.t. FC1 output
-        act_output: [total_recv, ffn_hidden] activation output (detached)
+        act_output: [total_recv, ffn_hidden] activation output (detached; probs-weighted if applicable)
         all_fc1: [total_recv, ffn_hidden] FC1 pre-activation (expert-major)
         grad_all_fc2: [total_recv, hidden] gradient after AllToAll + layout convert (for dW)
         all_expert_tokens: [total_recv, hidden] expert-major tokens
         all_tokens_per_expert: token counts per local expert
         backward_indices: layout convert indices for region 1/2
+        grad_expert_probs: Optional [total_recv] gradient w.r.t. probs in expert-major order
     """
     nvtx_range_push("combine_fc2_backward")
     scheduler = get_backward_scheduler()
@@ -710,7 +731,7 @@ def combine_fc2_backward(
         nvtx_range_pop()
 
         all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
-        grad_all_fc1, act_output, grad_all_fc2 = _post_combine_single_alltoall(
+        grad_all_fc1, act_output, grad_all_fc2, grad_probs = _post_combine_single_alltoall(
             grad_combined_recv=grad_combined_recv,
             backward_indices=backward_indices,
             weight2=weight2,
@@ -722,12 +743,13 @@ def combine_fc2_backward(
             ffn_hidden=ffn_hidden,
             dtype=dtype,
             device=device,
+            all_expert_probs=all_expert_probs,
         )
 
         nvtx_range_pop()  # combine_fc2_backward
         return (
             grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2,
-            all_expert_tokens, all_tokens_per_expert, backward_indices,
+            all_expert_tokens, all_tokens_per_expert, backward_indices, grad_probs,
         )
 
     if num_chunks <= 1:
@@ -752,7 +774,7 @@ def combine_fc2_backward(
 
         scheduler.wait_alltoall(task_id)
         grad_combined_recv = result_holder[0]
-        grad_all_fc1, act_output, grad_all_fc2 = _post_combine_single_alltoall(
+        grad_all_fc1, act_output, grad_all_fc2, grad_probs = _post_combine_single_alltoall(
             grad_combined_recv=grad_combined_recv,
             backward_indices=backward_indices,
             weight2=weight2,
@@ -764,12 +786,13 @@ def combine_fc2_backward(
             ffn_hidden=ffn_hidden,
             dtype=dtype,
             device=device,
+            all_expert_probs=all_expert_probs,
         )
 
         nvtx_range_pop()  # combine_fc2_backward
         return (
             grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2,
-            all_expert_tokens, all_tokens_per_expert, backward_indices,
+            all_expert_tokens, all_tokens_per_expert, backward_indices, grad_probs,
         )
 
     # ========================================================================
@@ -840,6 +863,8 @@ def combine_fc2_backward(
     # Step 2: Submit all AllToAll chunks (batch: single stream switch)
     def _make_combine_a2a(ib, ob):
         def fn():
+            ib.record_stream(torch.cuda.current_stream())
+            ob.record_stream(torch.cuda.current_stream())
             dist.all_to_all_single(
                 ob, ib, output_split_sizes=chunk_recv_splits,
                 input_split_sizes=chunk_send_splits, group=ep_group,
@@ -940,16 +965,29 @@ def combine_fc2_backward(
             grad_exp_act.index_copy_(0, scatter_c, _act_chunk_buf)
             nvtx_range_pop()
 
-    # Step 6: Activation backward on full expert-major tensor
+    # Step 6: Probs backward + activation backward on full expert-major tensor
+    grad_probs = None
+    if all_expert_probs is not None:
+        nvtx_range_push("probs_backward")
+        fc1_detached = all_fc1.detach()
+        act_pre_probs = activation_func(fc1_detached)
+        grad_probs = (grad_exp_act * act_pre_probs).sum(dim=-1)
+        grad_exp_act = grad_exp_act * all_expert_probs.unsqueeze(-1).to(grad_exp_act.dtype)
+        nvtx_range_pop()
+
     nvtx_range_push("act_backward")
     grad_all_fc1, act_output = _activation_backward(grad_exp_act, all_fc1, activation_func)
     nvtx_range_pop()
+
+    # For w2 dW: act_output should be act_weighted = act * probs (the actual FC2 input)
+    if all_expert_probs is not None:
+        act_output = act_output * all_expert_probs.unsqueeze(-1).to(act_output.dtype)
 
     nvtx_range_pop()  # combine_fc2_chunked
     nvtx_range_pop()  # combine_fc2_backward
     return (
         grad_all_fc1, act_output.detach(), all_fc1, grad_all_fc2,
-        all_expert_tokens, all_tokens_per_expert, backward_indices,
+        all_expert_tokens, all_tokens_per_expert, backward_indices, grad_probs,
     )
 
 
@@ -1132,6 +1170,8 @@ def fc1_dispatch_backward(
 
     def _make_dispatch_a2a(ib, ob):
         def fn():
+            ib.record_stream(torch.cuda.current_stream())
+            ob.record_stream(torch.cuda.current_stream())
             dist.all_to_all_single(
                 ob, ib, output_split_sizes=chunk_recv_splits,
                 input_split_sizes=chunk_send_splits, group=ep_group,
@@ -1255,27 +1295,28 @@ def router_backward(
     grad_permuted_probs: torch.Tensor,
     sorted_indices: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    router_probs: torch.Tensor,
+    top_indices: torch.Tensor,
+    top_probs: torch.Tensor,
     router_weight: torch.Tensor,
     num_tokens: int,
     num_experts: int,
+    top_k: int,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute router backward: gradients through softmax and linear projection.
-    Aligned with Megatron's routing format (routing_map [T, E] + routing_probs [T, E]).
-
-    No renormalization backward — matches Megatron pre_softmax mode where
-    softmax is applied before topk selection, and selected probs are used directly.
+    Compute router backward: gradients through post-softmax routing and linear projection.
+    Aligned with Megatron's default post-softmax mode: topk(logits) → softmax(top_k).
 
     Args:
         grad_permuted_probs: [num_real] gradient w.r.t. permuted probabilities
         sorted_indices: [num_real] original token indices (0..T-1, expert-major order)
         tokens_per_expert: [num_experts] token count per expert (pre-padding)
-        router_probs: [num_tokens, num_experts] full softmax probabilities
+        top_indices: [num_tokens, top_k] selected expert indices per token
+        top_probs: [num_tokens, top_k] softmax(top_k_logits) probabilities
         router_weight: [hidden_size, num_experts] router weight matrix
         num_tokens: Number of input tokens
         num_experts: Number of experts
+        top_k: Number of experts per token
         dtype: Data type for output
 
     Returns:
@@ -1285,7 +1326,6 @@ def router_backward(
     device = grad_permuted_probs.device
 
     # Step 1: Scatter grad from permuted [num_real] to [T, E]
-    # sorted_indices gives token id, tokens_per_expert gives expert boundaries
     expert_ids = torch.repeat_interleave(
         torch.arange(num_experts, device=device), tokens_per_expert
     )
@@ -1294,17 +1334,24 @@ def router_backward(
     )
     grad_routing_probs[sorted_indices, expert_ids] = grad_permuted_probs
 
-    # Step 2: Backward through softmax
-    # router_probs = softmax(router_logits), routing_probs = router_probs * routing_map
-    # grad_logits = router_probs * (grad_routing_probs - sum(grad_routing_probs * router_probs))
-    sum_grad = (grad_routing_probs * router_probs).sum(dim=-1, keepdim=True)
-    grad_router_logits = router_probs * (grad_routing_probs - sum_grad)
+    # Step 2: Gather grad at top-k positions → [T, k]
+    grad_top_probs = grad_routing_probs.gather(1, top_indices)
 
-    # Step 3: Backward through router linear: logits = hidden @ weight
-    # grad_hidden = grad_logits @ weight.T
+    # Step 3: Backward through softmax (only over top-k dimension)
+    sum_grad = (grad_top_probs * top_probs).sum(dim=-1, keepdim=True)
+    grad_top_logits = top_probs * (grad_top_probs - sum_grad)
+
+    # Step 4: Scatter back to [T, E] (only top-k positions have gradients)
+    grad_router_logits = torch.zeros(
+        num_tokens, num_experts, dtype=grad_top_logits.dtype, device=device
+    )
+    grad_router_logits.scatter_(1, top_indices, grad_top_logits)
+
+    # Step 5: Backward through router linear: logits = hidden @ weight
+    # Matmul in grad dtype matching Megatron
     grad_hidden_from_router = torch.matmul(
-        grad_router_logits.float(), router_weight.t().float()
-    ).to(dtype)
+        grad_router_logits, router_weight.to(grad_router_logits.dtype).t()
+    )
 
     return grad_hidden_from_router, grad_router_logits
 
@@ -1336,8 +1383,7 @@ def register_router_dw_task(
         grad_logits_saved = grad_router_logits.detach()
 
         def compute_router_dw():
-            grad_weight = torch.matmul(hidden_saved.t().float(), grad_logits_saved.float())
-            return grad_weight
+            return torch.matmul(hidden_saved.t(), grad_logits_saved)
 
         scheduler.register_dw_task(
             layer_name=f"router_weight_layer{layer_id}",
@@ -1347,7 +1393,7 @@ def register_router_dw_task(
         )
         return None
     else:
-        grad_router_weight = torch.matmul(hidden_states.t().float(), grad_router_logits.float())
+        grad_router_weight = torch.matmul(hidden_states.t(), grad_router_logits)
         return grad_router_weight
 
 

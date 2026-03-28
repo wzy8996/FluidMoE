@@ -232,6 +232,8 @@ def create_te_linear(
     params_dtype: Optional[torch.dtype] = None,
     device: Optional[torch.device] = None,
     init_method: Optional[Callable] = None,
+    get_rng_state_tracker: Optional[Callable] = None,
+    parallel_mode: Optional[str] = None,
 ) -> Optional[nn.Module]:
     """Create TE Linear module.
 
@@ -242,6 +244,9 @@ def create_te_linear(
         params_dtype: parameter dtype
         device:       parameter device
         init_method:  weight init callable
+        get_rng_state_tracker: Megatron RNG tracker callable for deterministic init
+        parallel_mode: TE parallel mode ("column", "row", or None).
+                       Must match Megatron's TELinear to ensure identical init path.
 
     Returns:
         te.Linear instance, or None if TE unavailable.
@@ -252,13 +257,19 @@ def create_te_linear(
         in_features=in_features,
         out_features=out_features,
         bias=bias,
+        tp_size=1,   # Match Megatron TELinear (TP=1)
+        tp_group=None,
     )
+    if parallel_mode is not None:
+        kwargs["parallel_mode"] = parallel_mode
     if params_dtype is not None:
         kwargs["params_dtype"] = params_dtype
     if device is not None:
         kwargs["device"] = str(device) if isinstance(device, torch.device) else device
     if init_method is not None:
         kwargs["init_method"] = init_method
+    if get_rng_state_tracker is not None:
+        kwargs["get_rng_state_tracker"] = get_rng_state_tracker
     return _te_pytorch.Linear(**kwargs)
 
 

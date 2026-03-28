@@ -50,25 +50,46 @@ class _FlatARBuffer:
         self.write_fp32 = 0
         self.committed_fp32 = 0
 
-    def setup(self, params):
+    def setup(self, params, accumulate_in_fp32=True):
+        """Set up flat buffer for params.
+
+        Args:
+            params: list of parameters to register.
+            accumulate_in_fp32: if True, always use fp32 buffer (matching Megatron's
+                accumulate_allreduce_grads_in_fp32 default). Gradients are cast to fp32
+                on write and the allreduce runs in fp32 for numerical stability.
+        """
         self.param_map = {}
         if not params:
             self.bf16 = self.fp32 = None
             self.reset_cursors()
             return
         device = params[0].device
-        for dtype_val, attr in [(torch.bfloat16, 'bf16'), (torch.float32, 'fp32')]:
-            typed = [(p, p.numel()) for p in params if p.dtype == dtype_val]
-            if typed:
-                total = sum(n for _, n in typed)
-                buf = torch.zeros(total, dtype=dtype_val, device=device)
-                offset = 0
-                for p, n in typed:
-                    self.param_map[p] = (buf, offset, n)
-                    offset += n
-                setattr(self, attr, buf)
-            else:
-                setattr(self, attr, None)
+        if accumulate_in_fp32:
+            # All params share a single fp32 buffer (Megatron convention)
+            total = sum(p.numel() for p in params)
+            buf = torch.zeros(total, dtype=torch.float32, device=device)
+            offset = 0
+            for p in params:
+                n = p.numel()
+                self.param_map[p] = (buf, offset, n)
+                offset += n
+            self.fp32 = buf
+            self.bf16 = None
+        else:
+            # Group by dtype (legacy path)
+            for dtype_val, attr in [(torch.bfloat16, 'bf16'), (torch.float32, 'fp32')]:
+                typed = [(p, p.numel()) for p in params if p.dtype == dtype_val]
+                if typed:
+                    total = sum(n for _, n in typed)
+                    buf = torch.zeros(total, dtype=dtype_val, device=device)
+                    offset = 0
+                    for p, n in typed:
+                        self.param_map[p] = (buf, offset, n)
+                        offset += n
+                    setattr(self, attr, buf)
+                else:
+                    setattr(self, attr, None)
         self.reset_cursors()
 
     def reset_cursors(self):
@@ -100,7 +121,7 @@ class _FlatARBuffer:
             b += max(0, self.committed_fp32 - self.read_fp32) * 4
         return b
 
-    def submit_block(self, group, max_bytes=0):
+    def submit_block(self, group, max_bytes=0, pre_scale: float = 1.0):
         """Submit all_reduce for committed data, up to max_bytes (0=unlimited).
         Returns (ops, bytes_submitted)."""
         ops = 0
@@ -109,7 +130,10 @@ class _FlatARBuffer:
             avail = self.committed_bf16 - self.read_bf16
             numel = min(avail, max_bytes // 2) if max_bytes > 0 else avail
             if numel > 0:
-                dist.all_reduce(self.bf16[self.read_bf16:self.read_bf16 + numel], group=group)
+                ar_slice = self.bf16[self.read_bf16:self.read_bf16 + numel]
+                if pre_scale != 1.0:
+                    ar_slice.mul_(pre_scale)
+                dist.all_reduce(ar_slice, group=group)
                 self.read_bf16 += numel
                 submitted += numel * 2
                 ops += 1
@@ -123,18 +147,34 @@ class _FlatARBuffer:
             else:
                 numel = avail
             if numel > 0:
-                dist.all_reduce(self.fp32[self.read_fp32:self.read_fp32 + numel], group=group)
+                ar_slice_fp32 = self.fp32[self.read_fp32:self.read_fp32 + numel]
+                if pre_scale != 1.0:
+                    ar_slice_fp32.mul_(pre_scale)
+                dist.all_reduce(ar_slice_fp32, group=group)
                 self.read_fp32 += numel
                 submitted += numel * 4
                 ops += 1
         return ops, submitted
 
-    def sync_allreduce(self, group):
+    def sync_allreduce(self, group, pre_scale: float = 1.0):
         """Synchronous AR of full buffers (used when ar_enabled=False)."""
         if self.bf16 is not None:
+            if pre_scale != 1.0:
+                self.bf16.mul_(pre_scale)
             dist.all_reduce(self.bf16, group=group)
         if self.fp32 is not None:
+            if pre_scale != 1.0:
+                self.fp32.mul_(pre_scale)
             dist.all_reduce(self.fp32, group=group)
+
+    def scale_pending(self, scale: float):
+        """Scale all committed-but-not-yet-read data (for expert_dp=1 scaling)."""
+        if self.bf16 is not None and self.read_bf16 < self.committed_bf16:
+            self.bf16[self.read_bf16:self.committed_bf16].mul_(scale)
+            self.read_bf16 = self.committed_bf16
+        if self.fp32 is not None and self.read_fp32 < self.committed_fp32:
+            self.fp32[self.read_fp32:self.committed_fp32].mul_(scale)
+            self.read_fp32 = self.committed_fp32
 
     def write_grad(self, param, grad_weight):
         """Write grad into buffer, advance write cursor. Returns True if handled."""
@@ -142,11 +182,19 @@ class _FlatARBuffer:
             return False
         buf, offset, numel = self.param_map[param]
         flat_grad = grad_weight.view(-1)
-        if param.grad is None:
-            buf[offset:offset + numel].copy_(flat_grad)
+        grad_view = buf[offset:offset + numel]
+        if not hasattr(param, '_ar_buf_written') or not param._ar_buf_written:
+            grad_view.copy_(flat_grad)
+            param._ar_buf_written = True
         else:
-            buf[offset:offset + numel].add_(flat_grad)
-        param.grad = buf[offset:offset + numel].view(param.shape)
+            grad_view.add_(flat_grad)
+        # If buffer dtype matches param dtype, use param.grad directly.
+        # Otherwise use main_grad (for fp32 buffer + bf16 param, matching Megatron).
+        shaped_view = grad_view.view(param.shape)
+        if buf.dtype == param.dtype:
+            param.grad = shaped_view
+        else:
+            param.main_grad = shaped_view
         end = offset + numel
         if buf.dtype == torch.bfloat16:
             if end > self.write_bf16:
@@ -180,6 +228,7 @@ class BackwardScheduler:
         # dW queue
         self._dw_queue = deque()
         self._ar_params_for_sync = []
+        self._unbuffered_expert_params = []
 
         # AllToAll tracking
         self._alltoall_task_id = 0
@@ -253,11 +302,15 @@ class BackwardScheduler:
             self.default_stream = torch.cuda.default_stream(current_device)
             from fluid.core.stream import get_stream_manager
             sm = get_stream_manager()
+            self._stream_manager = sm
             self.comm_stream = sm.comm_stream
-            self._ar_done_event = torch.cuda.Event()
-            self._dw_sync_event = torch.cuda.Event()
+            self._ar_done_event = sm.get_sync_event(("scheduler", "ar_done"))
+            self._dw_sync_event = sm.get_sync_event(("scheduler", "dw_sync"))
             _POOL_SIZE = 64
-            self._event_pool = [torch.cuda.Event() for _ in range(_POOL_SIZE)]
+            self._event_pool = [
+                sm.get_sync_event(("scheduler", "pool", idx))
+                for idx in range(_POOL_SIZE)
+            ]
             self._event_pool_size = _POOL_SIZE
 
     def enable(self):
@@ -336,6 +389,9 @@ class BackwardScheduler:
                         self._pending_ar_tensors.append(task.weight_param.grad)
                     elif self.shared_dp_world_size > 1:
                         self._ar_params_for_sync.append(task.weight_param)
+                else:
+                    # Expert params (no AR needed) — track for 1/dp_cp_size scaling
+                    self._unbuffered_expert_params.append(task.weight_param)
         self.completed_dw += 1
 
     def _commit_and_submit_ar(self):
@@ -428,16 +484,19 @@ class BackwardScheduler:
         CPU cost: microseconds (just queuing NCCL kernels).
         GPU: comm_stream runs AR concurrently with default_stream compute.
         """
-        has_expert = self.expert_dp_world_size > 1 and self.expert_dp_group is not None
+        has_expert_ar = self.expert_dp_world_size > 1 and self.expert_dp_group is not None
         has_shared = self.shared_dp_world_size > 1
+        has_expert_buf = self._expert_ar is not None and self._expert_ar.has_pending()
 
-        if not has_expert and not has_shared:
+        if not has_expert_ar and not has_shared and not has_expert_buf:
             return
 
         if budgeted:
             expert_budget, shared_budget = self._compute_ar_budget()
         else:
             expert_budget, shared_budget = 0, 0  # 0 = unlimited
+
+        pre_scale = 1.0 / self.shared_dp_world_size if self.shared_dp_world_size > 1 else 1.0
 
         ops = 0
         with torch.cuda.stream(self.comm_stream):
@@ -448,19 +507,34 @@ class BackwardScheduler:
             if ar_s:
                 ar_s.record(self.comm_stream)
 
-            # Expert first (smaller group, faster per byte)
-            if has_expert and self._expert_ar.has_pending():
-                e_ops, _ = self._expert_ar.submit_block(self.expert_dp_group, expert_budget)
-                ops += e_ops
+            # Expert: always pre_scale, only allreduce when expert_dp > 1
+            if has_expert_buf:
+                if has_expert_ar:
+                    e_ops, _ = self._expert_ar.submit_block(
+                        self.expert_dp_group, expert_budget,
+                        pre_scale=pre_scale)
+                    ops += e_ops
+                elif pre_scale != 1.0:
+                    # expert_dp=1: no allreduce, just scale for AVG convention
+                    self._expert_ar.scale_pending(pre_scale)
             # Shared
             if has_shared and self._shared_ar.has_pending():
-                s_ops, _ = self._shared_ar.submit_block(self.shared_dp_group, shared_budget)
+                s_ops, _ = self._shared_ar.submit_block(
+                    self.shared_dp_group, shared_budget,
+                    pre_scale=pre_scale)
                 ops += s_ops
             # Fallback: params not in flat buffer
             if not budgeted:
                 while self._pending_ar_tensors:
                     grad = self._pending_ar_tensors.popleft()
                     if grad is not None:
+                        # Direct-grad fallback tensors may be dropped from
+                        # model_param.grad as soon as optimizer preprocessing
+                        # starts. Record the comm stream so the caching
+                        # allocator does not recycle their storage before this
+                        # async all-reduce completes.
+                        grad.record_stream(self.comm_stream)
+                        grad.div_(self.shared_dp_world_size)
                         dist.all_reduce(grad, group=self.shared_dp_group)
                         ops += 1
 
@@ -489,7 +563,9 @@ class BackwardScheduler:
         if idx < self._event_pool_size:
             return self._event_pool[idx]
         while self._event_pool_size <= idx:
-            self._event_pool.append(torch.cuda.Event())
+            self._event_pool.append(
+                self._stream_manager.get_sync_event(("scheduler", "pool", self._event_pool_size))
+            )
             self._event_pool_size += 1
         return self._event_pool[idx]
 
@@ -622,11 +698,25 @@ class BackwardScheduler:
     # ========================================
     def _sync_allreduce_all_params(self):
         if self.shared_dp_world_size > 1:
-            self._shared_ar.sync_allreduce(self.shared_dp_group)
+            self._shared_ar.sync_allreduce(
+                self.shared_dp_group,
+                pre_scale=1.0 / self.shared_dp_world_size,
+            )
         if self.expert_dp_world_size > 1 and self.expert_dp_group is not None:
-            self._expert_ar.sync_allreduce(self.expert_dp_group)
+            self._expert_ar.sync_allreduce(
+                self.expert_dp_group,
+                pre_scale=1.0 / self.shared_dp_world_size,
+            )
+        elif self.shared_dp_world_size > 1 and self._expert_ar.bf16 is not None:
+            # Expert params don't need AR (expert_dp=1) but still need scaling
+            # to match shared params' AVG convention. Expert grads come from
+            # all CP ranks via AlltoAll dispatch, so divide by dp_cp_size.
+            self._expert_ar.bf16.mul_(1.0 / self.shared_dp_world_size)
+        elif self.shared_dp_world_size > 1 and self._expert_ar.fp32 is not None:
+            self._expert_ar.fp32.mul_(1.0 / self.shared_dp_world_size)
         for param in self._ar_params_for_sync:
             if param.grad is not None:
+                param.grad.div_(self.shared_dp_world_size)
                 dist.all_reduce(param.grad, group=self.shared_dp_group)
         self._ar_params_for_sync.clear()
 
@@ -646,6 +736,7 @@ class BackwardScheduler:
         self._alltoall_results.clear()
         self._pending_ar_tensors.clear()
         self._ar_params_for_sync.clear()
+        self._unbuffered_expert_params.clear()
         self._last_ar_cuda_event = None
         self._alltoall_task_id = 0
         self._ar_task_count = 0
@@ -669,9 +760,9 @@ class BackwardScheduler:
 
         if self._use_interleaved_ar() and needs_ar:
             # Execute dW with per-task commits + inline AR submission:
-            # GPU overlap via comm_stream (AR) vs default_stream (dW)
+            # GPU overlap via comm_stream (AR) vs default_stream (dw)
             self.execute_dw_tasks(commit_per_task=True)
-            # Flush any remaining AR
+            # Flush any remaining AR (includes expert pre_scale even when expert_dp=1)
             self._submit_ar_inline(budgeted=False)
             # Final GPU sync: default_stream waits for comm_stream completion
             self._wait_all_ar()
@@ -821,7 +912,7 @@ class BackwardScheduler:
 
     @staticmethod
     def measure_ar_bandwidth(ar_group=None, sizes_mb=(1, 2, 4, 8, 16, 32, 64, 96, 128),
-                             warmup=5, repeat=20, dtype=torch.bfloat16) -> dict:
+                             warmup=5, repeat=20, dtype=torch.float32) -> dict:
         device = torch.cuda.current_device()
         results = {'sizes_mb': [], 'bw_GBps': [], 'latency_ms': []}
         elem_size = 2 if dtype == torch.bfloat16 else 4

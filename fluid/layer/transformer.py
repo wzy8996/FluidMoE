@@ -26,7 +26,6 @@ from fluid.attention.forward import (
 )
 from fluid.moe.forward import (
     router_forward,
-    pad_moe_dispatch,
     dispatch_fc1_p2p_forward,
     fc2_combine_p2p_forward,
 )
@@ -200,62 +199,55 @@ class TransformerLayerFunction(torch.autograd.Function):
         ln2_flat = ln2_out.view(-1, hidden_size)
         num_tokens = ln2_flat.shape[0]
 
-        # Router forward (Megatron-aligned: routing_map + routing_probs format)
+        # Router forward (Megatron-aligned: post-softmax routing with TE fused permute)
         (permuted_tokens, permuted_probs, sorted_indices,
          input_splits, output_splits, tokens_per_expert,
-         router_probs) = router_forward(
+         top_indices, top_probs, row_id_map) = router_forward(
             ln2_flat, router_weight, num_experts, top_k, ep_group,
             capacity_factor=capacity_factor,
         )
-        # Save pre-pad tokens_per_expert for router backward
-        tokens_per_expert_router = tokens_per_expert.clone()
 
-        # Pad to fixed capacity for uniform splits (enables token-dim chunking in backward)
+        # Compute splits for dispatch/combine
         pad_to_cap = capacity_factor > 0
         if pad_to_cap:
             expert_capacity = int(math.ceil(
                 num_tokens * top_k / num_experts * capacity_factor))
-            cap_per_rank = expert_capacity
-            (permuted_tokens, permuted_probs, sorted_indices,
-             tokens_per_expert, real_mask) = pad_moe_dispatch(
-                permuted_tokens, permuted_probs, sorted_indices,
-                tokens_per_expert, cap_per_rank, num_experts,
-            )
-            S = num_local_experts * cap_per_rank
+            S = num_local_experts * expert_capacity
             input_splits_list = [S] * ep_group.size()
             output_splits_list = [S] * ep_group.size()
             # Metadata is deterministic — skip P2P metadata piggybacking
             pre_tokens_cpu = torch.full(
-                (ep_group.size(), num_local_experts), cap_per_rank, dtype=torch.int64)
+                (ep_group.size(), num_local_experts), expert_capacity, dtype=torch.int64)
         else:
-            real_mask = None
             input_splits_list = input_splits.tolist()
             output_splits_list = output_splits.tolist()
             pre_tokens_cpu = None
 
-        # Dispatch + FC1 with P2P overlap
+        # Dispatch + FC1 with P2P overlap (Megatron-aligned: probs applied between act and FC2)
         (local_tokens, local_act, recv_act_results, recv_buffers,
-         moe_partners, _recv_offsets, tokens_cpu) = dispatch_fc1_p2p_forward(
+         moe_partners, _recv_offsets, tokens_cpu,
+         local_probs, recv_probs_dict) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, activation_func, num_local_experts,
             tokens_per_expert,
             pre_tokens_cpu=pre_tokens_cpu,
+            permuted_probs=permuted_probs,
         )
 
         # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
         (combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert,
-         backward_indices) = fc2_combine_p2p_forward(
+         backward_indices, all_expert_probs) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
             moe_w2_d, input_splits_list, output_splits_list,
             ep_group, moe_overlap_ctx, num_local_experts,
             moe_partners, tokens_cpu, needs_backward=needs_grad,
+            local_probs=local_probs, recv_probs=recv_probs_dict,
         )
 
-        # Apply probs and scatter-reduce to [num_tokens, hidden]
-        weighted_output = combined_output * permuted_probs.unsqueeze(-1).to(dtype)
+        # Unpermute: scatter FC2 output back to token positions (NO probs — already applied inside experts)
         moe_output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
         moe_output.scatter_add_(
-            0, sorted_indices.unsqueeze(1).expand_as(weighted_output), weighted_output)
+            0, sorted_indices.unsqueeze(1).expand_as(combined_output), combined_output)
 
         # Reshape back: [seq*batch, hidden] -> [seq, batch, hidden]
         moe_output = moe_output.view(seq_len, batch_size, hidden_size)
@@ -270,17 +262,19 @@ class TransformerLayerFunction(torch.autograd.Function):
             # all_expert_tokens is pre-merged in forward (expert-major order)
             if all_expert_tokens is None:
                 all_expert_tokens = torch.empty(0, hidden_size, dtype=dtype, device=hidden_states.device)
-
+            # all_expert_probs for backward probs gradient (small 1D tensor)
+            if all_expert_probs is None:
+                all_expert_probs = torch.empty(0, dtype=torch.float32, device=hidden_states.device)
             ctx.save_for_backward(
                 # Input and intermediate states
                 hidden_states, ln1_out, hidden_after_attn, ln2_flat,
                 # Attention states - only attn_input_full needed (q/k/v saved with graph below)
                 attn_input_full,
                 # MoE states (Megatron-aligned format)
-                permuted_tokens, permuted_probs, sorted_indices,
-                router_probs,
+                permuted_tokens, sorted_indices,
+                top_indices, top_probs,
                 all_expert_tokens,
-                combined_output,
+                all_expert_probs,
                 # Weights (detached)
                 ln1_weight, ln1_bias, ln2_weight, ln2_bias,
                 qkv_weight.detach(), proj_weight.detach(),
@@ -291,8 +285,8 @@ class TransformerLayerFunction(torch.autograd.Function):
             # Store non-tensor merge results on ctx
             ctx.all_tokens_per_expert = all_tokens_per_expert
             ctx.backward_indices = backward_indices
-            # Pre-pad tokens_per_expert for router backward (expert boundary reconstruction)
-            ctx.tokens_per_expert_router = tokens_per_expert_router
+            # tokens_per_expert for router backward (in fused path, includes padding entries)
+            ctx.tokens_per_expert = tokens_per_expert
             # Save SDPA computation graph (avoids redundant forward in backward)
             # FlashAttention only stores logsumexp O(seq), not attention matrix O(seq²)
             ctx._q_for_attn = q_for_attn
@@ -332,8 +326,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.head_dim = head_dim
             ctx.scale = scale
 
-            # MoE routing info (real_mask distinguishes real vs padded tokens)
-            ctx.real_mask = real_mask
+            # MoE routing info
             ctx.input_splits_list = input_splits_list
             ctx.output_splits_list = output_splits_list
 
@@ -352,19 +345,19 @@ class TransformerLayerFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass with P2P overlap and dW scheduling."""
         if not ctx.needs_grad:
-            return (None,) * 26  # 10 weights + 4 groups/contexts + 12 config params
+            return (None,) * 29  # 10 weights + 4 groups/contexts + 15 config params
 
         # Ensure grad_output matches forward dtype (e.g. loss computed in float32 → cast back to bf16)
         if grad_output.dtype != ctx.dtype:
             grad_output = grad_output.to(ctx.dtype)
 
-        # Retrieve saved tensors (Megatron-aligned format: no token_ids/top_probs/top_indices)
+        # Retrieve saved tensors (Megatron-aligned format: post-softmax top_indices/top_probs)
         (hidden_states, ln1_out, hidden_after_attn, ln2_flat,
          attn_input_full,
-         permuted_tokens, permuted_probs, sorted_indices,
-         router_probs,
+         permuted_tokens, sorted_indices,
+         top_indices, top_probs,
          all_expert_tokens,
-         combined_output,
+         all_expert_probs,
          ln1_weight, ln1_bias, ln2_weight, ln2_bias,
          qkv_weight, proj_weight,
          router_weight, moe_w1_2d, moe_w2_2d,
@@ -373,6 +366,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Retrieve pre-computed merge results
         all_tokens_per_expert = ctx.all_tokens_per_expert
         backward_indices = ctx.backward_indices
+        tokens_per_expert = ctx.tokens_per_expert
 
         # Retrieve SDPA computation graph for direct backward (no redundant forward)
         q_for_attn = ctx._q_for_attn
@@ -439,30 +433,16 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_hidden_after_attn = grad_output
         grad_moe_output = grad_output.view(num_tokens, hidden_size)
 
-        # Step 1: Backward through sum and restore (capacity mode: scatter_add)
+        # Step 1: Backward through unpermute (NO probs — probs applied inside expert computation)
         # sorted_indices = original token indices (Megatron format)
-        grad_weighted = grad_moe_output[sorted_indices]
+        grad_combined = grad_moe_output[sorted_indices]
 
-        # Step 2: Backward through prob weighting
-        grad_combined = grad_weighted * permuted_probs.unsqueeze(-1).to(grad_weighted.dtype)
-        grad_permuted_probs = (grad_weighted * combined_output.to(grad_weighted.dtype)).sum(dim=-1)
-
-        # Filter padded positions for router backward (padded grads are zero but
-        # direct-assignment in router_backward could overwrite real gradients).
-        real_mask = ctx.real_mask
-        tokens_per_expert_router = ctx.tokens_per_expert_router
-        if real_mask is not None:
-            grad_permuted_probs_real = grad_permuted_probs[real_mask]
-            sorted_indices_real = sorted_indices[real_mask]
-        else:
-            grad_permuted_probs_real = grad_permuted_probs
-            sorted_indices_real = sorted_indices
-
-        # Region 1: Combine AllToAll → FC2 dx (communication-first pipeline)
-        # Chunked AllToAll submitted first, FC2 dx computed as each chunk arrives
+        # Region 1: Combine AllToAll → FC2 dx → probs backward → activation backward
+        # Probs backward (act * probs) is handled inside combine_fc2_backward
         scheduler.begin_region('moe_combine')
         (grad_all_fc1, act_output, all_fc1, grad_all_fc2,
-         all_expert_tokens, all_tokens_per_expert, backward_indices) = combine_fc2_backward(
+         all_expert_tokens, all_tokens_per_expert, backward_indices,
+         grad_expert_probs) = combine_fc2_backward(
             grad_combined, input_splits_list, output_splits_list, ep_group, layer_id,
             weight1=moe_w1,
             weight2=moe_w2,
@@ -473,6 +453,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             all_tokens_per_expert=all_tokens_per_expert,
             backward_indices=backward_indices,
             chunk_config=chunk_config,
+            all_expert_probs=all_expert_probs,
         )
 
         scheduler.end_region()
@@ -488,10 +469,31 @@ class TransformerLayerFunction(torch.autograd.Function):
         )
 
         # =================================================================
-        # Register router_backward + router_dw + LN2 normalize as scheduler
-        # tasks so they execute during R2's Dispatch A2A overlap window.
-        # All inputs are available NOW (before R2): they only depend on
-        # forward-saved tensors and pre-R1 grad computations.
+        # Transport probs gradient back via A2A (small 1D tensor, negligible overhead)
+        # grad_expert_probs is in expert-major order on this rank.
+        # Reverse dispatch A2A to send probs grads back to original sender ranks.
+        # =================================================================
+        if grad_expert_probs is not None:
+            row_idx_exp_to_rank_probs = backward_indices['row_idx_exp_to_rank']
+            grad_probs_rank_major = grad_expert_probs[row_idx_exp_to_rank_probs]
+            from fluid.core import _all_to_all
+            grad_probs_dispatched = _all_to_all(
+                grad_probs_rank_major.unsqueeze(-1),
+                output_split_sizes=input_splits_list,
+                input_split_sizes=output_splits_list,
+                group=ep_group,
+                debug_tag="moe_probs_grad_a2a",
+            ).squeeze(-1)
+            # grad_probs_dispatched is now in same order as sorted_indices
+            grad_permuted_probs = grad_probs_dispatched
+        else:
+            grad_permuted_probs = torch.zeros(
+                sorted_indices.shape[0], dtype=torch.float32, device=device)
+
+        # =================================================================
+        # Register router_backward + router_dw as scheduler tasks
+        # (execute during R2's Dispatch A2A overlap window)
+        # Padding entries have grad_probs=0 (from probs=0 gate), no real_mask needed.
         # =================================================================
         router_result = [None, None]  # [grad_hidden_from_router, grad_router_logits]
         grad_router_weight = None
@@ -500,21 +502,24 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         if is_enabled:
             # --- router backward (no weight, just compute) ---
-            _grad_permuted_probs = grad_permuted_probs_real.detach()
-            _sorted_indices = sorted_indices_real
-            _tokens_per_expert_router = tokens_per_expert_router
-            _router_probs = router_probs
+            _grad_permuted_probs = grad_permuted_probs.detach()
+            _sorted_indices = sorted_indices
+            _tokens_per_expert = tokens_per_expert
+            _top_indices = top_indices
+            _top_probs = top_probs
             _router_weight = router_weight
 
             def _router_bwd_task():
                 router_result[0], router_result[1] = router_backward(
                     grad_permuted_probs=_grad_permuted_probs,
                     sorted_indices=_sorted_indices,
-                    tokens_per_expert=_tokens_per_expert_router,
-                    router_probs=_router_probs,
+                    tokens_per_expert=_tokens_per_expert,
+                    top_indices=_top_indices,
+                    top_probs=_top_probs,
                     router_weight=_router_weight,
                     num_tokens=num_tokens,
                     num_experts=num_experts,
+                    top_k=top_k,
                     dtype=dtype,
                 )
                 return None  # no gradient to write
@@ -554,7 +559,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             layer_id=layer_id, num_chunks=moe_dispatch_chunks,
             chunk_config=chunk_config,
         )
-        # sorted_indices = original token indices (Megatron format)
+        # Unpermute gradients back to original token positions
         grad_hidden_from_moe_tokens = torch.zeros(
             num_tokens, hidden_size, dtype=dtype, device=device)
         grad_hidden_from_moe_tokens.scatter_add_(
@@ -562,17 +567,19 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         scheduler.end_region()
 
-        # After R2: router_backward + LN2 normalize already executed in R2 overlap.
+        # After R2: router_backward already executed in R2 overlap.
         # Fallback: compute synchronously if scheduler disabled.
         if not is_enabled:
             router_result[0], router_result[1] = router_backward(
-                grad_permuted_probs=grad_permuted_probs_real,
-                sorted_indices=sorted_indices_real,
-                tokens_per_expert=tokens_per_expert_router,
-                router_probs=router_probs,
+                grad_permuted_probs=grad_permuted_probs,
+                sorted_indices=sorted_indices,
+                tokens_per_expert=tokens_per_expert,
+                top_indices=top_indices,
+                top_probs=top_probs,
                 router_weight=router_weight,
                 num_tokens=num_tokens,
                 num_experts=num_experts,
+                top_k=top_k,
                 dtype=dtype,
             )
             grad_router_weight = register_router_dw_task(
@@ -765,6 +772,8 @@ class TransformerLayer(nn.Module):
         attn_qkv_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
+        init_std: float = 0.02,
+        output_init_std: Optional[float] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ):
@@ -786,6 +795,8 @@ class TransformerLayer(nn.Module):
         from fluid.core.te_ops import te_gelu
         self.activation_func = activation_func or te_gelu
         self.capacity_factor = capacity_factor
+        self.init_std = init_std
+        self.output_init_std = output_init_std if output_init_std is not None else init_std
         self._moe_chunk_config = None  # lazily computed on first forward
         self._moe_chunk_signature = None
 
@@ -808,15 +819,30 @@ class TransformerLayer(nn.Module):
         qkv_size = num_kv_heads * (q_per_kv + 2) * head_dim
 
         # TE modules for attention (DotProductAttention + Linear)
+        # Match Megatron init semantics:
+        # - qkv uses init_method
+        # - proj uses output_layer_init_method
+        import functools
+        _qkv_init = functools.partial(nn.init.normal_, mean=0.0, std=self.init_std)
+        _proj_init = functools.partial(nn.init.normal_, mean=0.0, std=self.output_init_std)
+        try:
+            from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+            _rng_tracker = get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+        except Exception:
+            _rng_tracker = None
         self.te_qkv_linear = create_te_linear(
             hidden_size, qkv_size, bias=False,
             params_dtype=dtype, device=device,
-            init_method=nn.init.xavier_uniform_,
+            init_method=_qkv_init,
+            get_rng_state_tracker=_rng_tracker,
+            parallel_mode="column",
         )
         self.te_proj_linear = create_te_linear(
             num_heads * head_dim, hidden_size, bias=False,
             params_dtype=dtype, device=device,
-            init_method=nn.init.xavier_uniform_,
+            init_method=_proj_init,
+            get_rng_state_tracker=_rng_tracker,
+            parallel_mode="row",
         )
         q_heads_local = num_heads // cp_size
         kv_heads_local = num_kv_heads // cp_size
@@ -838,6 +864,11 @@ class TransformerLayer(nn.Module):
         self.router_weight = nn.Parameter(torch.empty(hidden_size, num_experts, dtype=torch.float32, device=device))
         self.moe_w1 = nn.Parameter(torch.empty(num_local_experts, hidden_size, ffn_hidden_size, dtype=dtype, device=device))
         self.moe_w2 = nn.Parameter(torch.empty(num_local_experts, ffn_hidden_size, hidden_size, dtype=dtype, device=device))
+        # Match Megatron MoE optimizer grouping: expert weights are not dense-allreduced.
+        # Scheduler still owns their gradient synchronization; this flag is for
+        # Megatron optimizer param-group classification only.
+        setattr(self.moe_w1, 'allreduce', False)
+        setattr(self.moe_w2, 'allreduce', False)
 
         # Overlap contexts
         self.attn_overlap_ctx = MultiCardOverlapContext(device, cp_size, cp_size)
@@ -858,14 +889,81 @@ class TransformerLayer(nn.Module):
         return self.proj_weight
 
     def _reset_parameters(self):
-        # TE Linear handles its own initialization via init_method
+        """Initialize parameters to match Megatron's init/output init split.
+
+        Uses Megatron's RNG tracker to fork to the correct RNG stream for each
+        parameter type, ensuring identical weights with the same seed:
+          - QKV: model-parallel-rng + init_method
+          - Proj: model-parallel-rng + output_layer_init_method
+          - Router: global CUDA RNG (no fork, same as Megatron)
+          - Expert FC1: expert-parallel-rng + init_method
+          - Expert FC2: expert-parallel-rng + output_layer_init_method
+
+        MoE weights are initialized in Megatron's layout then transposed.
+        """
+        from contextlib import nullcontext
+        try:
+            from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+        except ImportError:
+            get_cuda_rng_tracker = None
+        try:
+            from megatron.core.tensor_parallel.random import get_expert_parallel_rng_tracker_name
+            expert_rng_name = get_expert_parallel_rng_tracker_name()
+        except (ImportError, Exception):
+            expert_rng_name = 'expert-parallel-rng'
+
+        # TE Linear handles its own init + RNG fork via get_rng_state_tracker
+        def _model_rng_ctx():
+            if get_cuda_rng_tracker is None:
+                return nullcontext()
+            try:
+                return get_cuda_rng_tracker().fork()
+            except Exception:
+                return nullcontext()
+
         if self.te_qkv_linear is None:
-            nn.init.xavier_uniform_(self.qkv_weight)
+            with _model_rng_ctx():
+                nn.init.normal_(self.qkv_weight, mean=0.0, std=self.init_std)
         if self.te_proj_linear is None:
-            nn.init.xavier_uniform_(self.proj_weight)
-        nn.init.xavier_uniform_(self.router_weight)
-        nn.init.xavier_uniform_(self.moe_w1)
-        nn.init.xavier_uniform_(self.moe_w2)
+            with _model_rng_ctx():
+                nn.init.normal_(self.proj_weight, mean=0.0, std=self.output_init_std)
+
+        # Router: Megatron uses global CUDA RNG (no fork), layout [E, H]
+        tmp_router = torch.empty(
+            self.num_experts, self.hidden_size,
+            dtype=self.router_weight.dtype, device=self.router_weight.device)
+        nn.init.normal_(tmp_router, mean=0.0, std=self.init_std)
+        self.router_weight.data.copy_(tmp_router.t())
+
+        # Expert FC1/FC2: Megatron uses expert-parallel-rng.
+        # Megatron's GroupedMLP inits weight1 as [hidden, num_local*ffn] (ColumnParallel)
+        # and weight2 as [num_local*ffn, hidden] (RowParallel) in one shot.
+        # Fallback to default RNG when expert-parallel-rng is not registered
+        # (e.g., block benchmark without full Megatron pretrain() init).
+        num_local = self.moe_w1.shape[0]
+        ffn = self.moe_w1.shape[2]
+
+        def _has_rng_state(name):
+            if get_cuda_rng_tracker is None:
+                return False
+            try:
+                tracker = get_cuda_rng_tracker()
+                return name in tracker.states_
+            except Exception:
+                return False
+
+        expert_ctx = (lambda: get_cuda_rng_tracker().fork(expert_rng_name)) if _has_rng_state(expert_rng_name) else nullcontext
+
+        with expert_ctx():
+            tmp_w1 = torch.empty(num_local * ffn, self.hidden_size,
+                dtype=self.moe_w1.dtype, device=self.moe_w1.device)
+            nn.init.normal_(tmp_w1, mean=0.0, std=self.init_std)
+            self.moe_w1.data.copy_(tmp_w1.view(num_local, ffn, self.hidden_size).transpose(1, 2))
+        with expert_ctx():
+            tmp_w2 = torch.empty(self.hidden_size, num_local * ffn,
+                dtype=self.moe_w2.dtype, device=self.moe_w2.device)
+            nn.init.normal_(tmp_w2, mean=0.0, std=self.output_init_std)
+            self.moe_w2.data.copy_(tmp_w2.view(self.hidden_size, num_local, ffn).permute(1, 2, 0))
 
     def _build_moe_chunk_config(self, x: torch.Tensor):
         """Build static MoE chunk config for the current input shape."""
@@ -947,11 +1045,13 @@ class TransformerModel(nn.Module):
         attn_qkv_chunks: int = 1,
         activation_func: Optional[Callable] = None,
         capacity_factor: float = 1.0,
+        init_std: float = 0.02,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
         self._chunk_check_signature = None
+        output_init_std = init_std / math.sqrt(2.0 * max(num_layers, 1))
 
         self.layers = nn.ModuleList([
             TransformerLayer(
@@ -970,6 +1070,8 @@ class TransformerModel(nn.Module):
                 attn_qkv_chunks=attn_qkv_chunks,
                 activation_func=activation_func,
                 capacity_factor=capacity_factor,
+                init_std=init_std,
+                output_init_std=output_init_std,
                 dtype=dtype,
                 device=device,
             )
@@ -1055,7 +1157,9 @@ class TransformerModel(nn.Module):
                 layer.ln1_weight, layer.ln1_bias,
             ])
         sched.setup_ar_buffer(shared_params)
-        if sched.expert_dp_world_size > 1:
+        # Always register expert params in buffer (even when expert_dp=1)
+        # so that finish_batch can apply uniform 1/dp_cp_size scaling.
+        if expert_params:
             sched.setup_expert_ar_buffer(expert_params)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -10,8 +10,13 @@ TESTS_DIR = os.path.join(ROOT_DIR, "tests")
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, TESTS_DIR)
+megatron_path = os.environ.get('MEGATRON_PATH', '/home/zju/wzy/Megatron-LM')
+if megatron_path not in sys.path:
+    sys.path.insert(0, megatron_path)
 
 import torch
+import torch._dynamo
+torch._dynamo.config.disable = True  # fair comparison: all frameworks run in eager mode
 import torch.distributed as dist
 
 from experiment_configs import get_block_benchmark_defaults
@@ -28,7 +33,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
     parser.add_argument("--model", type=str, default="mixtral_8x7b", help="模型名称 (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe",
-                        choices=["megatron", "megatron-overlap", "megatron-overlap-dw", "fluidmoe", "native", "deepspeed"],
+                        choices=["megatron", "megatron-overlap", "megatron-overlap-dw", "fluidmoe", "deepspeed"],
                         help="选择运行的实现")
     parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
@@ -48,72 +53,77 @@ def p0(rank, *args):
         print(*args, flush=True)
 
 
-_ar_bufs = {}  # cache: model_id -> (shared_flat, expert_flat, shared_params, expert_params)
+_ar_bufs = {}  # cache: model_id -> result dict
 
 
 def _build_ar_buffers(model):
-    """Build flat buffers for bucketized AllReduce (once per model)."""
+    """按 dtype 分组构建 flat buffer，所有参数的 grad 都指向 buffer 视图，零额外分配。"""
     mid = id(model)
     if mid in _ar_bufs:
         return _ar_bufs[mid]
 
-    shared_params, expert_params = [], []
+    device = next(model.parameters()).device
+
+    # 按 is_expert 分组，buffer 统一用 fp32（matching Megatron's
+    # accumulate_allreduce_grads_in_fp32 convention）
+    groups = {}  # is_expert -> [params]
     for name, p in model.named_parameters():
         is_expert = "moe_w1" in name or "moe_w2" in name or ".experts." in name
+        groups.setdefault(is_expert, []).append(p)
+
+    # 为每组构建 fp32 flat buffer
+    flat_bufs = {}  # (is_expert, dtype) -> (flat_tensor, [params])
+    for is_expert, params in groups.items():
+        numel = sum(p.numel() for p in params)
+        flat = torch.zeros(numel, dtype=torch.float32, device=device)
+        flat_bufs[(is_expert, torch.float32)] = (flat, params)
+
+    _ar_bufs[mid] = flat_bufs
+    return flat_bufs
+
+
+def zero_grad(model):
+    """Clear all param.grad."""
+    for p in model.parameters():
+        p.grad = None
+
+
+def copy_grads_to_flat_and_allreduce(model, dp_size, all_group, dp_group):
+    """Copy bf16 grads into fp32 flat buffer, pre-scale by 1/dp_cp_size, then allreduce.
+
+    Matches Megatron DDP convention: accumulate_allreduce_grads_in_fp32 + pre-scale + SUM.
+    """
+    flat_bufs = _build_ar_buffers(model)
+    dp_cp_size = dist.get_world_size(all_group)
+    pre_scale = 1.0 / dp_cp_size if dp_cp_size > 1 else 1.0
+
+    for (is_expert, _dt), (flat, params) in flat_bufs.items():
+        # Copy bf16 grads → fp32 flat buffer
+        offset = 0
+        for p in params:
+            n = p.numel()
+            if p.grad is not None:
+                flat[offset:offset + n].copy_(p.grad.view(-1))
+            else:
+                flat[offset:offset + n].zero_()
+            offset += n
+
+        # Pre-scale (Megatron convention)
+        if pre_scale != 1.0:
+            flat.mul_(pre_scale)
+
+        # Allreduce
         if is_expert:
-            expert_params.append(p)
+            if dp_size > 1:
+                dist.all_reduce(flat, group=dp_group)
         else:
-            shared_params.append(p)
+            dist.all_reduce(flat, group=all_group)
 
-    shared_numel = sum(p.numel() for p in shared_params)
-    expert_numel = sum(p.numel() for p in expert_params)
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-
-    shared_flat = torch.zeros(shared_numel, dtype=dtype, device=device) if shared_numel > 0 else None
-    expert_flat = torch.zeros(expert_numel, dtype=dtype, device=device) if expert_numel > 0 else None
-
-    _ar_bufs[mid] = (shared_flat, expert_flat, shared_params, expert_params)
-    return _ar_bufs[mid]
-
-
-def allreduce_grads(model, dp_size, all_group, dp_group):
-    shared_flat, expert_flat, shared_params, expert_params = _build_ar_buffers(model)
-
-    # Bucketized shared AllReduce (all GPUs: cp + dp)
-    if shared_flat is not None:
+        # Write back fp32 grads as param.grad (bf16 for optimizer compatibility)
         offset = 0
-        for p in shared_params:
+        for p in params:
             n = p.numel()
-            if p.grad is not None:
-                shared_flat[offset:offset + n].copy_(p.grad.view(-1))
-            else:
-                shared_flat[offset:offset + n].zero_()
-            offset += n
-        dist.all_reduce(shared_flat, group=all_group)
-        offset = 0
-        for p in shared_params:
-            n = p.numel()
-            if p.grad is not None:
-                p.grad.view(-1).copy_(shared_flat[offset:offset + n])
-            offset += n
-
-    # Bucketized expert AllReduce (dp replicas only)
-    if dp_size > 1 and expert_flat is not None:
-        offset = 0
-        for p in expert_params:
-            n = p.numel()
-            if p.grad is not None:
-                expert_flat[offset:offset + n].copy_(p.grad.view(-1))
-            else:
-                expert_flat[offset:offset + n].zero_()
-            offset += n
-        dist.all_reduce(expert_flat, group=dp_group)
-        offset = 0
-        for p in expert_params:
-            n = p.numel()
-            if p.grad is not None:
-                p.grad.view(-1).copy_(expert_flat[offset:offset + n])
+            p.grad = flat[offset:offset + n].view(p.shape).to(p.dtype)
             offset += n
 
 
@@ -221,7 +231,7 @@ def main():
     ev_s = torch.cuda.Event(enable_timing=True)
     ev_e = torch.cuda.Event(enable_timing=True)
 
-    if args.impl in ("megatron", "megatron-overlap", "megatron-overlap-dw", "native", "deepspeed"):
+    if args.impl in ("megatron", "megatron-overlap", "megatron-overlap-dw", "deepspeed"):
         if args.impl in ("megatron", "megatron-overlap", "megatron-overlap-dw"):
             from megatron_baseline import MegatronBaselineTransformerModel
 
@@ -262,33 +272,17 @@ def main():
                 dtype=torch.bfloat16,
                 device=device,
             )
-        else:
-            from baseline import BaselineTransformerModel
-
-            model = BaselineTransformerModel(
-                num_layers=num_layers,
-                hidden_size=hidden_size,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                ffn_hidden_size=ffn_hidden,
-                num_experts=num_experts,
-                top_k=top_k,
-                cp_group=cp_group,
-                ep_group=ep_group,
-                capacity_factor=capacity_factor,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-
         impl_name = args.impl.capitalize()
         scheduler = _NullScheduler()
 
+        # 预分配 flat buffer，将 param.grad 设为其视图，避免 backward 额外分配梯度
+        _build_ar_buffers(model)
+
         def run_baseline_bwd():
             x_grad.grad = None
-            for p in model.parameters():
-                p.grad = None
+            zero_grad(model)
             model(x_grad).sum().backward()
-            allreduce_grads(model, dp_size, all_group, dp_group)
+            copy_grads_to_flat_and_allreduce(model, dp_size, all_group, dp_group)
 
         p0(rank, f"{impl_name} warmup...")
         for _ in range(args.warmup):
@@ -305,8 +299,10 @@ def main():
         torch.cuda.synchronize()
         fwd_ms = ev_s.elapsed_time(ev_e) / args.iters
         iter_ms = bench(run_baseline_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
-        p0(rank, f"{impl_name}: forward={fwd_ms:.2f}ms  iter={iter_ms:.2f}ms")
-        p0(rank, f"RESULT impl={args.impl} forward_ms={fwd_ms:.6f} iter_ms={iter_ms:.6f}")
+        tokens_per_iter = seq_len * batch_size * dp_size
+        tokps = tokens_per_iter / (iter_ms / 1000.0)
+        p0(rank, f"{impl_name}: forward={fwd_ms:.2f}ms  iter={iter_ms:.2f}ms  throughput={tokps:.0f} tok/s")
+        p0(rank, f"RESULT impl={args.impl} forward_ms={fwd_ms:.6f} iter_ms={iter_ms:.6f} tokens_per_sec={tokps:.6f}")
         dist.destroy_process_group()
         p0(rank, "Done!")
         return
@@ -355,6 +351,8 @@ def main():
         x_grad.grad = None
         for p in fluidmoe_model.parameters():
             p.grad = None
+            if hasattr(p, '_ar_buf_written'):
+                p._ar_buf_written = False
         fluidmoe_model(x_grad).sum().backward()
         scheduler.finish_batch()
         scheduler.clear_iteration()
@@ -379,8 +377,12 @@ def main():
     scheduler.ar_enabled = True
     fluidmoe_interleaved = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
 
+    tokens_per_iter = seq_len * batch_size * dp_size
+    sync_tokps = tokens_per_iter / (fluidmoe_sync / 1000.0)
+    interleaved_tokps = tokens_per_iter / (fluidmoe_interleaved / 1000.0)
     p0(rank, f"FluidMoE: forward={fluidmoe_fwd:.2f}ms  sync_iter={fluidmoe_sync:.2f}ms  interleaved_iter={fluidmoe_interleaved:.2f}ms")
-    p0(rank, f"RESULT impl=fluidmoe forward_ms={fluidmoe_fwd:.6f} sync_iter_ms={fluidmoe_sync:.6f} interleaved_iter_ms={fluidmoe_interleaved:.6f}")
+    p0(rank, f"  throughput: sync={sync_tokps:.0f} tok/s  interleaved={interleaved_tokps:.0f} tok/s")
+    p0(rank, f"RESULT impl=fluidmoe forward_ms={fluidmoe_fwd:.6f} sync_iter_ms={fluidmoe_sync:.6f} interleaved_iter_ms={fluidmoe_interleaved:.6f} sync_tokens_per_sec={sync_tokps:.6f} interleaved_tokens_per_sec={interleaved_tokps:.6f}")
 
     dist.destroy_process_group()
     p0(rank, "Done!")
