@@ -112,51 +112,50 @@ def qkv_projection_p2p_forward(
         if partner != -1:
             partners.append(partner)
 
-    # Result buffer: [seq_full, batch, groups_per_rank, group_size]
+    # Result buffer (NOT cached — saved for backward, must not be reused across iters)
     qkv_full = torch.empty(seq_full, batch, groups_per_rank, group_size,
                            dtype=dtype, device=device)
 
-    # Per-partner weight slices: weight_qkv is [num_kv_heads * group_size, hidden]
-    # Partner p owns head groups [p*groups_per_rank : (p+1)*groups_per_rank]
-    # corresponding to weight rows [p*proj_per_rank : (p+1)*proj_per_rank]
-    weight_per_partner = {}
-    for partner in partners:
+    # Pre-compute per-partner weight slices and recv buffer views
+    weight_slices = []
+    recv_views = []
+    global_partners = []
+    events = []
+    for i, partner in enumerate(partners):
         w_start = partner * proj_per_rank
-        weight_per_partner[partner] = weight_qkv[w_start:w_start + proj_per_rank, :]
+        weight_slices.append(weight_qkv[w_start:w_start + proj_per_rank, :])
+        partner_seq_start = partner * seq_local
+        recv_views.append(qkv_full[partner_seq_start:partner_seq_start + seq_local])
+        global_partners.append(global_ranks[partner])
+        events.append(overlap_ctx.get_round_event("attn_qkv", i))
 
-    send_bufs = []  # keep references alive until P2P completes
-    all_reqs = []  # Keep Work objects alive until the completion event is consumed.
+    send_bufs = []
+    all_reqs = []
     last_p2p_event = None
+    n_partners = len(partners)
 
-    for round_idx, partner in enumerate(partners):
-        # Compute QKV for this partner's head groups
-        # tokens: [seq_local, batch, hidden] @ weight_slice.t() -> [seq_local, batch, proj_per_rank]
-        send_buf = torch.matmul(tokens, weight_per_partner[partner].t())
+    for i in range(n_partners):
+        send_buf = torch.matmul(tokens, weight_slices[i].t())
         send_buf = send_buf.view(seq_local, batch, groups_per_rank, group_size).contiguous()
         send_bufs.append(send_buf)
 
-        # Start P2P: send my QKV for partner's heads, receive partner's QKV for my heads
-        partner_seq_start = partner * seq_local
-        recv_buffer = qkv_full[partner_seq_start:partner_seq_start + seq_local]
-
+        # Record on default_stream BEFORE switching to comm_stream
+        ready_evt = default_stream.record_event()
+        recv_buffer = recv_views[i]
         with torch.cuda.stream(comm_stream):
-            comm_stream.wait_stream(default_stream)
-            global_partner = global_ranks[partner]
+            comm_stream.wait_event(ready_evt)
             recv_buffer.record_stream(comm_stream)
             send_buf.record_stream(comm_stream)
             p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffer, global_partner, group=cp_group),
-                dist.P2POp(dist.isend, send_buf, global_partner, group=cp_group),
+                dist.P2POp(dist.irecv, recv_buffer, global_partners[i], group=cp_group),
+                dist.P2POp(dist.isend, send_buf, global_partners[i], group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
             all_reqs.extend(reqs)
             if reqs:
-                # NCCL serializes the batched P2P ops on the communicator, so
-                # the final work item is enough to fence the batch on this
-                # user-facing stream.
                 reqs[-1].wait()
-            last_p2p_event = overlap_ctx.get_round_event("attn_qkv", round_idx)
-            last_p2p_event.record(comm_stream)
+            events[i].record(comm_stream)
+            last_p2p_event = events[i]
 
     # While last P2P is running, compute local QKV (overlaps with comm)
     local_w_start = my_rank * proj_per_rank
@@ -294,81 +293,72 @@ def output_projection_p2p_forward(
         if partner != -1:
             partners.append(partner)
 
-    # Prepare send data and receive buffers
-    send_data_dict = {}
-    recv_buffers = {}
-    recv_buffers_flat = {}
+    # Pre-compute all per-partner data (avoid dict lookups and allocs in loop)
+    send_data_list = []
+    recv_bufs = []
+    recv_bufs_flat = []
+    weight_slices = []
+    global_partners = []
+    p2p_events = []
+    partner_dim_starts = []
 
-    for partner in partners:
-        partner_seq_start = partner * seq_local
-        send_data_dict[partner] = attn_output[partner_seq_start:partner_seq_start + seq_local]
-
-        recv_buf = torch.empty(
-            seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device
-        )
-        recv_buffers[partner] = recv_buf
-        recv_buffers_flat[partner] = recv_buf.view(seq_local, batch_size, -1)
-
-    # --- Per-partner matmul with P2P overlap (event-based, no CPU blocking) ---
     weight_local_start = my_rank * input_dim_per_rank
     weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
-    weight_per_partner = {}
-    for partner in partners:
+
+    for i, partner in enumerate(partners):
+        partner_seq_start = partner * seq_local
+        send_data_list.append(attn_output[partner_seq_start:partner_seq_start + seq_local])
+        # NOT cached — recv data feeds into output projection and is saved for backward
+        recv_buf = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
+        recv_bufs.append(recv_buf)
+        recv_bufs_flat.append(recv_buf.view(seq_local, batch_size, -1))
         partner_weight_start = partner * input_dim_per_rank
-        weight_per_partner[partner] = weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank]
+        weight_slices.append(weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank])
+        global_partners.append(global_ranks[partner])
+        p2p_events.append(overlap_ctx.get_round_event("attn_output", i))
+        partner_dim_starts.append(partner * input_dim_per_rank)
 
     attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
     attn_local_flat = attn_local_seq.reshape(seq_local, batch_size, -1)
 
-    # Pre-allocate attn_input_full, copy into it during compute to avoid torch.cat at end
     total_head_dim = cp_size * input_dim_per_rank
-    attn_input_full = torch.empty(seq_local, batch_size, total_head_dim,
-                                  dtype=dtype, device=device)
+    # NOT cached — saved for backward
+    attn_input_full = torch.empty(seq_local, batch_size, total_head_dim, dtype=dtype, device=device)
     local_dim_start = my_rank * input_dim_per_rank
     attn_input_full[:, :, local_dim_start:local_dim_start + input_dim_per_rank] = attn_local_flat
 
-    prev_partner = None
-    all_reqs = []  # Keep Work objects alive until default_stream consumes the events.
-    p2p_events = []
+    all_reqs = []
     output = None
+    n_partners = len(partners)
 
-    for round_idx, partner in enumerate(partners):
+    for i in range(n_partners):
         with torch.cuda.stream(comm_stream):
-            if round_idx == 0:
+            if i == 0:
                 comm_stream.wait_stream(default_stream)
-            global_partner = global_ranks[partner]
-            recv_buffers[partner].record_stream(comm_stream)
-            send_data_dict[partner].record_stream(comm_stream)
+            recv_bufs[i].record_stream(comm_stream)
+            send_data_list[i].record_stream(comm_stream)
             p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffers[partner], global_partner, group=cp_group),
-                dist.P2POp(dist.isend, send_data_dict[partner], global_partner, group=cp_group),
+                dist.P2POp(dist.irecv, recv_bufs[i], global_partners[i], group=cp_group),
+                dist.P2POp(dist.isend, send_data_list[i], global_partners[i], group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
             all_reqs.extend(reqs)
             if reqs:
                 reqs[-1].wait()
-            evt = overlap_ctx.get_round_event("attn_output", round_idx)
-            evt.record(comm_stream)
-            p2p_events.append(evt)
+            p2p_events[i].record(comm_stream)
 
-        if round_idx == 0:
+        if i == 0:
             output = torch.matmul(attn_local_flat, weight_local.t())
         else:
-            # GPU-level wait for previous P2P (no CPU blocking)
-            default_stream.wait_event(p2p_events[round_idx - 1])
-            # Copy received data into pre-allocated buffer (overlaps with current P2P)
-            prev_dim_start = prev_partner * input_dim_per_rank
-            attn_input_full[:, :, prev_dim_start:prev_dim_start + input_dim_per_rank] = recv_buffers_flat[prev_partner]
-            output = output + torch.matmul(recv_buffers_flat[prev_partner], weight_per_partner[prev_partner].t())
+            default_stream.wait_event(p2p_events[i - 1])
+            attn_input_full[:, :, partner_dim_starts[i-1]:partner_dim_starts[i-1] + input_dim_per_rank] = recv_bufs_flat[i-1]
+            output = output + torch.matmul(recv_bufs_flat[i-1], weight_slices[i-1].t())
 
-        prev_partner = partner
-
-    if len(partners) > 0:
-        default_stream.wait_event(p2p_events[-1])
-        # Copy last partner's data into pre-allocated buffer
-        prev_dim_start = prev_partner * input_dim_per_rank
-        attn_input_full[:, :, prev_dim_start:prev_dim_start + input_dim_per_rank] = recv_buffers_flat[prev_partner]
-        output = output + torch.matmul(recv_buffers_flat[prev_partner], weight_per_partner[prev_partner].t())
+    if n_partners > 0:
+        last = n_partners - 1
+        default_stream.wait_event(p2p_events[last])
+        attn_input_full[:, :, partner_dim_starts[last]:partner_dim_starts[last] + input_dim_per_rank] = recv_bufs_flat[last]
+        output = output + torch.matmul(recv_bufs_flat[last], weight_slices[last].t())
 
     if all_reqs:
         all_reqs[-1].wait()

@@ -62,13 +62,23 @@ except ImportError:
     _te_permute_with_mask_map = None
     _HAS_TE_PERMUTE = False
 
-import os as _os
-
 _FUSED_ACT_PROBS_CACHE = {}
 
 _LAYOUT_IDX_CACHE = {}
 _PADDED_ROW_IDX_CACHE = {}
 _GROUP_RANKS_CACHE = {}
+_P2P_BUFFER_CACHE = {}
+
+
+def _get_p2p_buffer(tag: str, rows: int, cols: int, dtype: torch.dtype, device: torch.device):
+    """Grow-only persistent P2P buffer. Reuses memory across iterations,
+    avoids torch.empty allocation and NCCL re-registration overhead."""
+    key = (tag, cols, str(dtype), device.type, device.index if device.index is not None else -1)
+    buf = _P2P_BUFFER_CACHE.get(key)
+    if buf is None or buf.shape[0] < rows:
+        buf = torch.empty(max(rows, 1), cols, dtype=dtype, device=device)
+        _P2P_BUFFER_CACHE[key] = buf
+    return buf[:rows]
 
 
 def _get_group_ranks(group: dist.ProcessGroup):
@@ -667,46 +677,52 @@ def dispatch_fc1_p2p_forward(
         probs_dtype = None
 
     # Prepare send data
-    send_chunks = {}
-    recv_buffers_with_metadata = {}
-    recv_buffers = {}
+    # Build per-partner send/recv data as lists (avoid dict lookups in loop)
+    # Payload fusion: tokens + probs packed into one tensor [N, H+1] to halve NCCL ops
+    has_probs = permuted_probs is not None
+    send_chunk_list = []       # None if no data to send
+    recv_meta_list = []        # None if no data to recv (1D flat buffer)
+    recv_buffers = {}          # populated after metadata extraction
+    recv_probs_list = []       # extracted from flat recv buffer
+
     if use_metadata:
-        # Metadata piggybacking: encode per-expert token counts as extra row
         int32_as_elements = 4 // element_size
         metadata_elements = num_local_experts * int32_as_elements
-        for partner in partners:
-            if input_splits[partner] > 0:
-                token_chunk = tokens[input_offsets[partner]:input_offsets[partner+1]]
+        # metadata occupies 1 row worth of elements in the flat buffer
+        meta_flat_elems = hidden_size
+
+    for partner in partners:
+        n_send = input_splits[partner]
+        recv_size = output_splits[partner]
+
+        # Send buffer: 1D flat [meta_elems? + N*H + N?] — tokens then probs
+        if n_send > 0:
+            token_chunk = tokens[input_offsets[partner]:input_offsets[partner+1]]
+            parts = []
+            if use_metadata:
                 partner_metadata = tokens_per_expert[partner * num_local_experts : (partner + 1) * num_local_experts]
                 metadata_int32 = partner_metadata.to(torch.int32).to(device)
-                metadata_row = torch.zeros(1, hidden_size, dtype=dtype, device=device)
+                metadata_row = torch.zeros(meta_flat_elems, dtype=dtype, device=device)
                 metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
-                metadata_row[0, :metadata_elements] = metadata_as_dtype
-                send_chunks[partner] = torch.cat([metadata_row, token_chunk], dim=0)
-        for partner in partners:
-            recv_size = output_splits[partner]
-            if recv_size > 0:
-                recv_buffers_with_metadata[partner] = torch.empty(recv_size + 1, hidden_size, dtype=dtype, device=device)
-    else:
-        # No metadata needed — send raw token slices (no cat, no extra row)
-        for partner in partners:
-            if input_splits[partner] > 0:
-                send_chunks[partner] = tokens[input_offsets[partner]:input_offsets[partner+1]]
-        for partner in partners:
-            recv_size = output_splits[partner]
-            if recv_size > 0:
-                recv_buffers_with_metadata[partner] = torch.empty(recv_size, hidden_size, dtype=dtype, device=device)
+                metadata_row[:metadata_elements] = metadata_as_dtype
+                parts.append(metadata_row)
+            parts.append(token_chunk.reshape(-1))
+            if has_probs:
+                probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
+                parts.append(probs_chunk.to(dtype))
+            send_chunk_list.append(torch.cat(parts))
+        else:
+            send_chunk_list.append(None)
 
-    # Prepare probs send/recv buffers (Megatron-aligned: probs via P2P)
-    send_probs_chunks = {}
-    recv_probs_buffers = {}
-    if permuted_probs is not None:
-        for partner in partners:
-            if input_splits[partner] > 0:
-                send_probs_chunks[partner] = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
-            if output_splits[partner] > 0:
-                recv_probs_buffers[partner] = torch.empty(
-                    output_splits[partner], dtype=probs_dtype, device=device)
+        # Recv buffer: 1D flat, persistent
+        if recv_size > 0:
+            meta_elems = meta_flat_elems if use_metadata else 0
+            total_elems = meta_elems + recv_size * hidden_size + (recv_size if has_probs else 0)
+            recv_meta_list.append(_get_p2p_buffer(
+                f"dispatch_recv_{partner}", total_elems, 1, dtype, device).squeeze(-1))
+        else:
+            recv_meta_list.append(None)
+        recv_probs_list.append(None)
 
     # Compute each partner's offset in buffer
     recv_offsets = {}
@@ -722,55 +738,52 @@ def dispatch_fc1_p2p_forward(
     # data to default_stream, while still overlapping P2P_i with FC1 for
     # round i-1. The event must be recorded only after NCCL completion.
     # =========================================================================
-    prev_partner = None
-    all_reqs = []  # Keep Work objects alive until round-completion events are consumed.
+    prev_idx = -1
+    all_reqs = []
+    # Pre-compute per-round data to avoid dict/function-call overhead in loop
+    _global_partners = [global_ranks[p] for p in partners]
+    _dispatch_events = [overlap_ctx.get_round_event("moe_dispatch", i) for i in range(len(partners))]
     p2p_events = []
     recv_act_results = {}
     local_act = None
 
-    def extract_metadata_and_tokens(partner):
-        """Extract metadata from received buffer and update tokens_cpu."""
-        if partner in recv_buffers_with_metadata:
-            full_buffer = recv_buffers_with_metadata[partner]
+    def extract_metadata_and_tokens(idx):
+        """Extract metadata + split flat buffer into tokens and probs (zero-copy views)."""
+        partner = partners[idx]
+        flat = recv_meta_list[idx]
+        if flat is not None:
+            off = 0
             if use_metadata:
-                # Decode metadata from first row (GPU -> CPU sync)
-                metadata_as_dtype = full_buffer[0, :metadata_elements]
+                metadata_as_dtype = flat[:metadata_elements]
                 metadata_int32 = metadata_as_dtype.view(torch.int8).view(torch.int32)
                 tokens_cpu[partner] = metadata_int32[:num_local_experts].cpu().to(torch.int64)
-                recv_buffers[partner] = full_buffer[1:]
-            else:
-                # No metadata row — recv buffer IS the token data (no sync)
-                recv_buffers[partner] = full_buffer
+                off = meta_flat_elems
+            n = output_splits[partner]
+            # tokens: view as [N, H] — contiguous because flat buffer is contiguous
+            recv_buffers[partner] = flat[off:off + n * hidden_size].view(n, hidden_size)
+            if has_probs:
+                probs_off = off + n * hidden_size
+                recv_probs_list[idx] = flat[probs_off:probs_off + n].to(probs_dtype)
 
     for round_idx, partner in enumerate(partners):
-        # 1. Start current round P2P (async, returns immediately)
         nvtx_range_push(f"dispatch_p2p_R{round_idx}")
         with torch.cuda.stream(comm_stream):
             if round_idx == 0:
-                comm_stream.wait_stream(default_stream)  # Wait for send_chunks preparation
+                comm_stream.wait_stream(default_stream)
+            # Fused payload: tokens+probs in one tensor → 2 NCCL ops instead of 4
             p2p_ops = []
-            global_partner = global_ranks[partner]
-            if partner in recv_buffers_with_metadata:
-                recv_buffers_with_metadata[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_buffers_with_metadata[partner], global_partner, group=ep_group))
-            if partner in send_chunks:
-                send_chunks[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.isend, send_chunks[partner], global_partner, group=ep_group))
-            # Probs P2P (Megatron-aligned: probs sent alongside tokens)
-            if partner in recv_probs_buffers:
-                recv_probs_buffers[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_probs_buffers[partner], global_partner, group=ep_group))
-            if partner in send_probs_chunks:
-                send_probs_chunks[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.isend, send_probs_chunks[partner], global_partner, group=ep_group))
+            gp = _global_partners[round_idx]
+            if recv_meta_list[round_idx] is not None:
+                recv_meta_list[round_idx].record_stream(comm_stream)
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_meta_list[round_idx], gp, group=ep_group))
+            if send_chunk_list[round_idx] is not None:
+                send_chunk_list[round_idx].record_stream(comm_stream)
+                p2p_ops.append(dist.P2POp(dist.isend, send_chunk_list[round_idx], gp, group=ep_group))
             curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
             all_reqs.extend(curr_reqs)
             if curr_reqs:
-                # NCCL serializes P2P ops on the same communicator, so waiting
-                # on the last work item is sufficient to make the whole batch
-                # visible on this user-facing stream.
                 curr_reqs[-1].wait()
-            evt = overlap_ctx.get_round_event("moe_dispatch", round_idx)
+            evt = _dispatch_events[round_idx]
             evt.record(comm_stream)
             p2p_events.append(evt)
         nvtx_range_pop()
@@ -778,41 +791,39 @@ def dispatch_fc1_p2p_forward(
         # 2. Compute FC1 + Act (overlaps with current round's P2P, no CPU blocking)
         nvtx_range_push(f"fc1_compute_R{round_idx}")
         if round_idx == 0:
-            # First round: compute local FC1 + Act (parallel with P2P_0)
             if local_count > 0:
                 local_act = grouped_fc1_act(
                     local_tokens, weight1, local_tokens_per_expert_cpu,
                     activation_func, probs=local_probs)
-        elif prev_partner is not None:
-            # GPU-level wait for previous P2P (no CPU blocking)
+        elif prev_idx >= 0:
             default_stream.wait_event(p2p_events[round_idx - 1])
-            # Extract metadata from previous round's received data
-            extract_metadata_and_tokens(prev_partner)
-            if prev_partner in recv_buffers:
-                # Compute previous round's received data (now guaranteed complete)
-                recv_data = recv_buffers[prev_partner]
-                partner_probs = recv_probs_buffers.get(prev_partner)
+            extract_metadata_and_tokens(prev_idx)
+            prev_p = partners[prev_idx]
+            if prev_p in recv_buffers:
+                recv_data = recv_buffers[prev_p]
+                partner_probs = recv_probs_list[prev_idx]
                 recv_act = grouped_fc1_act(
-                    recv_data, weight1, tokens_cpu[prev_partner],
+                    recv_data, weight1, tokens_cpu[prev_p],
                     activation_func, probs=partner_probs)
-                recv_act_results[prev_partner] = recv_act
+                recv_act_results[prev_p] = recv_act
         nvtx_range_pop()
 
-        prev_partner = partner
+        prev_idx = round_idx
 
     # Process last round
     if len(partners) > 0:
         nvtx_range_push("fc1_compute_last")
         default_stream.wait_event(p2p_events[-1])
-        if prev_partner is not None:
-            extract_metadata_and_tokens(prev_partner)
-            if prev_partner in recv_buffers:
-                recv_data = recv_buffers[prev_partner]
-                partner_probs = recv_probs_buffers.get(prev_partner)
-                recv_act = grouped_fc1_act(
-                    recv_data, weight1, tokens_cpu[prev_partner],
-                    activation_func, probs=partner_probs)
-                recv_act_results[prev_partner] = recv_act
+        last_idx = len(partners) - 1
+        extract_metadata_and_tokens(last_idx)
+        last_p = partners[last_idx]
+        if last_p in recv_buffers:
+            recv_data = recv_buffers[last_p]
+            partner_probs = recv_probs_list[last_idx]
+            recv_act = grouped_fc1_act(
+                recv_data, weight1, tokens_cpu[last_p],
+                activation_func, probs=partner_probs)
+            recv_act_results[last_p] = recv_act
         nvtx_range_pop()
 
     # Make default_stream itself observe NCCL completion before returning.
@@ -826,7 +837,8 @@ def dispatch_fc1_p2p_forward(
     return (
         local_tokens, local_act, recv_act_results, recv_buffers,
         partners, recv_offsets, tokens_cpu,
-        local_probs, recv_probs_buffers if permuted_probs is not None else None,
+        local_probs,
+        {partners[i]: recv_probs_list[i] for i in range(len(partners)) if recv_probs_list[i] is not None} if permuted_probs is not None else None,
     )
 
 
@@ -893,7 +905,7 @@ def fc2_combine_p2p_forward(
     # Combine Phase Pipeline
     # =========================================================================
     total_output = sum(input_splits)
-    combined_output = torch.empty(total_output, hidden_size, dtype=dtype, device=device)
+    combined_output = _get_p2p_buffer("combine_output", total_output, hidden_size, dtype, device)
 
     peer_fc2_results = {}
     local_fc2 = None
@@ -914,22 +926,30 @@ def fc2_combine_p2p_forward(
             nvtx_range_pop()
 
     # Pipeline loop
-    all_combine_reqs = []  # Keep Work objects alive until combine results are consumed.
+    # Pre-compute per-round data
+    _combine_global_partners = [global_ranks[p] for p in partners]
+    _combine_recv_slices = []
+    for i, partner in enumerate(partners):
+        if input_splits[partner] > 0:
+            _combine_recv_slices.append(combined_output[input_offsets[partner]:input_offsets[partner+1]])
+        else:
+            _combine_recv_slices.append(None)
+
+    all_combine_reqs = []
     for round_idx, partner in enumerate(partners):
-        # Start P2P (send FC2 result to partner, receive from partner)
         nvtx_range_push(f"combine_p2p_R{round_idx}")
         with torch.cuda.stream(comm_stream):
             if has_pending_fc2:
                 comm_stream.wait_event(fc2_event)
             p2p_ops = []
-            global_partner = global_ranks[partner]
-            if input_splits[partner] > 0:
-                recv_slice = combined_output[input_offsets[partner]:input_offsets[partner+1]]
+            gp = _combine_global_partners[round_idx]
+            recv_slice = _combine_recv_slices[round_idx]
+            if recv_slice is not None:
                 recv_slice.record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_slice, global_partner, group=ep_group))
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_slice, gp, group=ep_group))
             if partner in peer_fc2_results:
                 peer_fc2_results[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], global_partner, group=ep_group))
+                p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], gp, group=ep_group))
             if p2p_ops:
                 curr_reqs = dist.batch_isend_irecv(p2p_ops)
                 all_combine_reqs.extend(curr_reqs)

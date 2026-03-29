@@ -48,25 +48,25 @@ def bench_p2p_roundrobin(chunk_numel: int, ep_group, device, warmup=10, iters=50
     ep_size = ep_group.size()
     global_ranks = dist.get_process_group_ranks(ep_group)
 
-    send_bufs = {}
-    recv_bufs = {}
+    # Pre-allocate persistent buffers and pre-compute per-round data (list, not dict)
+    rounds = []
+    send_buf_list = []
+    recv_buf_list = []
     for r in range(1, ep_size):
-        peer = (my_rank + r) % ep_size
-        send_bufs[peer] = torch.randn(chunk_numel, dtype=torch.bfloat16, device=device)
-        recv_bufs[peer] = torch.empty(chunk_numel, dtype=torch.bfloat16, device=device)
+        send_to = (my_rank + r) % ep_size
+        recv_from = (my_rank - r + ep_size) % ep_size
+        send_buf_list.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
+        recv_buf_list.append(torch.empty(chunk_numel, dtype=torch.bfloat16, device=device))
+        rounds.append((global_ranks[recv_from], global_ranks[send_to]))
+    n_rounds = len(rounds)
 
     def run_once():
-        # Round r: rank i sends to (i+r)%N, recvs from (i-r)%N
-        # This guarantees matching pairs: i sends to j, j recvs from i
-        # NCCL serializes ops on the same communicator, so we only need
-        # to wait on the last batch to avoid CPU-blocking pipeline bubbles.
         last_reqs = None
-        for r in range(1, ep_size):
-            send_to = (my_rank + r) % ep_size
-            recv_from = (my_rank - r + ep_size) % ep_size
+        for i in range(n_rounds):
+            gr_recv, gr_send = rounds[i]
             ops = [
-                dist.P2POp(dist.irecv, recv_bufs[recv_from], global_ranks[recv_from], group=ep_group),
-                dist.P2POp(dist.isend, send_bufs[send_to], global_ranks[send_to], group=ep_group),
+                dist.P2POp(dist.irecv, recv_buf_list[i], gr_recv, group=ep_group),
+                dist.P2POp(dist.isend, send_buf_list[i], gr_send, group=ep_group),
             ]
             last_reqs = dist.batch_isend_irecv(ops)
         for req in last_reqs:
@@ -92,21 +92,24 @@ def bench_p2p_all_concurrent(chunk_numel: int, ep_group, device, warmup=10, iter
     ep_size = ep_group.size()
     global_ranks = dist.get_process_group_ranks(ep_group)
 
-    send_bufs = {}
-    recv_bufs = {}
-    partners = []
+    # Pre-allocate persistent buffers and pre-compute partner data (list, not dict)
+    partner_list = []
+    send_buf_list = []
+    recv_buf_list = []
+    global_partner_list = []
     for r in range(1, ep_size):
         partner = (my_rank + r) % ep_size
-        partners.append(partner)
-        send_bufs[partner] = torch.randn(chunk_numel, dtype=torch.bfloat16, device=device)
-        recv_bufs[partner] = torch.empty(chunk_numel, dtype=torch.bfloat16, device=device)
+        partner_list.append(partner)
+        send_buf_list.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
+        recv_buf_list.append(torch.empty(chunk_numel, dtype=torch.bfloat16, device=device))
+        global_partner_list.append(global_ranks[partner])
+    n_partners = len(partner_list)
 
     def run_once():
         ops = []
-        for partner in partners:
-            global_partner = global_ranks[partner]
-            ops.append(dist.P2POp(dist.irecv, recv_bufs[partner], global_partner, group=ep_group))
-            ops.append(dist.P2POp(dist.isend, send_bufs[partner], global_partner, group=ep_group))
+        for i in range(n_partners):
+            ops.append(dist.P2POp(dist.irecv, recv_buf_list[i], global_partner_list[i], group=ep_group))
+            ops.append(dist.P2POp(dist.isend, send_buf_list[i], global_partner_list[i], group=ep_group))
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()

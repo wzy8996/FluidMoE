@@ -228,7 +228,6 @@ class BackwardScheduler:
         # dW queue
         self._dw_queue = deque()
         self._ar_params_for_sync = []
-        self._unbuffered_expert_params = []
 
         # AllToAll tracking
         self._alltoall_task_id = 0
@@ -389,9 +388,6 @@ class BackwardScheduler:
                         self._pending_ar_tensors.append(task.weight_param.grad)
                     elif self.shared_dp_world_size > 1:
                         self._ar_params_for_sync.append(task.weight_param)
-                else:
-                    # Expert params (no AR needed) — track for 1/dp_cp_size scaling
-                    self._unbuffered_expert_params.append(task.weight_param)
         self.completed_dw += 1
 
     def _commit_and_submit_ar(self):
@@ -736,7 +732,6 @@ class BackwardScheduler:
         self._alltoall_results.clear()
         self._pending_ar_tensors.clear()
         self._ar_params_for_sync.clear()
-        self._unbuffered_expert_params.clear()
         self._last_ar_cuda_event = None
         self._alltoall_task_id = 0
         self._ar_task_count = 0

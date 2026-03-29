@@ -78,9 +78,6 @@ def outproj_sp2hp_backward(
     if seq_local % num_chunks != 0:
         num_chunks = 1
 
-    # Debug output
-    if os.environ.get('FLUID_DEBUG_CHUNKS'):
-        print(f"[outproj_sp2hp_backward] num_chunks={num_chunks}, seq_local={seq_local}")
 
     if num_chunks == 1:
         # Non-chunked path: compute full dX then AllToAll via comm thread
@@ -455,18 +452,15 @@ def output_projection_register_dw(
     if scheduler.is_enabled():
         attn_full_flat_saved = attn_input_full.reshape(seq_local * batch_size, -1).detach()
         grad_output_flat_saved = grad_output.reshape(seq_local * batch_size, hidden_size).detach()
-        weight_proj_saved = weight_proj
 
         def compute_dw_proj():
-            # dW = grad_output.T @ attn_input_full
-            grad_weight = torch.matmul(grad_output_flat_saved.t(), attn_full_flat_saved)
-            return grad_weight
+            return torch.matmul(grad_output_flat_saved.t(), attn_full_flat_saved)
 
         scheduler.register_dw_task(
             layer_name=f"output_proj_layer{layer_id}",
             layer_id=layer_id,
             compute_fn=compute_dw_proj,
-            weight_param=weight_proj_saved,
+            weight_param=weight_proj,
         )
         return None
     else:

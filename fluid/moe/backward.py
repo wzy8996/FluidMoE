@@ -38,7 +38,6 @@ from fluid.core.te_ops import te_gelu, te_silu, te_dgelu, te_dsilu
 
 _SKIP_ALL_DW = os.environ.get('FLUID_SKIP_ALL_DW', '0') == '1'
 _SKIP_DISPATCH_DW = os.environ.get('FLUID_SKIP_DISPATCH_DW', '0') == '1'
-_DEBUG_SCHEDULER_REGISTER = os.environ.get('FLUID_DEBUG_SCHEDULER_REGISTER', '0') == '1'
 
 
 class _BackwardBufferPool:
@@ -494,9 +493,7 @@ def register_moe_dw_tasks(
     """
     scheduler = get_backward_scheduler()
 
-    # Debug output
-    if _DEBUG_SCHEDULER_REGISTER:
-        print(f"[DEBUG] register_moe_dw_tasks(L{layer_id}): scheduler.is_enabled()={scheduler.is_enabled()}", flush=True)
+
 
     # Get dimensions
     ffn_hidden = weight1.shape[-1]
