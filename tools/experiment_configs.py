@@ -7,7 +7,10 @@ from pprint import pformat
 from typing import Any, Dict
 
 
-BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'dp_size': 1,
+BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'nnodes': 1,
+ 'master_addr': 'localhost',
+ 'master_port': 29500,
+ 'dp_size': 1,
  'cp_size': 2,
  'ep_size': 2,
  'moe_combine_chunks': 8,
@@ -24,6 +27,9 @@ BLOCK_BENCHMARK_DEFAULTS: Dict[str, Any] = {'dp_size': 1,
  'expert_ar_bw': 0.0}
 
 TUNE_DEFAULTS: Dict[str, Any] = {
+    "nnodes": 1,
+    "master_addr": "localhost",
+    "master_port": 29500,
     "dp_size": 1,
     "cp_size": 2,
     "ep_size": 2,

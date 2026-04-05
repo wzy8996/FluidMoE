@@ -70,6 +70,81 @@ _GROUP_RANKS_CACHE = {}
 _P2P_BUFFER_CACHE = {}
 
 
+class EPPlan:
+    """Lightweight pre-computed static plan for padded MoE dispatch/combine.
+
+    Caches only Python values and event references — zero GPU buffer allocation.
+    The single GPU tensor (tokens_per_expert_gpu) is a few dozen bytes.
+    """
+    __slots__ = (
+        'ep_size', 'my_rank', 'num_local_experts', 'expert_capacity',
+        'S', 'input_splits_list', 'output_splits_list', 'input_offsets',
+        'pre_tokens_cpu', 'local_tokens_per_expert_cpu',
+        'local_count', 'local_start',
+        'partners', 'global_partners', 'num_rounds',
+        'dispatch_events', 'combine_events',
+        'recv_total_elems', 'recv_offsets',
+        'tokens_per_expert_gpu', 'all_tokens_per_expert',
+    )
+
+    def __init__(self, num_tokens, num_experts, top_k, capacity_factor,
+                 ep_group, overlap_ctx, device, hidden_size):
+        self.ep_size = ep_group.size()
+        self.my_rank = ep_group.rank()
+        self.num_local_experts = num_experts // self.ep_size
+
+        self.expert_capacity = int(math.ceil(
+            num_tokens * top_k / num_experts * capacity_factor))
+        self.S = self.num_local_experts * self.expert_capacity
+
+        self.input_splits_list = [self.S] * self.ep_size
+        self.output_splits_list = [self.S] * self.ep_size
+        self.input_offsets = [i * self.S for i in range(self.ep_size + 1)]
+
+        self.pre_tokens_cpu = torch.full(
+            (self.ep_size, self.num_local_experts),
+            self.expert_capacity, dtype=torch.int64)
+        self.local_tokens_per_expert_cpu = self.pre_tokens_cpu[self.my_rank]
+
+        self.local_count = self.S
+        self.local_start = self.my_rank * self.S
+
+        self.num_rounds = overlap_ctx.num_rounds
+        self.partners = []
+        for r in range(self.num_rounds):
+            p = overlap_ctx.get_partner(self.my_rank, r)
+            if p != -1:
+                self.partners.append(p)
+        global_ranks = _get_group_ranks(ep_group)
+        self.global_partners = [global_ranks[p] for p in self.partners]
+
+        self.dispatch_events = [
+            overlap_ctx.get_round_event("moe_dispatch", i)
+            for i in range(len(self.partners))]
+        self.combine_events = [
+            overlap_ctx.get_round_event("moe_combine", i)
+            for i in range(len(self.partners))]
+
+        # Pre-computed recv buffer sizes (fused payload: tokens + probs)
+        self.recv_total_elems = []
+        for p in self.partners:
+            n = self.S
+            total = n * hidden_size + n  # tokens + probs
+            self.recv_total_elems.append(total)
+
+        self.recv_offsets = {}
+        offset = 0
+        for i in range(self.ep_size):
+            if i != self.my_rank:
+                self.recv_offsets[i] = offset
+                offset += self.S
+
+        # Only GPU tensor: tiny (num_experts int64 ≈ few dozen bytes)
+        self.tokens_per_expert_gpu = torch.full(
+            (num_experts,), self.expert_capacity, dtype=torch.int64, device=device)
+        self.all_tokens_per_expert = [self.ep_size * self.expert_capacity] * self.num_local_experts
+
+
 def _get_p2p_buffer(tag: str, rows: int, cols: int, dtype: torch.dtype, device: torch.device):
     """Grow-only persistent P2P buffer. Reuses memory across iterations,
     avoids torch.empty allocation and NCCL re-registration overhead."""
@@ -268,6 +343,7 @@ def router_forward(
     top_k: int,
     ep_group: dist.ProcessGroup,
     capacity_factor: float = 1.0,
+    ep_plan: Optional['EPPlan'] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -345,8 +421,11 @@ def router_forward(
         padded_routing_map[sorted_indices, expert_ids_expand] = True
 
         num_out_tokens = num_experts * expert_capacity
-        tokens_per_expert = torch.full(
-            (num_experts,), expert_capacity, dtype=torch.int64, device=device)
+        if ep_plan is not None:
+            tokens_per_expert = ep_plan.tokens_per_expert_gpu
+        else:
+            tokens_per_expert = torch.full(
+                (num_experts,), expert_capacity, dtype=torch.int64, device=device)
 
         with torch.no_grad():
             row_id_map = _te_make_row_id_map(
@@ -582,6 +661,7 @@ def dispatch_fc1_p2p_forward(
     tokens_per_expert: torch.Tensor,
     pre_tokens_cpu: Optional[torch.Tensor] = None,
     permuted_probs: Optional[torch.Tensor] = None,
+    ep_plan: Optional['EPPlan'] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor,
            Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
@@ -634,36 +714,42 @@ def dispatch_fc1_p2p_forward(
     dtype = tokens.dtype
     hidden_size = tokens.shape[-1]
     element_size = torch.finfo(dtype).bits // 8
-    use_metadata = pre_tokens_cpu is None  # skip piggybacking when metadata is known
-
-    # Compute offsets
-    input_offsets = [0]
-    for s in input_splits:
-        input_offsets.append(input_offsets[-1] + s)
+    use_metadata = pre_tokens_cpu is None
 
     default_stream = torch.cuda.current_stream(device)
     comm_stream = overlap_ctx.get_stream()
 
-    local_count = input_splits[my_rank]
-    local_start = input_offsets[my_rank]
-
-    if use_metadata:
-        # Extract local tokens_per_expert (GPU -> CPU sync required)
-        local_tokens_per_expert = tokens_per_expert[my_rank * num_local_experts : (my_rank + 1) * num_local_experts]
-        local_tokens_per_expert_cpu = local_tokens_per_expert.to(dtype=torch.int64).cpu()
-        tokens_cpu = torch.zeros(ep_size, num_local_experts, dtype=torch.int64)
-        tokens_cpu[my_rank] = local_tokens_per_expert_cpu
+    # Use ep_plan for cached static values, or compute dynamically
+    if ep_plan is not None:
+        input_offsets = ep_plan.input_offsets
+        local_count = ep_plan.local_count
+        local_start = ep_plan.local_start
+        tokens_cpu = ep_plan.pre_tokens_cpu
+        local_tokens_per_expert_cpu = ep_plan.local_tokens_per_expert_cpu
+        partners = ep_plan.partners
+        _global_partners = ep_plan.global_partners
+        _dispatch_events = ep_plan.dispatch_events
     else:
-        # Metadata known a priori (e.g. padding) — no GPU-CPU sync needed
-        tokens_cpu = pre_tokens_cpu
-        local_tokens_per_expert_cpu = tokens_cpu[my_rank]
-
-    # Get Round-Robin scheduled partners
-    partners = []
-    for round_idx in range(overlap_ctx.num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner != -1:
-            partners.append(partner)
+        input_offsets = [0]
+        for s in input_splits:
+            input_offsets.append(input_offsets[-1] + s)
+        local_count = input_splits[my_rank]
+        local_start = input_offsets[my_rank]
+        if use_metadata:
+            local_tokens_per_expert = tokens_per_expert[my_rank * num_local_experts : (my_rank + 1) * num_local_experts]
+            local_tokens_per_expert_cpu = local_tokens_per_expert.to(dtype=torch.int64).cpu()
+            tokens_cpu = torch.zeros(ep_size, num_local_experts, dtype=torch.int64)
+            tokens_cpu[my_rank] = local_tokens_per_expert_cpu
+        else:
+            tokens_cpu = pre_tokens_cpu
+            local_tokens_per_expert_cpu = tokens_cpu[my_rank]
+        partners = []
+        for round_idx in range(overlap_ctx.num_rounds):
+            partner = overlap_ctx.get_partner(my_rank, round_idx)
+            if partner != -1:
+                partners.append(partner)
+        _global_partners = [global_ranks[p] for p in partners]
+        _dispatch_events = [overlap_ctx.get_round_event("moe_dispatch", i) for i in range(len(partners))]
 
     # Extract local tokens (no clone needed - data will be copied in merge_tokens_expert_major anyway)
     local_tokens = tokens[local_start:local_start + local_count] if local_count > 0 else torch.empty(0, hidden_size, dtype=dtype, device=device)
@@ -725,12 +811,15 @@ def dispatch_fc1_p2p_forward(
         recv_probs_list.append(None)
 
     # Compute each partner's offset in buffer
-    recv_offsets = {}
-    offset = 0
-    for i in range(ep_size):
-        if i != my_rank:
-            recv_offsets[i] = offset
-            offset += output_splits[i]
+    if ep_plan is not None:
+        recv_offsets = ep_plan.recv_offsets
+    else:
+        recv_offsets = {}
+        offset = 0
+        for i in range(ep_size):
+            if i != my_rank:
+                recv_offsets[i] = offset
+                offset += output_splits[i]
 
     # =========================================================================
     # Dispatch Phase Pipeline with event-based sync (no CPU blocking)
@@ -740,9 +829,6 @@ def dispatch_fc1_p2p_forward(
     # =========================================================================
     prev_idx = -1
     all_reqs = []
-    # Pre-compute per-round data to avoid dict/function-call overhead in loop
-    _global_partners = [global_ranks[p] for p in partners]
-    _dispatch_events = [overlap_ctx.get_round_event("moe_dispatch", i) for i in range(len(partners))]
     p2p_events = []
     recv_act_results = {}
     local_act = None
@@ -862,6 +948,7 @@ def fc2_combine_p2p_forward(
     needs_backward: bool = True,
     local_probs: Optional[torch.Tensor] = None,
     recv_probs: Optional[Dict[int, torch.Tensor]] = None,
+    ep_plan: Optional['EPPlan'] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[list], Optional[dict],
            Optional[torch.Tensor]]:
@@ -887,24 +974,28 @@ def fc2_combine_p2p_forward(
     dtype = local_tokens.dtype
     hidden_size = weight2.shape[-1]
 
-    # Compute offsets
-    input_offsets = [0]
-    for s in input_splits:
-        input_offsets.append(input_offsets[-1] + s)
+    # Use ep_plan for cached offsets, or compute dynamically
+    if ep_plan is not None:
+        input_offsets = ep_plan.input_offsets
+        local_count = ep_plan.local_count
+        local_start = ep_plan.local_start
+        local_tokens_per_expert = ep_plan.local_tokens_per_expert_cpu
+        total_output = ep_plan.S * ep_plan.ep_size
+    else:
+        input_offsets = [0]
+        for s in input_splits:
+            input_offsets.append(input_offsets[-1] + s)
+        local_count = input_splits[my_rank]
+        local_start = input_offsets[my_rank]
+        local_tokens_per_expert = tokens_cpu[my_rank] if tokens_cpu is not None else None
+        total_output = sum(input_splits)
 
     default_stream = torch.cuda.current_stream(device)
     comm_stream = overlap_ctx.get_stream()
 
-    local_count = input_splits[my_rank]
-    local_start = input_offsets[my_rank]
-
-    # local_tokens_per_expert is a 1D CPU tensor of per-expert token counts
-    local_tokens_per_expert = tokens_cpu[my_rank] if tokens_cpu is not None else None
-
     # =========================================================================
     # Combine Phase Pipeline
     # =========================================================================
-    total_output = sum(input_splits)
     combined_output = _get_p2p_buffer("combine_output", total_output, hidden_size, dtype, device)
 
     peer_fc2_results = {}
@@ -927,7 +1018,10 @@ def fc2_combine_p2p_forward(
 
     # Pipeline loop
     # Pre-compute per-round data
-    _combine_global_partners = [global_ranks[p] for p in partners]
+    if ep_plan is not None:
+        _combine_global_partners = ep_plan.global_partners
+    else:
+        _combine_global_partners = [global_ranks[p] for p in partners]
     _combine_recv_slices = []
     for i, partner in enumerate(partners):
         if input_splits[partner] > 0:
@@ -1046,7 +1140,8 @@ def fc2_combine_p2p_forward(
                 rank_major_probs = torch.cat(rank_probs_parts, dim=0) if len(rank_probs_parts) > 1 else rank_probs_parts[0]
                 all_expert_probs = rank_major_probs[row_idx_r2e]
 
-            all_tokens_per_expert = [ep_size * _cap] * num_local_experts
+            all_tokens_per_expert = (ep_plan.all_tokens_per_expert if ep_plan is not None
+                                     else [ep_size * _cap] * num_local_experts)
 
             # Backward indices from cache (no _build_row_reorder_index calls)
             sorted_r2e, sorted_e2r = _get_cached_layout_indices(
@@ -1184,6 +1279,7 @@ def pad_moe_dispatch(
 
 
 __all__ = [
+    'EPPlan',
     'router_forward',
     'pad_moe_dispatch',
     'merge_tokens_expert_major',

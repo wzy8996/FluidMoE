@@ -8,7 +8,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
-MODEL="${MODEL:-qwen3_30b_a3b}"
+MODEL="${MODEL:-mixtral_8x7b}"
 
 read_default() {
   local key="$1"
@@ -30,24 +30,50 @@ print(defaults[key])
 PY
 }
 
+# Multi-node settings (all from experiment_configs, only NODE_RANK needs env)
+NNODES="${NNODES:-$(read_default nnodes)}"
+MASTER_ADDR="${MASTER_ADDR:-$(read_default master_addr)}"
+MASTER_PORT="${MASTER_PORT:-$(read_default master_port)}"
+NODE_RANK="${NODE_RANK:-0}"
+
 DP_SIZE="${DP_SIZE:-$(read_default dp_size)}"
 CP_SIZE="${CP_SIZE:-$(read_default cp_size)}"
 EP_SIZE="${EP_SIZE:-$(read_default ep_size)}"
 WARMUP="${WARMUP:-$(read_default warmup)}"
 ITERS="${ITERS:-$(read_default iters)}"
 
-NPROC_PER_NODE=$(( DP_SIZE * CP_SIZE ))
+# Per-node GPU count: total GPUs = dp * cp, split across nodes
+TOTAL_GPUS=$(( DP_SIZE * CP_SIZE ))
+NPROC_PER_NODE=$(( TOTAL_GPUS / NNODES ))
+if (( NPROC_PER_NODE * NNODES != TOTAL_GPUS )); then
+  echo "ERROR: dp*cp=$TOTAL_GPUS is not divisible by nnodes=$NNODES" >&2
+  exit 1
+fi
 
 echo "============================================================"
 echo "Run All Block Benchmarks"
 echo "  model=${MODEL}"
-echo "  nproc_per_node=${NPROC_PER_NODE} (dp=${DP_SIZE} * cp=${CP_SIZE})"
+if (( NNODES > 1 )); then
+  echo "  nnodes=${NNODES}, node_rank=${NODE_RANK}"
+  echo "  master=${MASTER_ADDR}:${MASTER_PORT}"
+fi
+echo "  nproc_per_node=${NPROC_PER_NODE} (total_gpus=${TOTAL_GPUS})"
 echo "  dp=${DP_SIZE} cp=${CP_SIZE} ep=${EP_SIZE}"
 echo "============================================================"
 echo
 
+# Build torchrun args for single-node or multi-node
+TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE}")
+if (( NNODES > 1 )); then
+  TORCHRUN_ARGS+=(
+    --nnodes="${NNODES}"
+    --node_rank="${NODE_RANK}"
+    --master_addr="${MASTER_ADDR}"
+    --master_port="${MASTER_PORT}"
+  )
+fi
+
 COMMON_ARGS=(
-  --nproc_per_node="${NPROC_PER_NODE}"
   tests/run_block_benchmark.py
   --model "${MODEL}"
   --dp-size "${DP_SIZE}"
@@ -64,19 +90,19 @@ OVERLAP_LOG="$(mktemp)"
 trap 'rm -f "${DEEPSPEED_LOG}" "${MEGATRON_LOG}" "${FLUIDMOE_LOG}" "${OVERLAP_LOG}"' EXIT
 
 echo "[1/4] DeepSpeed Baseline"
-"${TORCHRUN_BIN}" "${COMMON_ARGS[@]}" --impl deepspeed | tee "${DEEPSPEED_LOG}"
+"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl deepspeed | tee "${DEEPSPEED_LOG}"
 echo
 
 echo "[2/4] Megatron Baseline"
-"${TORCHRUN_BIN}" "${COMMON_ARGS[@]}" --impl megatron | tee "${MEGATRON_LOG}"
+"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl megatron | tee "${MEGATRON_LOG}"
 echo
 
 echo "[3/4] FluidMoE"
-"${TORCHRUN_BIN}" "${COMMON_ARGS[@]}" --impl fluidmoe | tee "${FLUIDMOE_LOG}"
+"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl fluidmoe | tee "${FLUIDMOE_LOG}"
 echo
 
 echo "[4/4] Overlap Analysis"
-"${TORCHRUN_BIN}" --nproc_per_node="${NPROC_PER_NODE}" \
+"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" \
   tests/overlap_ratio_analyzer.py --model "${MODEL}" \
   --dp-size "${DP_SIZE}" --cp-size "${CP_SIZE}" --ep-size "${EP_SIZE}" \
   --warmup "${WARMUP}" --iters "${ITERS}" | tee "${OVERLAP_LOG}"

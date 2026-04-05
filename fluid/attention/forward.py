@@ -30,6 +30,72 @@ from fluid.core.comm import MultiCardOverlapContext
 from fluid.moe.forward import _get_group_ranks
 
 
+class CPPlan:
+    """Lightweight pre-computed static plan for attention CP P2P communication.
+
+    Caches only Python values and event references — zero GPU buffer allocation.
+    """
+    __slots__ = (
+        'cp_size', 'my_rank', 'seq_local',
+        'q_per_group', 'group_size', 'groups_per_rank',
+        'heads_local', 'proj_per_rank',
+        'partners', 'global_partners', 'n_partners',
+        # QKV forward
+        'qkv_weight_offsets', 'qkv_recv_seq_starts',
+        'qkv_events', 'qkv_ready_events',
+        'local_w_start',
+        # Output proj forward
+        'proj_weight_offsets', 'proj_dim_starts',
+        'proj_events',
+        'input_dim_per_rank', 'local_seq_start',
+        'weight_local_start',
+    )
+
+    def __init__(self, seq_local, batch, hidden_size,
+                 num_heads, num_kv_heads, head_dim,
+                 cp_group, overlap_ctx):
+        self.cp_size = cp_group.size()
+        self.my_rank = cp_group.rank()
+        self.seq_local = seq_local
+
+        self.q_per_group = num_heads // num_kv_heads
+        self.group_size = (self.q_per_group + 2) * head_dim
+        self.groups_per_rank = num_kv_heads // self.cp_size
+        self.heads_local = self.groups_per_rank * self.q_per_group
+        self.proj_per_rank = self.groups_per_rank * self.group_size
+
+        # Round-robin partners
+        num_rounds = self.cp_size - 1 if self.cp_size % 2 == 0 else self.cp_size
+        self.partners = []
+        for r in range(num_rounds):
+            p = overlap_ctx.get_partner(self.my_rank, r)
+            if p != -1:
+                self.partners.append(p)
+        global_ranks = _get_group_ranks(cp_group)
+        self.global_partners = [global_ranks[p] for p in self.partners]
+        self.n_partners = len(self.partners)
+
+        # QKV: weight slice offsets per partner
+        self.qkv_weight_offsets = [p * self.proj_per_rank for p in self.partners]
+        self.qkv_recv_seq_starts = [p * seq_local for p in self.partners]
+        self.local_w_start = self.my_rank * self.proj_per_rank
+
+        # QKV: pre-allocated events
+        self.qkv_events = [overlap_ctx.get_round_event("attn_qkv", i)
+                           for i in range(self.n_partners)]
+        self.qkv_ready_events = [overlap_ctx.get_round_event("attn_qkv_ready", i)
+                                 for i in range(self.n_partners)]
+
+        # Output proj: weight slice offsets and dim starts per partner
+        self.input_dim_per_rank = self.heads_local * head_dim
+        self.local_seq_start = self.my_rank * seq_local
+        self.weight_local_start = self.my_rank * self.input_dim_per_rank
+        self.proj_weight_offsets = [p * self.input_dim_per_rank for p in self.partners]
+        self.proj_dim_starts = [p * self.input_dim_per_rank for p in self.partners]
+        self.proj_events = [overlap_ctx.get_round_event("attn_output", i)
+                            for i in range(self.n_partners)]
+
+
 def qkv_projection_p2p_forward(
     tokens: torch.Tensor,
     weight_qkv: torch.Tensor,
@@ -39,6 +105,7 @@ def qkv_projection_p2p_forward(
     cp_group: dist.ProcessGroup,
     overlap_ctx: MultiCardOverlapContext,
     te_qkv_linear=None,
+    cp_plan: 'CPPlan' = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     QKV projection with P2P overlap for sp2hp transformation.
@@ -94,54 +161,54 @@ def qkv_projection_p2p_forward(
         v = qkv[:, :, :, q_dim + head_dim:]
         return q, k, v
 
-    # Multi-GPU: per-partner QKV compute overlapped with P2P (sp2hp)
-    # Timeline:
-    #   Round 0: Compute QKV for partner_0 heads -> Start P2P_0
-    #   Round i: P2P_{i-1} running + Compute QKV for partner_i -> Start P2P_i
-    #   Final:   Last P2P running + Compute local QKV -> Wait all P2P
-    num_rounds = cp_size - 1
     seq_full = seq_local * cp_size
-
     default_stream = torch.cuda.current_stream(device)
     comm_stream = overlap_ctx.get_stream()
 
-    # Build partner list
-    partners = []
-    for round_idx in range(num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner != -1:
-            partners.append(partner)
+    # Use cp_plan for cached schedule/events, or build dynamically
+    if cp_plan is not None:
+        partners = cp_plan.partners
+        global_partners = cp_plan.global_partners
+        events = cp_plan.qkv_events
+        ready_events = cp_plan.qkv_ready_events
+        n_partners = cp_plan.n_partners
+        local_w_start = cp_plan.local_w_start
+    else:
+        partners = []
+        for r in range(cp_size - 1):
+            p = overlap_ctx.get_partner(my_rank, r)
+            if p != -1:
+                partners.append(p)
+        global_partners = [global_ranks[p] for p in partners]
+        events = [overlap_ctx.get_round_event("attn_qkv", i) for i in range(len(partners))]
+        ready_events = [None] * len(partners)  # will use default_stream.record_event()
+        n_partners = len(partners)
+        local_w_start = my_rank * proj_per_rank
 
-    # Result buffer (NOT cached — saved for backward, must not be reused across iters)
+    # Result buffer (NOT cached — saved for backward)
     qkv_full = torch.empty(seq_full, batch, groups_per_rank, group_size,
                            dtype=dtype, device=device)
-
-    # Pre-compute per-partner weight slices and recv buffer views
-    weight_slices = []
-    recv_views = []
-    global_partners = []
-    events = []
-    for i, partner in enumerate(partners):
-        w_start = partner * proj_per_rank
-        weight_slices.append(weight_qkv[w_start:w_start + proj_per_rank, :])
-        partner_seq_start = partner * seq_local
-        recv_views.append(qkv_full[partner_seq_start:partner_seq_start + seq_local])
-        global_partners.append(global_ranks[partner])
-        events.append(overlap_ctx.get_round_event("attn_qkv", i))
 
     send_bufs = []
     all_reqs = []
     last_p2p_event = None
-    n_partners = len(partners)
 
     for i in range(n_partners):
-        send_buf = torch.matmul(tokens, weight_slices[i].t())
+        w_start = (cp_plan.qkv_weight_offsets[i] if cp_plan is not None
+                   else partners[i] * proj_per_rank)
+        send_buf = torch.matmul(tokens, weight_qkv[w_start:w_start + proj_per_rank, :].t())
         send_buf = send_buf.view(seq_local, batch, groups_per_rank, group_size).contiguous()
         send_bufs.append(send_buf)
 
-        # Record on default_stream BEFORE switching to comm_stream
-        ready_evt = default_stream.record_event()
-        recv_buffer = recv_views[i]
+        # Record ready event on default_stream BEFORE switching to comm_stream
+        if cp_plan is not None:
+            ready_events[i].record(default_stream)
+            ready_evt = ready_events[i]
+        else:
+            ready_evt = default_stream.record_event()
+        seq_start = (cp_plan.qkv_recv_seq_starts[i] if cp_plan is not None
+                     else partners[i] * seq_local)
+        recv_buffer = qkv_full[seq_start:seq_start + seq_local]
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_event(ready_evt)
             recv_buffer.record_stream(comm_stream)
@@ -157,13 +224,13 @@ def qkv_projection_p2p_forward(
             events[i].record(comm_stream)
             last_p2p_event = events[i]
 
-    # While last P2P is running, compute local QKV (overlaps with comm)
-    local_w_start = my_rank * proj_per_rank
+    # Compute local QKV (overlaps with last P2P)
     weight_local = weight_qkv[local_w_start:local_w_start + proj_per_rank, :]
     local_qkv = torch.matmul(tokens, weight_local.t())
     local_qkv = local_qkv.view(seq_local, batch, groups_per_rank, group_size)
 
-    local_seq_start = my_rank * seq_local
+    _my_rank = cp_plan.my_rank if cp_plan is not None else my_rank
+    local_seq_start = _my_rank * seq_local
     qkv_full[local_seq_start:local_seq_start + seq_local] = local_qkv
 
     # GPU-level wait for all P2P to complete (no CPU blocking)
@@ -233,6 +300,7 @@ def output_projection_p2p_forward(
     cp_group: dist.ProcessGroup,
     overlap_ctx: MultiCardOverlapContext,
     te_proj_linear=None,
+    cp_plan: 'CPPlan' = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Output projection with P2P overlap for hp2sp transformation.
@@ -277,59 +345,62 @@ def output_projection_p2p_forward(
     seq_full, batch_size, heads_local, head_dim = attn_output.shape
     seq_local = seq_full // cp_size
     hidden_size = weight_proj.shape[0]
-    input_dim_per_rank = heads_local * head_dim
-    num_rounds = cp_size - 1
 
     default_stream = torch.cuda.current_stream(device)
     comm_stream = overlap_ctx.get_stream()
 
-    # Local sequence position
-    local_seq_start = my_rank * seq_local
+    # Use cp_plan for cached schedule, or build dynamically
+    if cp_plan is not None:
+        input_dim_per_rank = cp_plan.input_dim_per_rank
+        local_seq_start = cp_plan.local_seq_start
+        partners = cp_plan.partners
+        global_partners = cp_plan.global_partners
+        p2p_events = cp_plan.proj_events
+        n_partners = cp_plan.n_partners
+        weight_local_start = cp_plan.weight_local_start
+    else:
+        input_dim_per_rank = heads_local * head_dim
+        local_seq_start = my_rank * seq_local
+        partners = []
+        for r in range(cp_size - 1):
+            p = overlap_ctx.get_partner(my_rank, r)
+            if p != -1:
+                partners.append(p)
+        global_partners = [global_ranks[p] for p in partners]
+        p2p_events = [overlap_ctx.get_round_event("attn_output", i) for i in range(len(partners))]
+        n_partners = len(partners)
+        weight_local_start = my_rank * input_dim_per_rank
 
-    # Build partner list
-    partners = []
-    for round_idx in range(num_rounds):
-        partner = overlap_ctx.get_partner(my_rank, round_idx)
-        if partner != -1:
-            partners.append(partner)
+    weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
 
-    # Pre-compute all per-partner data (avoid dict lookups and allocs in loop)
+    # Per-partner data (recv bufs NOT cached — saved for backward)
     send_data_list = []
     recv_bufs = []
     recv_bufs_flat = []
     weight_slices = []
-    global_partners = []
-    p2p_events = []
     partner_dim_starts = []
-
-    weight_local_start = my_rank * input_dim_per_rank
-    weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
 
     for i, partner in enumerate(partners):
         partner_seq_start = partner * seq_local
         send_data_list.append(attn_output[partner_seq_start:partner_seq_start + seq_local])
-        # NOT cached — recv data feeds into output projection and is saved for backward
         recv_buf = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
         recv_bufs.append(recv_buf)
         recv_bufs_flat.append(recv_buf.view(seq_local, batch_size, -1))
-        partner_weight_start = partner * input_dim_per_rank
-        weight_slices.append(weight_proj[:, partner_weight_start:partner_weight_start + input_dim_per_rank])
-        global_partners.append(global_ranks[partner])
-        p2p_events.append(overlap_ctx.get_round_event("attn_output", i))
-        partner_dim_starts.append(partner * input_dim_per_rank)
+        w_off = cp_plan.proj_weight_offsets[i] if cp_plan is not None else partner * input_dim_per_rank
+        weight_slices.append(weight_proj[:, w_off:w_off + input_dim_per_rank])
+        d_start = cp_plan.proj_dim_starts[i] if cp_plan is not None else partner * input_dim_per_rank
+        partner_dim_starts.append(d_start)
 
     attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
     attn_local_flat = attn_local_seq.reshape(seq_local, batch_size, -1)
 
     total_head_dim = cp_size * input_dim_per_rank
-    # NOT cached — saved for backward
     attn_input_full = torch.empty(seq_local, batch_size, total_head_dim, dtype=dtype, device=device)
-    local_dim_start = my_rank * input_dim_per_rank
+    local_dim_start = weight_local_start
     attn_input_full[:, :, local_dim_start:local_dim_start + input_dim_per_rank] = attn_local_flat
 
     all_reqs = []
     output = None
-    n_partners = len(partners)
 
     for i in range(n_partners):
         with torch.cuda.stream(comm_stream):

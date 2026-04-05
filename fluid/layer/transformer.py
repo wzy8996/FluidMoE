@@ -90,6 +90,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         activation_func: Callable,
         capacity_factor: float,
         chunk_config: Optional[dict] = None,
+        ep_plan=None,
+        cp_plan=None,
         # TE modules (None if TE unavailable)
         te_qkv_linear=None,
         te_proj_linear=None,
@@ -128,7 +130,8 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Returns q, k, v in format [seq_full, batch, heads_local, head_dim]
         q_hp, k_hp, v_hp = qkv_projection_p2p_forward(
             ln1_out, qkv_weight_d, num_heads, num_kv_heads, head_dim,
-            cp_group, attn_overlap_ctx, te_qkv_linear=te_qkv_linear
+            cp_group, attn_overlap_ctx, te_qkv_linear=te_qkv_linear,
+            cp_plan=cp_plan,
         )
 
         # Compute scale for attention
@@ -181,7 +184,7 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Output Projection with P2P overlap (uses TE Linear when available)
         proj_out, attn_input_full = output_projection_p2p_forward(
             attn_out, proj_weight_d, None, cp_group, attn_overlap_ctx,
-            te_proj_linear=te_proj_linear
+            te_proj_linear=te_proj_linear, cp_plan=cp_plan,
         )
 
         # Residual connection
@@ -204,7 +207,7 @@ class TransformerLayerFunction(torch.autograd.Function):
          input_splits, output_splits, tokens_per_expert,
          top_indices, top_probs, row_id_map) = router_forward(
             ln2_flat, router_weight, num_experts, top_k, ep_group,
-            capacity_factor=capacity_factor,
+            capacity_factor=capacity_factor, ep_plan=ep_plan,
         )
 
         # Compute splits for dispatch/combine
@@ -232,6 +235,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             tokens_per_expert,
             pre_tokens_cpu=pre_tokens_cpu,
             permuted_probs=permuted_probs,
+            ep_plan=ep_plan,
         )
 
         # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
@@ -242,6 +246,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             ep_group, moe_overlap_ctx, num_local_experts,
             moe_partners, tokens_cpu, needs_backward=needs_grad,
             local_probs=local_probs, recv_probs=recv_probs_dict,
+            ep_plan=ep_plan,
         )
 
         # Unpermute: scatter FC2 output back to token positions (NO probs — already applied inside experts)
@@ -345,7 +350,7 @@ class TransformerLayerFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Backward pass with P2P overlap and dW scheduling."""
         if not ctx.needs_grad:
-            return (None,) * 29  # 10 weights + 4 groups/contexts + 15 config params
+            return (None,) * 31  # 10 weights + 4 groups/contexts + 17 config params
 
         # Ensure grad_output matches forward dtype (e.g. loss computed in float32 → cast back to bf16)
         if grad_output.dtype != ctx.dtype:
@@ -728,6 +733,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             None,                 # activation_func
             None,                 # capacity_factor
             None,                 # chunk_config
+            None, None,           # ep_plan, cp_plan
             None, None, None,     # te_qkv_linear, te_proj_linear, te_attn
         )
 
@@ -799,6 +805,9 @@ class TransformerLayer(nn.Module):
         self.output_init_std = output_init_std if output_init_std is not None else init_std
         self._moe_chunk_config = None  # lazily computed on first forward
         self._moe_chunk_signature = None
+        self._ep_plan = None  # created on first forward (pad mode only)
+        self._cp_plan = None  # created on first forward (cp>1 only)
+        self._plan_sig = None  # (seq, batch, dtype, device) for plan invalidation
 
         self.cp_group = cp_group
         self.ep_group = ep_group
@@ -997,12 +1006,37 @@ class TransformerLayer(nn.Module):
         Returns:
             [seq, batch, hidden] output tensor
         """
-        # Lazy-init static chunk config for padded MoE backward.
-        signature = (int(x.shape[0]), int(x.shape[1]))
-        if self.capacity_factor > 0 and (
-            self._moe_chunk_config is None or self._moe_chunk_signature != signature
-        ):
-            self._moe_chunk_config, _, self._moe_chunk_signature = self._build_moe_chunk_config(x)
+        # Plan init with shape/dtype/device signature check.
+        # Invalidate and rebuild if input geometry changes.
+        _sig = (x.shape[0], x.shape[1], x.dtype, x.device)
+        if self._plan_sig != _sig:
+            self._moe_chunk_config = None
+            self._ep_plan = None
+            self._cp_plan = None
+            self._plan_sig = _sig
+
+        if self._moe_chunk_config is None and self.capacity_factor > 0:
+            self._moe_chunk_config, _, _ = self._build_moe_chunk_config(x)
+
+        if self._ep_plan is None and self.capacity_factor > 0:
+            from fluid.moe.forward import EPPlan
+            self._ep_plan = EPPlan(
+                num_tokens=x.shape[0] * x.shape[1],
+                num_experts=self.num_experts,
+                top_k=self.top_k, capacity_factor=self.capacity_factor,
+                ep_group=self.ep_group, overlap_ctx=self.moe_overlap_ctx,
+                device=x.device, hidden_size=x.shape[2],
+            )
+
+        if self._cp_plan is None and self.cp_group.size() > 1:
+            from fluid.attention.forward import CPPlan
+            self._cp_plan = CPPlan(
+                seq_local=x.shape[0], batch=x.shape[1],
+                hidden_size=x.shape[2],
+                num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim=x.shape[2] // self.num_heads,
+                cp_group=self.cp_group, overlap_ctx=self.attn_overlap_ctx,
+            )
 
         return TransformerLayerFunction.apply(
             x,
@@ -1021,6 +1055,7 @@ class TransformerLayer(nn.Module):
             self.activation_func,
             self.capacity_factor,
             self._moe_chunk_config,
+            self._ep_plan, self._cp_plan,
             self.te_qkv_linear, self.te_proj_linear, self.te_attn,
         )
 
