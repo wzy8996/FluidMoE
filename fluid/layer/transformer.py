@@ -870,7 +870,7 @@ class TransformerLayer(nn.Module):
         # MoE weights (stored in 3D shape to avoid permute overhead)
         # w1: [num_local_experts, hidden_size, ffn_hidden_size] for matmul(tokens, w1[exp])
         # w2: [num_local_experts, ffn_hidden_size, hidden_size] for matmul(act, w2[exp])
-        self.router_weight = nn.Parameter(torch.empty(hidden_size, num_experts, dtype=torch.float32, device=device))
+        self.router_weight = nn.Parameter(torch.empty(hidden_size, num_experts, dtype=dtype, device=device))
         self.moe_w1 = nn.Parameter(torch.empty(num_local_experts, hidden_size, ffn_hidden_size, dtype=dtype, device=device))
         self.moe_w2 = nn.Parameter(torch.empty(num_local_experts, ffn_hidden_size, hidden_size, dtype=dtype, device=device))
         # Match Megatron MoE optimizer grouping: expert weights are not dense-allreduced.
@@ -1170,6 +1170,15 @@ class TransformerModel(nn.Module):
         self._chunk_check_signature = signature
         return messages
 
+    def _init_shared_cp_slots(self, x: torch.Tensor):
+        """Placeholder for shared CP P2P slot allocation.
+
+        Currently disabled: persistent GPU buffers hurt CUDA caching allocator
+        performance in backward. Slots code is preserved in CPPlan for future
+        use when a fragmentation-free allocation strategy is available.
+        """
+        pass
+
     def setup_ar_buffer(self):
         """Set up flat AR buffers for zero-copy trickle slicing.
 
@@ -1198,6 +1207,7 @@ class TransformerModel(nn.Module):
             sched.setup_expert_ar_buffer(expert_params)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._init_shared_cp_slots(x)
         for layer in self.layers:
             x = layer(x)
         return x

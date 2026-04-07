@@ -49,6 +49,10 @@ class CPPlan:
         'proj_events',
         'input_dim_per_rank', 'local_seq_start',
         'weight_local_start',
+        # Shared slots (set externally, shared across layers)
+        'qkv_send_slots',   # [n_partners] pre-allocated send bufs, or None
+        'proj_recv_slots',   # [n_partners] pre-allocated recv bufs, or None
+        'proj_recv_flat',    # [n_partners] flattened views, or None
     )
 
     def __init__(self, seq_local, batch, hidden_size,
@@ -94,6 +98,24 @@ class CPPlan:
         self.proj_dim_starts = [p * self.input_dim_per_rank for p in self.partners]
         self.proj_events = [overlap_ctx.get_round_event("attn_output", i)
                             for i in range(self.n_partners)]
+
+        # Shared slots: set via set_shared_slots() after creation.
+        # Shared across layers — only 1 set allocated for the whole model.
+        self.qkv_send_slots = None
+        self.proj_recv_slots = None
+        self.proj_recv_flat = None
+
+    def set_shared_slots(self, qkv_send_slots, proj_recv_slots):
+        """Attach shared pre-allocated buffers (called once by TransformerModel)."""
+        self.qkv_send_slots = qkv_send_slots
+        self.proj_recv_slots = proj_recv_slots
+        if proj_recv_slots is not None:
+            s0 = proj_recv_slots[0]
+            batch = s0.shape[1]
+            self.proj_recv_flat = [s.view(self.seq_local, batch, -1)
+                                   for s in proj_recv_slots]
+        else:
+            self.proj_recv_flat = None
 
 
 def qkv_projection_p2p_forward(
@@ -189,18 +211,25 @@ def qkv_projection_p2p_forward(
     qkv_full = torch.empty(seq_full, batch, groups_per_rank, group_size,
                            dtype=dtype, device=device)
 
-    send_bufs = []
+    _use_slots = cp_plan is not None and cp_plan.qkv_send_slots is not None
+    send_bufs = [] if not _use_slots else None
     all_reqs = []
     last_p2p_event = None
 
     for i in range(n_partners):
         w_start = (cp_plan.qkv_weight_offsets[i] if cp_plan is not None
                    else partners[i] * proj_per_rank)
-        send_buf = torch.matmul(tokens, weight_qkv[w_start:w_start + proj_per_rank, :].t())
-        send_buf = send_buf.view(seq_local, batch, groups_per_rank, group_size).contiguous()
-        send_bufs.append(send_buf)
 
-        # Record ready event on default_stream BEFORE switching to comm_stream
+        if _use_slots:
+            send_buf = cp_plan.qkv_send_slots[i]
+            send_flat = send_buf.view(seq_local, batch, proj_per_rank)
+            torch.matmul(tokens, weight_qkv[w_start:w_start + proj_per_rank, :].t(),
+                         out=send_flat)
+        else:
+            send_buf = torch.matmul(tokens, weight_qkv[w_start:w_start + proj_per_rank, :].t())
+            send_buf = send_buf.view(seq_local, batch, groups_per_rank, group_size).contiguous()
+            send_bufs.append(send_buf)
+
         if cp_plan is not None:
             ready_events[i].record(default_stream)
             ready_evt = ready_events[i]
@@ -212,7 +241,8 @@ def qkv_projection_p2p_forward(
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_event(ready_evt)
             recv_buffer.record_stream(comm_stream)
-            send_buf.record_stream(comm_stream)
+            if not _use_slots:
+                send_buf.record_stream(comm_stream)
             p2p_ops = [
                 dist.P2POp(dist.irecv, recv_buffer, global_partners[i], group=cp_group),
                 dist.P2POp(dist.isend, send_buf, global_partners[i], group=cp_group),
@@ -373,23 +403,27 @@ def output_projection_p2p_forward(
 
     weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
 
-    # Per-partner data (recv bufs NOT cached — saved for backward)
+    _use_slots = cp_plan is not None and cp_plan.proj_recv_slots is not None
+    _has_plan = cp_plan is not None
+
     send_data_list = []
-    recv_bufs = []
-    recv_bufs_flat = []
-    weight_slices = []
-    partner_dim_starts = []
+    if not _has_plan:
+        weight_slices = []
+        partner_dim_starts = []
+    if not _use_slots:
+        recv_bufs = []
+        recv_bufs_flat = []
 
     for i, partner in enumerate(partners):
         partner_seq_start = partner * seq_local
         send_data_list.append(attn_output[partner_seq_start:partner_seq_start + seq_local])
-        recv_buf = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
-        recv_bufs.append(recv_buf)
-        recv_bufs_flat.append(recv_buf.view(seq_local, batch_size, -1))
-        w_off = cp_plan.proj_weight_offsets[i] if cp_plan is not None else partner * input_dim_per_rank
-        weight_slices.append(weight_proj[:, w_off:w_off + input_dim_per_rank])
-        d_start = cp_plan.proj_dim_starts[i] if cp_plan is not None else partner * input_dim_per_rank
-        partner_dim_starts.append(d_start)
+        if not _use_slots:
+            recv_buf = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
+            recv_bufs.append(recv_buf)
+            recv_bufs_flat.append(recv_buf.view(seq_local, batch_size, -1))
+        if not _has_plan:
+            weight_slices.append(weight_proj[:, partner * input_dim_per_rank:partner * input_dim_per_rank + input_dim_per_rank])
+            partner_dim_starts.append(partner * input_dim_per_rank)
 
     attn_local_seq = attn_output[local_seq_start:local_seq_start + seq_local]
     attn_local_flat = attn_local_seq.reshape(seq_local, batch_size, -1)
@@ -403,13 +437,16 @@ def output_projection_p2p_forward(
     output = None
 
     for i in range(n_partners):
+        recv_buf_i = cp_plan.proj_recv_slots[i] if _use_slots else recv_bufs[i]
+
         with torch.cuda.stream(comm_stream):
             if i == 0:
                 comm_stream.wait_stream(default_stream)
-            recv_bufs[i].record_stream(comm_stream)
+            if not _use_slots:
+                recv_buf_i.record_stream(comm_stream)
             send_data_list[i].record_stream(comm_stream)
             p2p_ops = [
-                dist.P2POp(dist.irecv, recv_bufs[i], global_partners[i], group=cp_group),
+                dist.P2POp(dist.irecv, recv_buf_i, global_partners[i], group=cp_group),
                 dist.P2POp(dist.isend, send_data_list[i], global_partners[i], group=cp_group),
             ]
             reqs = dist.batch_isend_irecv(p2p_ops)
@@ -422,14 +459,28 @@ def output_projection_p2p_forward(
             output = torch.matmul(attn_local_flat, weight_local.t())
         else:
             default_stream.wait_event(p2p_events[i - 1])
-            attn_input_full[:, :, partner_dim_starts[i-1]:partner_dim_starts[i-1] + input_dim_per_rank] = recv_bufs_flat[i-1]
-            output = output + torch.matmul(recv_bufs_flat[i-1], weight_slices[i-1].t())
+            prev_flat = cp_plan.proj_recv_flat[i - 1] if _use_slots else recv_bufs_flat[i - 1]
+            if _has_plan:
+                d_start = cp_plan.proj_dim_starts[i - 1]
+                w_off = cp_plan.proj_weight_offsets[i - 1]
+                attn_input_full[:, :, d_start:d_start + input_dim_per_rank] = prev_flat
+                output = output + torch.matmul(prev_flat, weight_proj[:, w_off:w_off + input_dim_per_rank].t())
+            else:
+                attn_input_full[:, :, partner_dim_starts[i-1]:partner_dim_starts[i-1] + input_dim_per_rank] = prev_flat
+                output = output + torch.matmul(prev_flat, weight_slices[i-1].t())
 
     if n_partners > 0:
         last = n_partners - 1
         default_stream.wait_event(p2p_events[last])
-        attn_input_full[:, :, partner_dim_starts[last]:partner_dim_starts[last] + input_dim_per_rank] = recv_bufs_flat[last]
-        output = output + torch.matmul(recv_bufs_flat[last], weight_slices[last].t())
+        last_flat = cp_plan.proj_recv_flat[last] if _use_slots else recv_bufs_flat[last]
+        if _has_plan:
+            d_start = cp_plan.proj_dim_starts[last]
+            w_off = cp_plan.proj_weight_offsets[last]
+            attn_input_full[:, :, d_start:d_start + input_dim_per_rank] = last_flat
+            output = output + torch.matmul(last_flat, weight_proj[:, w_off:w_off + input_dim_per_rank].t())
+        else:
+            attn_input_full[:, :, partner_dim_starts[last]:partner_dim_starts[last] + input_dim_per_rank] = last_flat
+            output = output + torch.matmul(last_flat, weight_slices[last].t())
 
     if all_reqs:
         all_reqs[-1].wait()

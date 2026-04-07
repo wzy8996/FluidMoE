@@ -777,26 +777,38 @@ def dispatch_fc1_p2p_forward(
         # metadata occupies 1 row worth of elements in the flat buffer
         meta_flat_elems = hidden_size
 
-    for partner in partners:
+    for i, partner in enumerate(partners):
         n_send = input_splits[partner]
         recv_size = output_splits[partner]
 
         # Send buffer: 1D flat [meta_elems? + N*H + N?] — tokens then probs
         if n_send > 0:
             token_chunk = tokens[input_offsets[partner]:input_offsets[partner+1]]
-            parts = []
-            if use_metadata:
-                partner_metadata = tokens_per_expert[partner * num_local_experts : (partner + 1) * num_local_experts]
-                metadata_int32 = partner_metadata.to(torch.int32).to(device)
-                metadata_row = torch.zeros(meta_flat_elems, dtype=dtype, device=device)
-                metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
-                metadata_row[:metadata_elements] = metadata_as_dtype
-                parts.append(metadata_row)
-            parts.append(token_chunk.reshape(-1))
-            if has_probs:
-                probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
-                parts.append(probs_chunk.to(dtype))
-            send_chunk_list.append(torch.cat(parts))
+            if not use_metadata and ep_plan is not None:
+                # Padded mode: grow-only send buffer (same pattern as recv side)
+                total_elems = ep_plan.recv_total_elems[i]
+                send_buf = _get_p2p_buffer(
+                    f"dispatch_send_{i}", total_elems, 1, dtype, device).squeeze(-1)
+                send_buf[:n_send * hidden_size].copy_(token_chunk.reshape(-1))
+                if has_probs:
+                    probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
+                    send_buf[n_send * hidden_size:].copy_(probs_chunk.to(dtype) if probs_chunk.dtype != dtype else probs_chunk)
+                send_chunk_list.append(send_buf)
+            else:
+                # Dynamic mode: use cat
+                parts = []
+                if use_metadata:
+                    partner_metadata = tokens_per_expert[partner * num_local_experts : (partner + 1) * num_local_experts]
+                    metadata_int32 = partner_metadata.to(torch.int32).to(device)
+                    metadata_row = torch.zeros(meta_flat_elems, dtype=dtype, device=device)
+                    metadata_as_dtype = metadata_int32.view(torch.int8).view(dtype)
+                    metadata_row[:metadata_elements] = metadata_as_dtype
+                    parts.append(metadata_row)
+                parts.append(token_chunk.reshape(-1))
+                if has_probs:
+                    probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
+                    parts.append(probs_chunk.to(dtype))
+                send_chunk_list.append(torch.cat(parts))
         else:
             send_chunk_list.append(None)
 
@@ -860,7 +872,7 @@ def dispatch_fc1_p2p_forward(
             p2p_ops = []
             gp = _global_partners[round_idx]
             if recv_meta_list[round_idx] is not None:
-                recv_meta_list[round_idx].record_stream(comm_stream)
+                # recv buffer from _get_p2p_buffer (persistent) — no record_stream needed
                 p2p_ops.append(dist.P2POp(dist.irecv, recv_meta_list[round_idx], gp, group=ep_group))
             if send_chunk_list[round_idx] is not None:
                 send_chunk_list[round_idx].record_stream(comm_stream)
@@ -1078,66 +1090,41 @@ def fc2_combine_p2p_forward(
     all_expert_probs = None
     if needs_backward and tokens_cpu is not None:
         nvtx_range_push("merge_sort_fwd")
-        # Build peer tokens concat
-        peer_tokens = [recv_buffers[i] for i in range(ep_size) if i != my_rank and i in recv_buffers]
-        if len(peer_tokens) == 0:
-            all_peer_tokens = torch.empty(0, hidden_size, dtype=dtype, device=device)
-        elif len(peer_tokens) == 1:
-            all_peer_tokens = peer_tokens[0]
-        else:
-            all_peer_tokens = torch.cat(peer_tokens, dim=0)
-
-        # Build peer probs concat (Megatron-aligned: probs in expert-major for backward)
-        if local_probs is not None and recv_probs is not None:
-            peer_probs_list = [recv_probs[i] for i in range(ep_size)
-                               if i != my_rank and i in recv_probs]
-            if len(peer_probs_list) == 0:
-                all_peer_probs = torch.empty(0, dtype=local_probs.dtype, device=device)
-            elif len(peer_probs_list) == 1:
-                all_peer_probs = peer_probs_list[0]
-            else:
-                all_peer_probs = torch.cat(peer_probs_list, dim=0)
 
         # Check for uniform padding case (CPU tensor — no GPU sync)
-        _cap = int(tokens_cpu.view(-1)[0])
-        _is_padded = bool((tokens_cpu == _cap).all())
+        if ep_plan is not None:
+            _is_padded = True
+            _cap = ep_plan.expert_capacity
+        else:
+            _cap = int(tokens_cpu.view(-1)[0])
+            _is_padded = bool((tokens_cpu == _cap).all())
 
         if _is_padded and _cap > 0:
-            # Fast path: all indices are deterministic and cached.
-            # Eliminates GPU-CPU syncs from _build_row_reorder_index and merge.
+            # Fast path: direct rank-segment copy, no intermediate cat.
             row_idx_r2e, row_idx_e2r = _get_padded_row_indices(
                 num_local_experts, ep_size, _cap, device)
 
             n_per_rank = num_local_experts * _cap
             total_tokens_merge = ep_size * n_per_rank
 
-            # Build rank-major tokens
-            rank_parts = []
-            peer_offset = 0
-            for rank in range(ep_size):
-                if rank == my_rank:
-                    rank_parts.append(local_tokens)
-                else:
-                    rank_parts.append(all_peer_tokens[peer_offset:peer_offset + n_per_rank])
-                    peer_offset += n_per_rank
-            rank_major = torch.cat(rank_parts, dim=0) if len(rank_parts) > 1 else rank_parts[0]
+            # Build rank-major by direct copy_ per rank (no cat)
+            rank_major = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
+            rank_major[my_rank * n_per_rank:(my_rank + 1) * n_per_rank] = local_tokens
+            for p in partners:
+                if p in recv_buffers:
+                    rank_major[p * n_per_rank:(p + 1) * n_per_rank] = recv_buffers[p]
 
             # Reorder to expert-major using cached index
             all_expert_tokens = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
             torch.index_select(rank_major, 0, row_idx_r2e, out=all_expert_tokens)
 
-            # Merge probs to expert-major (same layout as tokens)
+            # Merge probs to expert-major by direct copy_ per rank (no cat)
             if local_probs is not None and recv_probs is not None:
-                rank_probs_parts = []
-                peer_probs_offset = 0
-                for rank in range(ep_size):
-                    if rank == my_rank:
-                        rank_probs_parts.append(local_probs)
-                    else:
-                        rank_probs_parts.append(
-                            all_peer_probs[peer_probs_offset:peer_probs_offset + n_per_rank])
-                        peer_probs_offset += n_per_rank
-                rank_major_probs = torch.cat(rank_probs_parts, dim=0) if len(rank_probs_parts) > 1 else rank_probs_parts[0]
+                rank_major_probs = torch.empty(total_tokens_merge, dtype=local_probs.dtype, device=device)
+                rank_major_probs[my_rank * n_per_rank:(my_rank + 1) * n_per_rank] = local_probs
+                for p in partners:
+                    if p in recv_probs:
+                        rank_major_probs[p * n_per_rank:(p + 1) * n_per_rank] = recv_probs[p]
                 all_expert_probs = rank_major_probs[row_idx_r2e]
 
             all_tokens_per_expert = (ep_plan.all_tokens_per_expert if ep_plan is not None
@@ -1157,7 +1144,23 @@ def fc2_combine_p2p_forward(
                 'row_idx_exp_to_rank': row_idx_e2r,
             }
         else:
-            # General path: non-uniform splits, compute from scratch
+            # General path: non-uniform splits, build peer concat then merge
+            peer_tokens = [recv_buffers[i] for i in range(ep_size) if i != my_rank and i in recv_buffers]
+            if len(peer_tokens) == 0:
+                all_peer_tokens = torch.empty(0, hidden_size, dtype=dtype, device=device)
+            elif len(peer_tokens) == 1:
+                all_peer_tokens = peer_tokens[0]
+            else:
+                all_peer_tokens = torch.cat(peer_tokens, dim=0)
+            if local_probs is not None and recv_probs is not None:
+                peer_probs_list = [recv_probs[i] for i in range(ep_size)
+                                   if i != my_rank and i in recv_probs]
+                if len(peer_probs_list) == 0:
+                    all_peer_probs = torch.empty(0, dtype=local_probs.dtype, device=device)
+                elif len(peer_probs_list) == 1:
+                    all_peer_probs = peer_probs_list[0]
+                else:
+                    all_peer_probs = torch.cat(peer_probs_list, dim=0)
             all_expert_tokens, all_tokens_per_expert = merge_tokens_expert_major(
                 local_tokens, all_peer_tokens,
                 num_local_experts, tokens_cpu, my_rank, ep_size, device,

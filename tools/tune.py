@@ -80,16 +80,14 @@ num_gpus = dp_size * cp_size
 N_ITER = int(tune_defaults["chunk_search_iters"])              # 测量轮数
 MAX_C = int(tune_defaults["chunk_search_max_c"])               # 最大候选分块数
 MIN_SAVING = float(tune_defaults["chunk_stop_min_saving_ms"])  # 早停阈值(ms)
-# MoE 区域 (R1, R2): 候选受限于本 rank 上的专家数 nle（expert-dim 切分要求 C | nle）
-_nle = num_experts // ep_size
-_moe_max = min(MAX_C, _nle)
-MOE_CHUNK_CANDIDATES = [2**i for i in range(_moe_max.bit_length()) if 2**i <= _moe_max]
-if 1 not in MOE_CHUNK_CANDIDATES:
-    MOE_CHUNK_CANDIDATES.insert(0, 1)
-# Attention 区域 (R3, R4): 不受专家数限制，仅受 MAX_C 限制
-ATTN_CHUNK_CANDIDATES = [2**i for i in range(MAX_C.bit_length()) if 2**i <= MAX_C]
-if 1 not in ATTN_CHUNK_CANDIDATES:
-    ATTN_CHUNK_CANDIDATES.insert(0, 1)
+# Chunk 候选列表 (powers of 2 up to MAX_C)
+# MoE 和 Attention 使用相同候选范围，两级分解 (_decompose_chunks)
+# 会自动处理无效值（返回有效的 C_expert × C_cap 或 fallback 到 C=1）
+CHUNK_CANDIDATES = [2**i for i in range(MAX_C.bit_length()) if 2**i <= MAX_C]
+if 1 not in CHUNK_CANDIDATES:
+    CHUNK_CANDIDATES.insert(0, 1)
+MOE_CHUNK_CANDIDATES = CHUNK_CANDIDATES
+ATTN_CHUNK_CANDIDATES = CHUNK_CANDIDATES
 
 # AR 搜索参数
 N_AR_WARMUP = int(tune_defaults["ar_warmup"])                  # 预热轮数
