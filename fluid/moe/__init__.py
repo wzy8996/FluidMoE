@@ -29,8 +29,8 @@ Key design principles:
 """
 
 from .forward import (
+    EPPlan,
     router_forward,
-    pad_moe_dispatch,
     merge_tokens_expert_major,
     precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
@@ -48,8 +48,8 @@ from .backward import (
 
 __all__ = [
     # Forward operations (P2P overlap)
+    'EPPlan',
     'router_forward',
-    'pad_moe_dispatch',
     'merge_tokens_expert_major',
     'precompute_backward_sort_indices',
     'dispatch_fc1_p2p_forward',

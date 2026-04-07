@@ -766,6 +766,7 @@ def dispatch_fc1_p2p_forward(
     # Build per-partner send/recv data as lists (avoid dict lookups in loop)
     # Payload fusion: tokens + probs packed into one tensor [N, H+1] to halve NCCL ops
     has_probs = permuted_probs is not None
+    _need_probs_cast = has_probs and permuted_probs.dtype != dtype
     send_chunk_list = []       # None if no data to send
     recv_meta_list = []        # None if no data to recv (1D flat buffer)
     recv_buffers = {}          # populated after metadata extraction
@@ -792,7 +793,8 @@ def dispatch_fc1_p2p_forward(
                 send_buf[:n_send * hidden_size].copy_(token_chunk.reshape(-1))
                 if has_probs:
                     probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
-                    send_buf[n_send * hidden_size:].copy_(probs_chunk.to(dtype) if probs_chunk.dtype != dtype else probs_chunk)
+                    send_buf[n_send * hidden_size:].copy_(
+                        probs_chunk.to(dtype) if _need_probs_cast else probs_chunk)
                 send_chunk_list.append(send_buf)
             else:
                 # Dynamic mode: use cat
@@ -807,7 +809,7 @@ def dispatch_fc1_p2p_forward(
                 parts.append(token_chunk.reshape(-1))
                 if has_probs:
                     probs_chunk = permuted_probs[input_offsets[partner]:input_offsets[partner+1]]
-                    parts.append(probs_chunk.to(dtype))
+                    parts.append(probs_chunk.to(dtype) if _need_probs_cast else probs_chunk)
                 send_chunk_list.append(torch.cat(parts))
         else:
             send_chunk_list.append(None)
@@ -861,7 +863,8 @@ def dispatch_fc1_p2p_forward(
             recv_buffers[partner] = flat[off:off + n * hidden_size].view(n, hidden_size)
             if has_probs:
                 probs_off = off + n * hidden_size
-                recv_probs_list[idx] = flat[probs_off:probs_off + n].to(probs_dtype)
+                probs_view = flat[probs_off:probs_off + n]
+                recv_probs_list[idx] = probs_view.to(probs_dtype) if _need_probs_cast else probs_view
 
     for round_idx, partner in enumerate(partners):
         nvtx_range_push(f"dispatch_p2p_R{round_idx}")

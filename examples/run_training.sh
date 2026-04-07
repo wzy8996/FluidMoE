@@ -8,7 +8,7 @@
 # Experiment configs (parallelism, chunks, AR) are read from tools/experiment_configs.py.
 #
 # Usage:
-#   bash examples/run_training.sh                          # default: qwen3_30b_a3b
+#   bash examples/run_training.sh                          # default: mixtral_8x7b
 #   MODEL=mixtral_8x7b bash examples/run_training.sh      # different model
 #   TRAIN_ITERS=500 bash examples/run_training.sh          # more iterations
 set -euo pipefail
@@ -17,7 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-MODEL="${MODEL:-qwen3_30b_a3b}"
+MODEL="${MODEL:-mixtral_8x7b}"
 TRAIN_ITERS="${TRAIN_ITERS:-100}"
 LR_WARMUP="${LR_WARMUP:-10}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"

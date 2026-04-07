@@ -10,6 +10,8 @@ Fair comparison: all methods use the same per-peer chunk size.
 import argparse
 import os
 
+os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+
 import torch
 import torch.distributed as dist
 

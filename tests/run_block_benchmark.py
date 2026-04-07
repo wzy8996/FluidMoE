@@ -4,15 +4,14 @@ import argparse
 import os
 import sys
 
+os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT_DIR, "tools")
 TESTS_DIR = os.path.join(ROOT_DIR, "tests")
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, TESTS_DIR)
-megatron_path = os.environ.get('MEGATRON_PATH', '/home/zju/wzy/Megatron-LM')
-if megatron_path not in sys.path:
-    sys.path.insert(0, megatron_path)
 
 import torch
 import torch._dynamo

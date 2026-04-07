@@ -25,7 +25,6 @@ Timeline (Attention Backward - uses precomputed attn_probs/grad_attn_scores):
                                         overlap!
 """
 
-import os
 import torch
 import torch.distributed as dist
 from typing import Optional, Tuple
@@ -310,23 +309,15 @@ def hp2sp_qkv_backward(
     # Execute dW tasks during AllToAll
     scheduler.execute_dw_tasks()
 
-    # Process each chunk as it arrives: QKV dX
-    # After hp2sp AllToAll: [seq_chunk_local, batch, num_kv_heads, group_size]
-    # total_proj = num_kv_heads * group_size (NOT kv_heads_local * group_size)
+    # Process each chunk as it arrives: QKV dX only
     grad_tokens = torch.empty(seq_local, batch, hidden_size, dtype=tokens.dtype, device=device)
-
-    # Shared accumulator for partial dW results.
-    # Partials are NOT written to the AR buffer individually — doing so would
-    # allow trickle AR to send incomplete gradients before all partials are
-    # summed, corrupting the all-reduce result.  Only the final task writes
-    # the complete accumulated gradient to the buffer (single atomic write).
-    _qkv_dw_accum = [None]
+    # Collect grad_qkv chunks for single dW registration after all chunks arrive
+    grad_qkv_chunks = []
 
     for chunk_idx in range(num_chunks):
         s_start_local = chunk_idx * seq_chunk_local
         s_end_local = s_start_local + seq_chunk_local
 
-        # Wait for this chunk (only trickle AR on last chunk)
         is_last = (chunk_idx == num_chunks - 1)
         scheduler.wait_alltoall(task_ids[chunk_idx], try_trickle=is_last)
         grad_qkv_sp_chunk = chunk_results_buf[chunk_idx]
@@ -334,47 +325,15 @@ def hp2sp_qkv_backward(
         # Flatten and compute dX
         grad_qkv_chunk_flat = grad_qkv_sp_chunk.reshape(seq_chunk_local, batch, -1)
         grad_tokens[s_start_local:s_end_local] = torch.matmul(grad_qkv_chunk_flat, weight_qkv)
+        grad_qkv_chunks.append(grad_qkv_chunk_flat.reshape(-1, total_proj).detach())
 
-        # Register partial QKV dW for this chunk (accumulates locally, no buffer write).
-        _tokens_chunk = tokens[s_start_local:s_end_local].detach()
-        _grad_chunk = grad_qkv_chunk_flat.reshape(-1, total_proj).detach()
-        _hidden = hidden_size
-
-        def _make_partial_dw(tc, gc, hs, accum):
-            def compute():
-                partial = torch.matmul(gc.t(), tc.view(-1, hs))
-                if accum[0] is None:
-                    accum[0] = partial
-                else:
-                    accum[0].add_(partial)
-                return None  # no buffer write; accumulated in final task
-            return compute
-
-        scheduler.register_dw_task(
-            layer_name=f"qkv_partial{chunk_idx}_layer{layer_id}",
-            layer_id=layer_id,
-            compute_fn=_make_partial_dw(_tokens_chunk, _grad_chunk, _hidden, _qkv_dw_accum),
-            weight_param=None,  # NOT bound to buffer — prevents premature AR
-        )
-
-        # Execute partial dW during next chunk's A2A (not on last chunk)
+        # Execute other dW tasks during AllToAll wait (not on last chunk)
         if not is_last:
             scheduler.execute_dw_tasks()
 
-    # Final task: write the complete accumulated gradient to buffer atomically.
-    def _make_final_qkv_dw(accum):
-        def compute():
-            return accum[0]
-        return compute
-
-    scheduler.register_dw_task(
-        layer_name=f"qkv_final_layer{layer_id}",
-        layer_id=layer_id,
-        compute_fn=_make_final_qkv_dw(_qkv_dw_accum),
-        weight_param=weight_qkv,
-    )
-
-    grad_weight = None
+    # Register single QKV dW task (complete gradient, single atomic write)
+    grad_qkv_full = torch.cat(grad_qkv_chunks, dim=0)
+    grad_weight = _register_qkv_dw(grad_qkv_full, tokens.detach(), weight_qkv, hidden_size, layer_id)
 
     return grad_tokens, grad_weight
 

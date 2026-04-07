@@ -13,6 +13,9 @@ import gc
 import os
 import sys
 
+# Required for P2P + CP/TP correctness (same as Megatron's requirement)
+os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT_DIR, "tools")
 sys.path.insert(0, ROOT_DIR)

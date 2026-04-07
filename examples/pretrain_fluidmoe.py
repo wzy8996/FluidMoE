@@ -21,9 +21,6 @@ import sys
 from functools import partial
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-megatron_path = os.environ.get('MEGATRON_PATH', '/home/zju/wzy/Megatron-LM')
-if megatron_path not in sys.path:
-    sys.path.insert(0, megatron_path)
 
 import torch
 from megatron.training import get_args, pretrain
