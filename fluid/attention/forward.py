@@ -207,13 +207,17 @@ def qkv_projection_p2p_forward(
         n_partners = len(partners)
         local_w_start = my_rank * proj_per_rank
 
-    # Result buffer (NOT cached — saved for backward)
-    qkv_full = torch.empty(seq_full, batch, groups_per_rank, group_size,
-                           dtype=dtype, device=device)
+    # Result buffer — symmetric heap when NVSHMEM active (recv target).
+    # Views/slices of symmetric tensors are valid symmetric addresses.
+    from fluid.core.p2p_backend import get_p2p_backend
+    _p2p = get_p2p_backend()
+    _qkv_numel = seq_full * batch * groups_per_rank * group_size
+    qkv_full = _p2p.alloc_recv_buffer(
+        "attn_qkv_full", _qkv_numel, dtype, device
+    ).view(seq_full, batch, groups_per_rank, group_size)
 
     _use_slots = cp_plan is not None and cp_plan.qkv_send_slots is not None
     send_bufs = [] if not _use_slots else None
-    all_reqs = []
     last_p2p_event = None
 
     for i in range(n_partners):
@@ -243,15 +247,12 @@ def qkv_projection_p2p_forward(
             recv_buffer.record_stream(comm_stream)
             if not _use_slots:
                 send_buf.record_stream(comm_stream)
-            p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buffer, global_partners[i], group=cp_group),
-                dist.P2POp(dist.isend, send_buf, global_partners[i], group=cp_group),
-            ]
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            all_reqs.extend(reqs)
-            if reqs:
-                reqs[-1].wait()
-            events[i].record(comm_stream)
+            _p2p.exchange(
+                send_buf=send_buf, recv_buf=recv_buffer,
+                partner_global_rank=global_partners[i],
+                partner_local_rank=partners[i],
+                group=cp_group, comm_stream=comm_stream, event=events[i],
+            )
             last_p2p_event = events[i]
 
     # Compute local QKV (overlaps with last P2P)
@@ -267,11 +268,8 @@ def qkv_projection_p2p_forward(
     if last_p2p_event is not None:
         default_stream.wait_event(last_p2p_event)
 
-    # Also synchronize NCCL work onto default_stream before returning. The
-    # comm_stream-side wait above is not enough for allocator safety on
-    # default_stream consumers.
-    if all_reqs:
-        all_reqs[-1].wait()
+    if _p2p.needs_final_wait():
+        _p2p.final_wait()
 
     # Separate Q, K, V
     q_size = q_per_group * head_dim
@@ -403,6 +401,8 @@ def output_projection_p2p_forward(
 
     weight_local = weight_proj[:, weight_local_start:weight_local_start + input_dim_per_rank]
 
+    from fluid.core.p2p_backend import get_p2p_backend
+    _p2p_proj = get_p2p_backend()
     _use_slots = cp_plan is not None and cp_plan.proj_recv_slots is not None
     _has_plan = cp_plan is not None
 
@@ -418,7 +418,10 @@ def output_projection_p2p_forward(
         partner_seq_start = partner * seq_local
         send_data_list.append(attn_output[partner_seq_start:partner_seq_start + seq_local])
         if not _use_slots:
-            recv_buf = torch.empty(seq_local, batch_size, heads_local, head_dim, dtype=dtype, device=device)
+            _proj_recv_numel = seq_local * batch_size * heads_local * head_dim
+            recv_buf = _p2p_proj.alloc_recv_buffer(
+                f"attn_proj_recv_{i}", _proj_recv_numel, dtype, device
+            ).view(seq_local, batch_size, heads_local, head_dim)
             recv_bufs.append(recv_buf)
             recv_bufs_flat.append(recv_buf.view(seq_local, batch_size, -1))
         if not _has_plan:
@@ -433,7 +436,6 @@ def output_projection_p2p_forward(
     local_dim_start = weight_local_start
     attn_input_full[:, :, local_dim_start:local_dim_start + input_dim_per_rank] = attn_local_flat
 
-    all_reqs = []
     output = None
 
     for i in range(n_partners):
@@ -445,15 +447,12 @@ def output_projection_p2p_forward(
             if not _use_slots:
                 recv_buf_i.record_stream(comm_stream)
             send_data_list[i].record_stream(comm_stream)
-            p2p_ops = [
-                dist.P2POp(dist.irecv, recv_buf_i, global_partners[i], group=cp_group),
-                dist.P2POp(dist.isend, send_data_list[i], global_partners[i], group=cp_group),
-            ]
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            all_reqs.extend(reqs)
-            if reqs:
-                reqs[-1].wait()
-            p2p_events[i].record(comm_stream)
+            _p2p_proj.exchange(
+                send_buf=send_data_list[i], recv_buf=recv_buf_i,
+                partner_global_rank=global_partners[i],
+                partner_local_rank=partners[i],
+                group=cp_group, comm_stream=comm_stream, event=p2p_events[i],
+            )
 
         if i == 0:
             output = torch.matmul(attn_local_flat, weight_local.t())
@@ -482,8 +481,8 @@ def output_projection_p2p_forward(
             attn_input_full[:, :, partner_dim_starts[last]:partner_dim_starts[last] + input_dim_per_rank] = last_flat
             output = output + torch.matmul(last_flat, weight_slices[last].t())
 
-    if all_reqs:
-        all_reqs[-1].wait()
+    if _p2p_proj.needs_final_wait():
+        _p2p_proj.final_wait()
 
     if bias_proj is not None:
         output = output + bias_proj

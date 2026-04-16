@@ -24,6 +24,13 @@ from .scheduler import (
     get_backward_scheduler,
 )
 
+from .p2p_backend import (
+    P2PBackend,
+    NCCLBackend,
+    get_p2p_backend,
+    reset_p2p_backend,
+)
+
 from .nvtx import (
     nvtx_range,
     nvtx_range_push,
@@ -44,6 +51,11 @@ __all__ = [
     # Scheduler
     'BackwardScheduler',
     'get_backward_scheduler',
+    # P2P Backend
+    'P2PBackend',
+    'NCCLBackend',
+    'get_p2p_backend',
+    'reset_p2p_backend',
     # NVTX Profiling
     'nvtx_range',
     'nvtx_range_push',

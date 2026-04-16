@@ -439,8 +439,31 @@ def router_forward(
         experts_per_rank = num_experts // ep_size
         input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
         output_splits = input_splits  # symmetric in padded mode
+    elif capacity_factor > 0:
+        # ---- Fallback padded: argsort + index_select (no TE) ----
+        # Must produce same padded layout as TE path so EPPlan offsets are valid
+        routing_map_int_T = routing_map.to(torch.int8).T.contiguous()  # [E, T]
+        sorted_per_expert = routing_map_int_T.argsort(
+            dim=-1, descending=True, stable=True
+        )[:, :expert_capacity].contiguous()  # [E, capacity]
+        sorted_indices = sorted_per_expert.reshape(-1)
+
+        permuted_tokens = hidden_states.index_select(0, sorted_indices)
+        permuted_probs = routing_probs.T.contiguous().gather(
+            1, sorted_per_expert).reshape(-1)
+
+        if ep_plan is not None:
+            tokens_per_expert = ep_plan.tokens_per_expert_gpu
+        else:
+            tokens_per_expert = torch.full(
+                (num_experts,), expert_capacity, dtype=torch.int64, device=device)
+
+        experts_per_rank = num_experts // ep_size
+        input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
+        output_splits = input_splits
+        row_id_map = None
     else:
-        # ---- Fallback: PyTorch ops (non-fused or non-padded) ----
+        # ---- Fallback dynamic: compact layout (no padding) ----
         tokens_per_expert = routing_map.int().sum(dim=0).long()  # [E]
         routing_map_T = routing_map.bool().T.contiguous()  # [E, T]
         token_indices = torch.arange(
@@ -448,17 +471,14 @@ def router_forward(
         sorted_indices = token_indices.masked_select(routing_map_T)
         permuted_probs = routing_probs.T.contiguous().masked_select(routing_map_T)
         permuted_tokens = hidden_states.index_select(0, sorted_indices)
-        row_id_map = None  # not available in fallback path
+        row_id_map = None
 
         experts_per_rank = num_experts // ep_size
         input_splits = tokens_per_expert.view(ep_size, experts_per_rank).sum(dim=1)
-        if capacity_factor > 0:
-            output_splits = input_splits
-        else:
-            all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
-            dist.all_gather(all_input_splits, input_splits, group=ep_group)
-            all_input_splits = torch.stack(all_input_splits)
-            output_splits = all_input_splits[:, my_rank].clone()
+        all_input_splits = [torch.zeros_like(input_splits) for _ in range(ep_size)]
+        dist.all_gather(all_input_splits, input_splits, group=ep_group)
+        all_input_splits = torch.stack(all_input_splits)
+        output_splits = all_input_splits[:, my_rank].clone()
 
     nvtx_range_pop()
     return (permuted_tokens, permuted_probs, sorted_indices,
@@ -814,12 +834,13 @@ def dispatch_fc1_p2p_forward(
         else:
             send_chunk_list.append(None)
 
-        # Recv buffer: 1D flat, persistent
+        # Recv buffer: 1D flat, persistent (symmetric heap when NVSHMEM active)
         if recv_size > 0:
+            from fluid.core.p2p_backend import get_p2p_backend
             meta_elems = meta_flat_elems if use_metadata else 0
             total_elems = meta_elems + recv_size * hidden_size + (recv_size if has_probs else 0)
-            recv_meta_list.append(_get_p2p_buffer(
-                f"dispatch_recv_{partner}", total_elems, 1, dtype, device).squeeze(-1))
+            recv_meta_list.append(get_p2p_backend().alloc_recv_buffer(
+                f"dispatch_recv_{partner}", total_elems, dtype, device))
         else:
             recv_meta_list.append(None)
         recv_probs_list.append(None)
@@ -842,7 +863,7 @@ def dispatch_fc1_p2p_forward(
     # round i-1. The event must be recorded only after NCCL completion.
     # =========================================================================
     prev_idx = -1
-    all_reqs = []
+    # all_reqs removed — P2P backend manages request lifecycle internally
     p2p_events = []
     recv_act_results = {}
     local_act = None
@@ -866,26 +887,22 @@ def dispatch_fc1_p2p_forward(
                 probs_view = flat[probs_off:probs_off + n]
                 recv_probs_list[idx] = probs_view.to(probs_dtype) if _need_probs_cast else probs_view
 
+    from fluid.core.p2p_backend import get_p2p_backend
+    _p2p = get_p2p_backend()
+
     for round_idx, partner in enumerate(partners):
         nvtx_range_push(f"dispatch_p2p_R{round_idx}")
         with torch.cuda.stream(comm_stream):
             if round_idx == 0:
                 comm_stream.wait_stream(default_stream)
-            # Fused payload: tokens+probs in one tensor → 2 NCCL ops instead of 4
-            p2p_ops = []
-            gp = _global_partners[round_idx]
-            if recv_meta_list[round_idx] is not None:
-                # recv buffer from _get_p2p_buffer (persistent) — no record_stream needed
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_meta_list[round_idx], gp, group=ep_group))
-            if send_chunk_list[round_idx] is not None:
-                send_chunk_list[round_idx].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.isend, send_chunk_list[round_idx], gp, group=ep_group))
-            curr_reqs = dist.batch_isend_irecv(p2p_ops) if p2p_ops else []
-            all_reqs.extend(curr_reqs)
-            if curr_reqs:
-                curr_reqs[-1].wait()
             evt = _dispatch_events[round_idx]
-            evt.record(comm_stream)
+            _p2p.exchange(
+                send_buf=send_chunk_list[round_idx],
+                recv_buf=recv_meta_list[round_idx],
+                partner_global_rank=_global_partners[round_idx],
+                partner_local_rank=partners[round_idx],
+                group=ep_group, comm_stream=comm_stream, event=evt,
+            )
             p2p_events.append(evt)
         nvtx_range_pop()
 
@@ -927,12 +944,8 @@ def dispatch_fc1_p2p_forward(
             recv_act_results[last_p] = recv_act
         nvtx_range_pop()
 
-    # Make default_stream itself observe NCCL completion before returning.
-    # This second wait is required in addition to the comm_stream-side wait
-    # above: ProcessGroupNCCL tracks allocator safety against the user-facing
-    # streams that call wait()/synchronize().
-    if all_reqs:
-        all_reqs[-1].wait()
+    if _p2p.needs_final_wait():
+        _p2p.final_wait()
 
     nvtx_range_pop()  # dispatch_fc1_p2p
     return (
@@ -1011,7 +1024,10 @@ def fc2_combine_p2p_forward(
     # =========================================================================
     # Combine Phase Pipeline
     # =========================================================================
-    combined_output = _get_p2p_buffer("combine_output", total_output, hidden_size, dtype, device)
+    from fluid.core.p2p_backend import get_p2p_backend
+    combined_output = get_p2p_backend().alloc_recv_buffer(
+        "combine_output", total_output * hidden_size, dtype, device
+    ).view(total_output, hidden_size)
 
     peer_fc2_results = {}
     local_fc2 = None
@@ -1044,26 +1060,27 @@ def fc2_combine_p2p_forward(
         else:
             _combine_recv_slices.append(None)
 
-    all_combine_reqs = []
+    from fluid.core.p2p_backend import get_p2p_backend
+    _p2p_combine = get_p2p_backend()
+
     for round_idx, partner in enumerate(partners):
         nvtx_range_push(f"combine_p2p_R{round_idx}")
         with torch.cuda.stream(comm_stream):
             if has_pending_fc2:
                 comm_stream.wait_event(fc2_event)
-            p2p_ops = []
-            gp = _combine_global_partners[round_idx]
             recv_slice = _combine_recv_slices[round_idx]
             if recv_slice is not None:
                 recv_slice.record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_slice, gp, group=ep_group))
-            if partner in peer_fc2_results:
-                peer_fc2_results[partner].record_stream(comm_stream)
-                p2p_ops.append(dist.P2POp(dist.isend, peer_fc2_results[partner], gp, group=ep_group))
-            if p2p_ops:
-                curr_reqs = dist.batch_isend_irecv(p2p_ops)
-                all_combine_reqs.extend(curr_reqs)
-                if curr_reqs:
-                    curr_reqs[-1].wait()
+            send_buf = peer_fc2_results.get(partner)
+            if send_buf is not None:
+                send_buf.record_stream(comm_stream)
+            _p2p_combine.exchange(
+                send_buf=send_buf,
+                recv_buf=recv_slice,
+                partner_global_rank=_combine_global_partners[round_idx],
+                partner_local_rank=partners[round_idx],
+                group=ep_group, comm_stream=comm_stream, event=None,
+            )
         nvtx_range_pop()
 
         # Parallel with current P2P: compute next round FC2 or local FC2
@@ -1195,12 +1212,9 @@ def fc2_combine_p2p_forward(
                 all_expert_probs = rank_major_probs[backward_indices['row_idx_rank_to_exp']]
         nvtx_range_pop()
 
-    # Same rationale as dispatch_fc1_p2p: make default_stream observe NCCL
-    # completion before local writes read from combined_output or the function
-    # returns and drops temporary tensors.
     nvtx_range_push("combine_wait_all")
-    if all_combine_reqs:
-        all_combine_reqs[-1].wait()
+    if _p2p_combine.needs_final_wait():
+        _p2p_combine.final_wait()
     nvtx_range_pop()
 
     # Handle no partners case (ep_size=1): compute local FC2

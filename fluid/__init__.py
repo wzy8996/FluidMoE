@@ -44,6 +44,8 @@ from .core import (
     # Scheduler
     BackwardScheduler,
     get_backward_scheduler,
+    # P2P Backend
+    get_p2p_backend,
 )
 
 # =============================================================================
@@ -102,6 +104,8 @@ __all__ = [
     "MultiCardOverlapContext",
     # Core - Scheduler
     "BackwardScheduler",
+    # Core - P2P Backend
+    "get_p2p_backend",
     "get_backward_scheduler",
 
     # MoE - Forward operations

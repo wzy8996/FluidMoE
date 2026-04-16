@@ -46,6 +46,7 @@ class StreamManager:
             self._data_ready_event = None
             self._sync_event_pool = {}
             self._streams_initialized = False
+            self._nvshmem_initialized = False
             StreamManager._initialized = True
 
     def _ensure_initialized(self, device: Optional[torch.device] = None):
@@ -105,6 +106,35 @@ class StreamManager:
                 )
             return
         self._ensure_initialized(device)
+
+    def init_nvshmem(self):
+        """Initialize NVSHMEM (called once by NVSHMEMBackend)."""
+        if self._nvshmem_initialized:
+            return
+        with self._lock:
+            if self._nvshmem_initialized:
+                return
+            import os
+            if "NVSHMEM_BOOTSTRAP" not in os.environ:
+                os.environ["NVSHMEM_BOOTSTRAP"] = "pmi"
+            from fluid.csrc import nvshmem_init
+            nvshmem_init()
+            self._nvshmem_initialized = True
+            import atexit
+            atexit.register(self._finalize_nvshmem)
+
+    def _finalize_nvshmem(self):
+        if self._nvshmem_initialized:
+            try:
+                from fluid.csrc import nvshmem_finalize
+                nvshmem_finalize()
+            except Exception:
+                pass
+            self._nvshmem_initialized = False
+
+    @property
+    def nvshmem_initialized(self) -> bool:
+        return self._nvshmem_initialized
 
 
 def get_stream_manager() -> StreamManager:
