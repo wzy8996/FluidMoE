@@ -1,9 +1,9 @@
 """
 Overlap ratio analyzer (single metric output).
 
-输出: 仅打印一个 overlap_ratio 数值（rank0）
+Output: prints a single overlap_ratio value (on rank 0).
 
-用法:
+Usage:
   torchrun --nproc_per_node=<N> tools/overlap_ratio_analyzer.py --model qwen_moe_a2_7b
 """
 import argparse

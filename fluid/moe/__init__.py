@@ -31,8 +31,6 @@ Key design principles:
 from .forward import (
     EPPlan,
     router_forward,
-    merge_tokens_expert_major,
-    precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
     fc2_combine_p2p_forward,
 )
@@ -50,8 +48,6 @@ __all__ = [
     # Forward operations (P2P overlap)
     'EPPlan',
     'router_forward',
-    'merge_tokens_expert_major',
-    'precompute_backward_sort_indices',
     'dispatch_fc1_p2p_forward',
     'fc2_combine_p2p_forward',
     # Region 1: combine AllToAll → FC2 dx (communication-first)

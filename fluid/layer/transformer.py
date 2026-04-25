@@ -96,6 +96,10 @@ class TransformerLayerFunction(torch.autograd.Function):
         te_qkv_linear=None,
         te_proj_linear=None,
         te_attn=None,
+        # MoE stability options (Megatron-aligned).
+        router_dtype: torch.dtype = torch.bfloat16,
+        aux_loss_coeff: float = 0.0,
+        z_loss_coeff: float = 0.0,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
         needs_grad = hidden_states.requires_grad
@@ -108,7 +112,6 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         cp_size = cp_group.size()
         ep_size = ep_group.size()
-        my_ep_rank = ep_group.rank()
         num_local_experts = num_experts // ep_size
         head_dim = hidden_size // num_heads
 
@@ -128,6 +131,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # QKV Projection with P2P overlap (uses TE Linear when available)
         # Returns q, k, v in format [seq_full, batch, heads_local, head_dim]
+        # Layout: rank-major-contiguous (FluidMoE's natural P2P assembly).
         q_hp, k_hp, v_hp = qkv_projection_p2p_forward(
             ln1_out, qkv_weight_d, num_heads, num_kv_heads, head_dim,
             cp_group, attn_overlap_ctx, te_qkv_linear=te_qkv_linear,
@@ -204,49 +208,29 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Router forward (Megatron-aligned: post-softmax routing with TE fused permute)
         (permuted_tokens, permuted_probs, sorted_indices,
-         input_splits, output_splits, tokens_per_expert,
-         top_indices, top_probs, row_id_map) = router_forward(
+         tokens_per_expert, top_indices, top_probs, router_logits,
+         routing_map, row_id_map) = router_forward(
             ln2_flat, router_weight, num_experts, top_k, ep_group,
             capacity_factor=capacity_factor, ep_plan=ep_plan,
+            router_dtype=router_dtype,
         )
-
-        # Compute splits for dispatch/combine
-        pad_to_cap = capacity_factor > 0
-        if pad_to_cap:
-            expert_capacity = int(math.ceil(
-                num_tokens * top_k / num_experts * capacity_factor))
-            S = num_local_experts * expert_capacity
-            input_splits_list = [S] * ep_group.size()
-            output_splits_list = [S] * ep_group.size()
-            # Metadata is deterministic — skip P2P metadata piggybacking
-            pre_tokens_cpu = torch.full(
-                (ep_group.size(), num_local_experts), expert_capacity, dtype=torch.int64)
-        else:
-            input_splits_list = input_splits.tolist()
-            output_splits_list = output_splits.tolist()
-            pre_tokens_cpu = None
 
         # Dispatch + FC1 with P2P overlap (Megatron-aligned: probs applied between act and FC2)
         (local_tokens, local_act, recv_act_results, recv_buffers,
          moe_partners, _recv_offsets, tokens_cpu,
          local_probs, recv_probs_dict) = dispatch_fc1_p2p_forward(
-            permuted_tokens, moe_w1_d, input_splits_list, output_splits_list,
-            ep_group, moe_overlap_ctx, activation_func, num_local_experts,
-            tokens_per_expert,
-            pre_tokens_cpu=pre_tokens_cpu,
+            permuted_tokens, moe_w1_d, ep_group, moe_overlap_ctx,
+            activation_func, num_local_experts, ep_plan,
             permuted_probs=permuted_probs,
-            ep_plan=ep_plan,
         )
 
-        # FC2 + Combine with P2P overlap (uses tokens_cpu from dispatch)
+        # FC2 + Combine with P2P overlap
         (combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert,
          backward_indices, all_expert_probs) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
-            moe_w2_d, input_splits_list, output_splits_list,
-            ep_group, moe_overlap_ctx, num_local_experts,
-            moe_partners, tokens_cpu, needs_backward=needs_grad,
+            moe_w2_d, ep_group, moe_overlap_ctx, num_local_experts, ep_plan,
+            needs_backward=needs_grad,
             local_probs=local_probs, recv_probs=recv_probs_dict,
-            ep_plan=ep_plan,
         )
 
         # Unpermute: scatter FC2 output back to token positions (NO probs — already applied inside experts)
@@ -292,6 +276,15 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.backward_indices = backward_indices
             # tokens_per_expert for router backward (in fused path, includes padding entries)
             ctx.tokens_per_expert = tokens_per_expert
+            # Router states for aux / z loss backward (injected manually since we're
+            # in a custom autograd.Function and Megatron's MoEAuxLossAutoScaler
+            # can't reach inside us).
+            ctx.router_dtype = router_dtype
+            ctx.aux_loss_coeff = float(aux_loss_coeff)
+            ctx.z_loss_coeff = float(z_loss_coeff)
+            if aux_loss_coeff > 0 or z_loss_coeff > 0:
+                ctx._router_logits = router_logits  # [T, E] in router_dtype
+                ctx._routing_map = routing_map      # [T, E] bool (post capacity)
             # Save SDPA computation graph (avoids redundant forward in backward)
             # FlashAttention only stores logsumexp O(seq), not attention matrix O(seq²)
             ctx._q_for_attn = q_for_attn
@@ -331,9 +324,11 @@ class TransformerLayerFunction(torch.autograd.Function):
             ctx.head_dim = head_dim
             ctx.scale = scale
 
-            # MoE routing info
-            ctx.input_splits_list = input_splits_list
-            ctx.output_splits_list = output_splits_list
+            # MoE routing info (all from EPPlan; static in padded mode).
+            ctx.input_splits_list = ep_plan.input_splits_list
+            ctx.output_splits_list = ep_plan.output_splits_list
+            # Pre-built padded expert_ids for router_backward.
+            ctx.expert_ids_gpu = ep_plan.expert_ids_gpu
 
             # Shape info
             ctx.seq_len = seq_len
@@ -378,7 +373,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         k_for_attn = ctx._k_for_attn
         v_for_attn = ctx._v_for_attn
         attn_out_bf = ctx._attn_out_bf
-        enable_gqa = ctx._enable_gqa
 
         # Retrieve config
         cp_group = ctx.cp_group
@@ -395,7 +389,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         activation_func = ctx.activation_func
         num_local_experts = ctx.num_local_experts
         head_dim = ctx.head_dim
-        scale = ctx.scale
 
         input_splits_list = ctx.input_splits_list
         output_splits_list = ctx.output_splits_list
@@ -419,7 +412,6 @@ class TransformerLayerFunction(torch.autograd.Function):
         scheduler = get_backward_scheduler()
         dtype = hidden_states.dtype
         device = grad_output.device
-        cp_size = cp_group.size()
 
         # MoE weights are already 3D: [num_local_experts, hidden/ffn, ffn/hidden]
         moe_w1 = moe_w1_2d  # Already in shape [E, hidden, ffn]
@@ -506,13 +498,21 @@ class TransformerLayerFunction(torch.autograd.Function):
         grad_ln2_bias = None
 
         if is_enabled:
-            # --- router backward (no weight, just compute) ---
+            # Router backward as a queued task — runs DURING moe_dispatch's A2A
+            # overlap window on default_stream, not before it. Inline (pre-region)
+            # would push moe_dispatch's A2A start later by router_backward's
+            # duration on default_stream (~5-10ms regression).
             _grad_permuted_probs = grad_permuted_probs.detach()
             _sorted_indices = sorted_indices
             _tokens_per_expert = tokens_per_expert
             _top_indices = top_indices
             _top_probs = top_probs
             _router_weight = router_weight
+            _expert_ids_gpu = ctx.expert_ids_gpu
+            _aux_loss_coeff = getattr(ctx, 'aux_loss_coeff', 0.0)
+            _z_loss_coeff = getattr(ctx, 'z_loss_coeff', 0.0)
+            _router_logits_saved = getattr(ctx, '_router_logits', None)
+            _routing_map_saved = getattr(ctx, '_routing_map', None)
 
             def _router_bwd_task():
                 router_result[0], router_result[1] = router_backward(
@@ -526,6 +526,11 @@ class TransformerLayerFunction(torch.autograd.Function):
                     num_experts=num_experts,
                     top_k=top_k,
                     dtype=dtype,
+                    expert_ids=_expert_ids_gpu,
+                    aux_loss_coeff=_aux_loss_coeff,
+                    z_loss_coeff=_z_loss_coeff,
+                    router_logits=_router_logits_saved,
+                    routing_map=_routing_map_saved,
                 )
                 return None  # no gradient to write
 
@@ -534,14 +539,15 @@ class TransformerLayerFunction(torch.autograd.Function):
                 layer_id=layer_id,
                 compute_fn=_router_bwd_task,
                 weight_param=None,
+                defer=False,  # Python-side consumer: router_result[0] feeds grad_ln2_flat
             )
 
-            # --- router dW (depends on router_result[1] from above) ---
+            # Router dW: depends on router_result[1] from above task.
             _ln2_flat_saved = ln2_flat.detach()
 
             def _router_dw_task():
-                return torch.matmul(_ln2_flat_saved.t().float(),
-                                    router_result[1].float())
+                g = router_result[1]
+                return torch.matmul(_ln2_flat_saved.to(g.dtype).t(), g)
 
             scheduler.register_dw_task(
                 layer_name=f"router_weight_L{layer_id}",
@@ -552,7 +558,7 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Region 2: FC1 dx → Dispatch AllToAll (compute-first pipeline)
         # FC1 dx computed in chunks, each chunk submitted to AllToAll on completion
-        # dW window now also executes: router_bwd → router_dw → moe dW
+        # dW window overlaps: router_dw → moe dW (router_bwd ran inline above)
         row_idx_exp_to_rank = backward_indices['row_idx_exp_to_rank']
 
         scheduler.begin_region('moe_dispatch')
@@ -572,8 +578,9 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         scheduler.end_region()
 
-        # After R2: router_backward already executed in R2 overlap.
-        # Fallback: compute synchronously if scheduler disabled.
+        # FB/F mode: scheduler.enabled or ar_enabled is False, so router_bwd_task
+        # was either not queued or executed synchronously. Run inline as fallback
+        # so router_result is populated for the grad_ln2_flat addition below.
         if not is_enabled:
             router_result[0], router_result[1] = router_backward(
                 grad_permuted_probs=grad_permuted_probs,
@@ -586,6 +593,11 @@ class TransformerLayerFunction(torch.autograd.Function):
                 num_experts=num_experts,
                 top_k=top_k,
                 dtype=dtype,
+                expert_ids=ctx.expert_ids_gpu,
+                aux_loss_coeff=getattr(ctx, 'aux_loss_coeff', 0.0),
+                z_loss_coeff=getattr(ctx, 'z_loss_coeff', 0.0),
+                router_logits=getattr(ctx, '_router_logits', None),
+                routing_map=getattr(ctx, '_routing_map', None),
             )
             grad_router_weight = register_router_dw_task(
                 hidden_states=ln2_flat,
@@ -594,7 +606,7 @@ class TransformerLayerFunction(torch.autograd.Function):
                 layer_id=layer_id,
             )
 
-        # Combine MoE gradients
+        # Combine MoE gradients.
         grad_ln2_flat = grad_hidden_from_moe_tokens + router_result[0]
 
         # LayerNorm 2 backward (TE fused kernel: computes dx, dw, db in one launch)
@@ -603,11 +615,14 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_ln2_out, hidden_after_attn, ln2_mu, ln2_rsigma, ln2_weight)
         grad_hidden_after_attn = grad_hidden_after_attn + grad_ln2_dx
 
-        # Register dW tasks for LN2 (execute during R3 overlap)
+        # Register dW tasks for LN2. NSYS-verified: keeping LN as queued tasks
+        # (vs immediate flat-buffer write) yields more, smaller AR kernels in
+        # dp_tail's commit-per-task path. NCCL is markedly less efficient on
+        # medium-to-large AllReduce — empirically 8.6ms/100MB vs 19ms/200MB —
+        # so smaller AR granularity wins by ~22ms/iter overall.
         if is_enabled:
             _ln2_dw = grad_ln2_weight_val.detach()
             _ln2_db = grad_ln2_bias_val.detach()
-
             scheduler.register_dw_task(
                 layer_name=f"ln2_weight_L{layer_id}",
                 layer_id=layer_id,
@@ -658,10 +673,10 @@ class TransformerLayerFunction(torch.autograd.Function):
                 attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
                 grad_attn_3d, retain_graph=False
             )
-            # grad_q/k/v are sbhd 4D [seq, batch, heads, dim] → convert to bhsd for hp2sp_qkv_backward
-            grad_q = grad_q.permute(1, 2, 0, 3)
-            grad_k = grad_k.permute(1, 2, 0, 3)
-            grad_v = grad_v.permute(1, 2, 0, 3)
+            # grad_q/k/v are sbhd 4D [seq, batch, heads, dim]
+            grad_q = grad_q.permute(1, 2, 0, 3).contiguous()
+            grad_k = grad_k.permute(1, 2, 0, 3).contiguous()
+            grad_v = grad_v.permute(1, 2, 0, 3).contiguous()
         else:
             # PyTorch SDPA: attn_out_bf is bhsd [batch, heads, seq, dim]
             grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
@@ -692,11 +707,10 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_ln1_out, hidden_states, ln1_mu, ln1_rsigma, ln1_weight)
         grad_hidden_states = grad_hidden_states + grad_ln1_dx
 
-        # Register dW tasks for LN1 (execute during next layer's R1)
+        # Register dW tasks for LN1 (same nsys-verified rationale as LN2 above).
         if is_enabled:
             _ln1_dw = grad_ln1_weight_val.detach()
             _ln1_db = grad_ln1_bias_val.detach()
-
             scheduler.register_dw_task(
                 layer_name=f"ln1_weight_L{layer_id}",
                 layer_id=layer_id,
@@ -735,6 +749,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             None,                 # chunk_config
             None, None,           # ep_plan, cp_plan
             None, None, None,     # te_qkv_linear, te_proj_linear, te_attn
+            None, None, None,     # router_dtype, aux_loss_coeff, z_loss_coeff
         )
 
 
@@ -782,6 +797,10 @@ class TransformerLayer(nn.Module):
         output_init_std: Optional[float] = None,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        # MoE stability options (Megatron-aligned).
+        router_dtype: torch.dtype = torch.bfloat16,
+        aux_loss_coeff: float = 0.0,
+        z_loss_coeff: float = 0.0,
     ):
         super().__init__()
 
@@ -801,6 +820,9 @@ class TransformerLayer(nn.Module):
         from fluid.core.te_ops import te_gelu
         self.activation_func = activation_func or te_gelu
         self.capacity_factor = capacity_factor
+        self.router_dtype = router_dtype
+        self.aux_loss_coeff = aux_loss_coeff
+        self.z_loss_coeff = z_loss_coeff
         self.init_std = init_std
         self.output_init_std = output_init_std if output_init_std is not None else init_std
         self._moe_chunk_config = None  # lazily computed on first forward
@@ -808,6 +830,8 @@ class TransformerLayer(nn.Module):
         self._ep_plan = None  # created on first forward (pad mode only)
         self._cp_plan = None  # created on first forward (cp>1 only)
         self._plan_sig = None  # (seq, batch, dtype, device) for plan invalidation
+        self._shared_qkv_send_slots = None
+        self._shared_proj_recv_slots = None
 
         self.cp_group = cp_group
         self.ep_group = ep_group
@@ -977,9 +1001,6 @@ class TransformerLayer(nn.Module):
     def _build_moe_chunk_config(self, x: torch.Tensor):
         """Build static MoE chunk config for the current input shape."""
         signature = (int(x.shape[0]), int(x.shape[1]))
-        if self.capacity_factor <= 0:
-            return None, None, signature
-
         seq_len, batch_size, _ = x.shape
         num_tokens = seq_len * batch_size
         nle = self.num_experts // self.ep_group.size()
@@ -1015,10 +1036,10 @@ class TransformerLayer(nn.Module):
             self._cp_plan = None
             self._plan_sig = _sig
 
-        if self._moe_chunk_config is None and self.capacity_factor > 0:
+        if self._moe_chunk_config is None:
             self._moe_chunk_config, _, _ = self._build_moe_chunk_config(x)
 
-        if self._ep_plan is None and self.capacity_factor > 0:
+        if self._ep_plan is None:
             from fluid.moe.forward import EPPlan
             self._ep_plan = EPPlan(
                 num_tokens=x.shape[0] * x.shape[1],
@@ -1036,6 +1057,12 @@ class TransformerLayer(nn.Module):
                 num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
                 head_dim=x.shape[2] // self.num_heads,
                 cp_group=self.cp_group, overlap_ctx=self.attn_overlap_ctx,
+            )
+
+        if self._cp_plan is not None and self._shared_qkv_send_slots is not None:
+            self._cp_plan.set_shared_slots(
+                self._shared_qkv_send_slots,
+                self._shared_proj_recv_slots,
             )
 
         return TransformerLayerFunction.apply(
@@ -1057,6 +1084,7 @@ class TransformerLayer(nn.Module):
             self._moe_chunk_config,
             self._ep_plan, self._cp_plan,
             self.te_qkv_linear, self.te_proj_linear, self.te_attn,
+            self.router_dtype, self.aux_loss_coeff, self.z_loss_coeff,
         )
 
 
@@ -1083,9 +1111,16 @@ class TransformerModel(nn.Module):
         init_std: float = 0.02,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        # MoE stability options (Megatron-aligned).
+        router_dtype: torch.dtype = torch.bfloat16,
+        aux_loss_coeff: float = 0.0,
+        z_loss_coeff: float = 0.0,
     ):
         super().__init__()
         self._chunk_check_signature = None
+        self._shared_cp_slot_signature = None
+        self._shared_qkv_send_slots = None
+        self._shared_proj_recv_slots = None
         output_init_std = init_std / math.sqrt(2.0 * max(num_layers, 1))
 
         self.layers = nn.ModuleList([
@@ -1109,6 +1144,9 @@ class TransformerModel(nn.Module):
                 output_init_std=output_init_std,
                 dtype=dtype,
                 device=device,
+                router_dtype=router_dtype,
+                aux_loss_coeff=aux_loss_coeff,
+                z_loss_coeff=z_loss_coeff,
             )
             for i in range(num_layers)
         ])
@@ -1128,33 +1166,21 @@ class TransformerModel(nn.Module):
         seq_full = seq_local * cp_size
         messages = []
 
-        if layer0.capacity_factor > 0:
-            moe_cfg, cap, _ = layer0._build_moe_chunk_config(x)
-            for layer in self.layers:
-                layer._moe_chunk_config = moe_cfg
-                layer._moe_chunk_signature = signature
+        moe_cfg, cap, _ = layer0._build_moe_chunk_config(x)
+        for layer in self.layers:
+            layer._moe_chunk_config = moe_cfg
+            layer._moe_chunk_signature = signature
 
-            if layer0.moe_combine_chunks > 1 and (moe_cfg is None or moe_cfg.get("r1") is None):
-                messages.append(
-                    f"R1 moe_combine_chunks={layer0.moe_combine_chunks} will fallback to 1 "
-                    f"(cap={cap} is not divisible)"
-                )
-            if layer0.moe_dispatch_chunks > 1 and (moe_cfg is None or moe_cfg.get("r2") is None):
-                messages.append(
-                    f"R2 moe_dispatch_chunks={layer0.moe_dispatch_chunks} will fallback to 1 "
-                    f"(cap={cap} is not divisible)"
-                )
-        else:
-            if layer0.moe_combine_chunks > 1:
-                messages.append(
-                    "R1 moe_combine_chunks cannot be prevalidated because capacity_factor<=0 "
-                    "(runtime MoE splits are dynamic)"
-                )
-            if layer0.moe_dispatch_chunks > 1:
-                messages.append(
-                    "R2 moe_dispatch_chunks cannot be prevalidated because capacity_factor<=0 "
-                    "(runtime MoE splits are dynamic)"
-                )
+        if layer0.moe_combine_chunks > 1 and (moe_cfg is None or moe_cfg.get("r1") is None):
+            messages.append(
+                f"R1 moe_combine_chunks={layer0.moe_combine_chunks} will fallback to 1 "
+                f"(cap={cap} is not divisible)"
+            )
+        if layer0.moe_dispatch_chunks > 1 and (moe_cfg is None or moe_cfg.get("r2") is None):
+            messages.append(
+                f"R2 moe_dispatch_chunks={layer0.moe_dispatch_chunks} will fallback to 1 "
+                f"(cap={cap} is not divisible)"
+            )
 
         if layer0.attn_proj_chunks > 1 and seq_local % layer0.attn_proj_chunks != 0:
             messages.append(
@@ -1171,13 +1197,7 @@ class TransformerModel(nn.Module):
         return messages
 
     def _init_shared_cp_slots(self, x: torch.Tensor):
-        """Placeholder for shared CP P2P slot allocation.
-
-        Currently disabled: persistent GPU buffers hurt CUDA caching allocator
-        performance in backward. Slots code is preserved in CPPlan for future
-        use when a fragmentation-free allocation strategy is available.
-        """
-        pass
+        return
 
     def setup_ar_buffer(self):
         """Set up flat AR buffers for zero-copy trickle slicing.

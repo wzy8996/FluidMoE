@@ -12,9 +12,6 @@ from .comm import (
     _all_to_all,
     _all_to_all_sp2hp_forward,
     _all_to_all_hp2sp_forward,
-    # P2P Scheduling
-    compute_round_robin_schedule,
-    get_partner_for_round,
     # Overlap Context
     MultiCardOverlapContext,
 )
@@ -43,9 +40,6 @@ __all__ = [
     '_all_to_all',
     '_all_to_all_sp2hp_forward',
     '_all_to_all_hp2sp_forward',
-    # P2P Schedule
-    'compute_round_robin_schedule',
-    'get_partner_for_round',
     # Overlap Context
     'MultiCardOverlapContext',
     # Scheduler

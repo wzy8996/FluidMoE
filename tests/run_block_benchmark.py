@@ -30,11 +30,15 @@ class _NullScheduler:
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
-    parser.add_argument("--model", type=str, default="mixtral_8x7b", help="模型名称 (from tools/model_configs.py)")
+    parser.add_argument("--model", type=str, default="mixtral_8x7b", help="Model name (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe",
-                        choices=["megatron", "megatron-overlap", "megatron-overlap-dw", "fluidmoe", "deepspeed"],
-                        help="选择运行的实现")
-    parser.add_argument("--list-models", action="store_true", help="打印可用模型并退出")
+                        choices=["megatron", "megatron-overlap", "megatron-overlap-dw",
+                                 "fluidmoe", "fluidmoe-f", "fluidmoe-fb", "fluidmoe-full",
+                                 "deepspeed"],
+                        help="Implementation to run. fluidmoe-{f,fb,full} map to "
+                             "FluidMoE mechanism variants (forward only / +backward / all). "
+                             "Plain 'fluidmoe' is an alias for 'fluidmoe-full'.")
+    parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
     parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])
     parser.add_argument("--ep-size", type=int, default=defaults["ep_size"])
@@ -56,26 +60,32 @@ _ar_bufs = {}  # cache: model_id -> result dict
 
 
 def _build_ar_buffers(model):
-    """按 dtype 分组构建 flat buffer，所有参数的 grad 都指向 buffer 视图，零额外分配。"""
+    """Build flat buffers grouped by dtype; all param grads are views into the buffer (zero extra alloc)."""
     mid = id(model)
     if mid in _ar_bufs:
         return _ar_bufs[mid]
 
     device = next(model.parameters()).device
 
-    # 按 is_expert 分组，buffer 统一用 fp32（matching Megatron's
-    # accumulate_allreduce_grads_in_fp32 convention）
+    # Group by is_expert; buffer uses the param dtype (matches Megatron
+    # grad_reduce_in_fp32=False semantics).
     groups = {}  # is_expert -> [params]
     for name, p in model.named_parameters():
         is_expert = "moe_w1" in name or "moe_w2" in name or ".experts." in name
         groups.setdefault(is_expert, []).append(p)
 
-    # 为每组构建 fp32 flat buffer
+    # One flat buffer per group, matching the param dtype.
     flat_bufs = {}  # (is_expert, dtype) -> (flat_tensor, [params])
     for is_expert, params in groups.items():
         numel = sum(p.numel() for p in params)
-        flat = torch.zeros(numel, dtype=torch.float32, device=device)
-        flat_bufs[(is_expert, torch.float32)] = (flat, params)
+        grad_dtype = params[0].dtype
+        flat = torch.zeros(numel, dtype=grad_dtype, device=device)
+        offset = 0
+        for p in params:
+            n = p.numel()
+            p.main_grad = flat[offset:offset + n].view(p.shape)
+            offset += n
+        flat_bufs[(is_expert, grad_dtype)] = (flat, params)
 
     _ar_bufs[mid] = flat_bufs
     return flat_bufs
@@ -88,16 +98,16 @@ def zero_grad(model):
 
 
 def copy_grads_to_flat_and_allreduce(model, dp_size, all_group, dp_group):
-    """Copy bf16 grads into fp32 flat buffer, pre-scale by 1/dp_cp_size, then allreduce.
+    """Copy grads into flat buffers in grad dtype, pre-scale, then allreduce.
 
-    Matches Megatron DDP convention: accumulate_allreduce_grads_in_fp32 + pre-scale + SUM.
+    Matches Megatron DDP behavior when grad_reduce_in_fp32=False: communication
+    buffer and main_grad both use param dtype.
     """
     flat_bufs = _build_ar_buffers(model)
     dp_cp_size = dist.get_world_size(all_group)
     pre_scale = 1.0 / dp_cp_size if dp_cp_size > 1 else 1.0
 
     for (is_expert, _dt), (flat, params) in flat_bufs.items():
-        # Copy bf16 grads → fp32 flat buffer
         offset = 0
         for p in params:
             n = p.numel()
@@ -107,22 +117,20 @@ def copy_grads_to_flat_and_allreduce(model, dp_size, all_group, dp_group):
                 flat[offset:offset + n].zero_()
             offset += n
 
-        # Pre-scale (Megatron convention)
         if pre_scale != 1.0:
             flat.mul_(pre_scale)
 
-        # Allreduce
         if is_expert:
             if dp_size > 1:
                 dist.all_reduce(flat, group=dp_group)
         else:
             dist.all_reduce(flat, group=all_group)
 
-        # Write back fp32 grads as param.grad (bf16 for optimizer compatibility)
         offset = 0
         for p in params:
             n = p.numel()
-            p.grad = flat[offset:offset + n].view(p.shape).to(p.dtype)
+            p.main_grad = flat[offset:offset + n].view(p.shape)
+            p.grad = None
             offset += n
 
 
@@ -172,22 +180,22 @@ def main():
     ep_size = args.ep_size
     num_gpus = dp_size * cp_size
 
-    assert ep_size == cp_size, f"当前仅支持 ep=cp, 但 ep={ep_size}, cp={cp_size}"
-    assert world_size >= num_gpus, f"需要至少 {num_gpus} GPU, 但只有 {world_size}"
+    assert ep_size == cp_size, f"only ep=cp supported, got ep={ep_size}, cp={cp_size}"
+    assert world_size >= num_gpus, f"need at least {num_gpus} GPUs, got {world_size}"
     assert world_size == num_gpus, (
         f"world_size={world_size} != dp*cp={num_gpus}, "
-        f"多余的 {world_size - num_gpus} 个进程会直接退出。"
-        f"请设置 NPROC_PER_NODE={num_gpus} 或调整 dp/cp"
+        f"{world_size - num_gpus} extra processes would exit immediately. "
+        f"Set NPROC_PER_NODE={num_gpus} or adjust dp/cp."
     )
-    assert seq_len % cp_size == 0, f"seq_len={seq_len} 不能被 cp_size={cp_size} 整除"
+    assert seq_len % cp_size == 0, f"seq_len={seq_len} not divisible by cp_size={cp_size}"
     assert num_experts % ep_size == 0, (
-        f"num_experts={num_experts} 不能被 ep_size={ep_size} 整除"
+        f"num_experts={num_experts} not divisible by ep_size={ep_size}"
     )
     assert num_heads % cp_size == 0, (
-        f"num_heads={num_heads} 不能被 cp_size={cp_size} 整除"
+        f"num_heads={num_heads} not divisible by cp_size={cp_size}"
     )
     assert num_kv_heads % cp_size == 0, (
-        f"num_kv_heads={num_kv_heads} 不能被 cp_size={cp_size} 整除"
+        f"num_kv_heads={num_kv_heads} not divisible by cp_size={cp_size}"
     )
     seq_local = seq_len // cp_size
 
@@ -221,7 +229,7 @@ def main():
     p0(rank, f"  experts={num_experts}, top_k={top_k}, layers={num_layers}")
     p0(rank, f"  seq={seq_len}, batch={batch_size}, GPUs={num_gpus}")
     p0(rank, f"  dp={dp_size}, cp={cp_size}, ep={ep_size}")
-    if args.impl == "fluidmoe":
+    if args.impl.startswith("fluidmoe"):
         p0(rank, f"  chunks: R1={args.moe_combine_chunks}, R2={args.moe_dispatch_chunks}, R3={args.attn_proj_chunks}, R4={args.attn_qkv_chunks}")
     p0(rank, "=" * 60)
 
@@ -274,7 +282,7 @@ def main():
         impl_name = args.impl.capitalize()
         scheduler = _NullScheduler()
 
-        # 预分配 flat buffer，将 param.grad 设为其视图，避免 backward 额外分配梯度
+        # Preallocate flat buffer and bind param.main_grad to its views.
         _build_ar_buffers(model)
 
         def run_baseline_bwd():
@@ -371,17 +379,38 @@ def main():
     torch.cuda.synchronize()
     fluidmoe_fwd = ev_s.elapsed_time(ev_e) / args.iters
 
+    # Three FluidMoE mechanism variants (paper §5.4 Component Ablation):
+    #   F    = forward tournament only (disable scheduler -> sync dW, no chunk, no inline AR)
+    #   FB   = forward + backward schedule (scheduler.enable, ar_enabled=False)
+    #   full = all mechanisms (scheduler.enable, ar_enabled=True)
+    # A plain --impl=fluidmoe reports all three and uses full as the primary.
+    primary = args.impl if args.impl.startswith("fluidmoe") else "fluidmoe-full"
+    if primary == "fluidmoe":
+        primary = "fluidmoe-full"
+
+    # F mode: disable scheduler entirely. register_dw_task becomes a no-op;
+    # TransformerLayerFunction.backward falls back to synchronous dW.
+    scheduler.enabled = False
+    fluidmoe_f = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    scheduler.enabled = True
+    # FB mode: backward schedule on, no inline AR.
     scheduler.ar_enabled = False
-    fluidmoe_sync = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    fluidmoe_fb = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    # full mode: everything on.
     scheduler.ar_enabled = True
-    fluidmoe_interleaved = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    fluidmoe_full = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
 
     tokens_per_iter = seq_len * batch_size * dp_size
-    sync_tokps = tokens_per_iter / (fluidmoe_sync / 1000.0)
-    interleaved_tokps = tokens_per_iter / (fluidmoe_interleaved / 1000.0)
-    p0(rank, f"FluidMoE: forward={fluidmoe_fwd:.2f}ms  sync_iter={fluidmoe_sync:.2f}ms  interleaved_iter={fluidmoe_interleaved:.2f}ms")
-    p0(rank, f"  throughput: sync={sync_tokps:.0f} tok/s  interleaved={interleaved_tokps:.0f} tok/s")
-    p0(rank, f"RESULT impl=fluidmoe forward_ms={fluidmoe_fwd:.6f} sync_iter_ms={fluidmoe_sync:.6f} interleaved_iter_ms={fluidmoe_interleaved:.6f} sync_tokens_per_sec={sync_tokps:.6f} interleaved_tokens_per_sec={interleaved_tokps:.6f}")
+    tokps_f    = tokens_per_iter / (fluidmoe_f    / 1000.0)
+    tokps_fb   = tokens_per_iter / (fluidmoe_fb   / 1000.0)
+    tokps_full = tokens_per_iter / (fluidmoe_full / 1000.0)
+    p0(rank, f"FluidMoE: forward={fluidmoe_fwd:.2f}ms")
+    p0(rank, f"  F (fwd only):    iter={fluidmoe_f:.2f}ms  {tokps_f:.0f} tok/s")
+    p0(rank, f"  FB (fwd+bwd):    iter={fluidmoe_fb:.2f}ms  {tokps_fb:.0f} tok/s")
+    p0(rank, f"  full (+sync AR): iter={fluidmoe_full:.2f}ms  {tokps_full:.0f} tok/s")
+    p0(rank, f"RESULT impl={primary} forward_ms={fluidmoe_fwd:.6f} "
+             f"f_iter_ms={fluidmoe_f:.6f} fb_iter_ms={fluidmoe_fb:.6f} full_iter_ms={fluidmoe_full:.6f} "
+             f"f_tokens_per_sec={tokps_f:.6f} fb_tokens_per_sec={tokps_fb:.6f} full_tokens_per_sec={tokps_full:.6f}")
 
     dist.destroy_process_group()
     p0(rank, "Done!")

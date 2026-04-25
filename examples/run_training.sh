@@ -17,11 +17,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+
 MODEL="${MODEL:-mixtral_8x7b}"
-TRAIN_ITERS="${TRAIN_ITERS:-100}"
-LR_WARMUP="${LR_WARMUP:-10}"
+TRAIN_ITERS="${TRAIN_ITERS:-300}"
+LR_WARMUP="${LR_WARMUP:- 30}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
-SEED="${SEED:-42}"
+SEED="${SEED:-105}"
 HIDDEN_DROPOUT="${HIDDEN_DROPOUT:-0.0}"
 ATTENTION_DROPOUT="${ATTENTION_DROPOUT:-0.0}"
 DATASET_SOURCE="${DATASET_SOURCE:-mock}"
@@ -30,7 +33,7 @@ PROJ_ROOT="$(pwd)"
 
 # Read model config from tools/model_configs.py
 read -r HIDDEN FFN NUM_HEADS NUM_KV_HEADS NUM_EXPERTS TOP_K NUM_LAYERS SEQ_LEN BATCH_SIZE CAP_FACTOR <<< $(
-python -c "
+"${PYTHON_BIN}" -c "
 import sys; sys.path.insert(0, '${PROJ_ROOT}')
 from tools.model_configs import get_model_config
 c = get_model_config('${MODEL}')
@@ -44,7 +47,7 @@ read -r DP_SIZE CP_SIZE EP_SIZE \
      MOE_COMBINE_CHUNKS MOE_DISPATCH_CHUNKS ATTN_PROJ_CHUNKS ATTN_QKV_CHUNKS \
      SHARED_AR_BW EXPERT_AR_BW \
      GAP_MOE_COMBINE GAP_MOE_DISPATCH GAP_ATTN_PROJ GAP_ATTN_QKV <<< $(
-python -c "
+"${PYTHON_BIN}" -c "
 import sys; sys.path.insert(0, '${PROJ_ROOT}')
 from tools.experiment_configs import get_block_benchmark_defaults
 d = get_block_benchmark_defaults()
@@ -63,7 +66,8 @@ NPROC=$((DP_SIZE * CP_SIZE))
 SEQ_LEN="${SEQ_LEN_OVERRIDE:-$((SEQ_LEN > 2048 ? 2048 : SEQ_LEN))}"
 BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${BATCH_SIZE}}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${MICRO_BATCH_SIZE}}"
+# Megatron requires global_batch_size to be divisible by micro_batch_size * dp_size.
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * DP_SIZE))}"
 
 case "${DATASET_SOURCE}" in
     mock)
@@ -128,12 +132,10 @@ COMMON_ARGS=(
     --attention-dropout "${ATTENTION_DROPOUT}"
     --disable-bias-linear
     --log-interval 1
-    --no-save-optim
-    --no-save-rng
-    --save /tmp/fluidmoe_training_ckpt
     --save-interval 10000
     --seed "${SEED}"
     --eval-iters 0
+    --eval-interval 10000
     "${DATASET_ARGS[@]}"
 )
 
@@ -194,21 +196,21 @@ echo "[1/2] Megatron Baseline ..."
 run_training_job \
     "Megatron Baseline" \
     "${MEG_LOG}" \
-    torchrun --nproc_per_node="${NPROC}" examples/pretrain_megatron.py "${COMMON_ARGS[@]}"
+    ${TORCHRUN_BIN} --nproc_per_node="${NPROC}" examples/pretrain_megatron.py "${COMMON_ARGS[@]}"
 echo
 
 echo "[2/2] FluidMoE ..."
 run_training_job \
     "FluidMoE" \
     "${FLUID_LOG}" \
-    torchrun --nproc_per_node="${NPROC}" examples/pretrain_fluidmoe.py "${COMMON_ARGS[@]}"
+    ${TORCHRUN_BIN} --nproc_per_node="${NPROC}" examples/pretrain_fluidmoe.py "${COMMON_ARGS[@]}"
 echo
 
 # ── Summary: compute stable step time (skip first LR_WARMUP steps) ──
 echo "============================================================"
 echo "Summary"
 echo "============================================================"
-python3 -c "
+"${PYTHON_BIN}" -c "
 import re, sys
 
 def parse_log(path, warmup):

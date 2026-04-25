@@ -316,50 +316,26 @@ def compute_round_robin_schedule(num_ranks: int) -> List[List[Tuple[int, int]]]:
     return schedule
 
 
-def get_partner_for_round(my_rank: int, round_idx: int, num_ranks: int) -> int:
-    """
-    Get the partner rank for a specific round.
-
-    Args:
-        my_rank: Current rank
-        round_idx: Round index
-        num_ranks: Total number of ranks
-
-    Returns:
-        partner_rank: Partner rank, -1 if idling this round
-    """
-    schedule = compute_round_robin_schedule(num_ranks)
-    if round_idx >= len(schedule):
-        return -1
-
-    for a, b in schedule[round_idx]:
-        if a == my_rank:
-            return b
-        if b == my_rank:
-            return a
-    return -1  # Idle this round
-
-
 # =============================================================================
 # Multi-Card Overlap Context
 # =============================================================================
 
 class MultiCardOverlapContext:
-    """管理多卡P2P通信重叠所需的CUDA资源
+    """CUDA resources for multi-card P2P communication overlap.
 
-    统一管理 MoE 层和 Attention 层的通信重叠资源：
-    - MoE: dispatch/combine 的多轮 P2P 通信
-    - Attention: QKV sp2hp 和 hp2sp output projection 的 P2P 通信
+    Unified manager for MoE and Attention overlap resources:
+    - MoE: multi-round dispatch/combine P2P
+    - Attention: QKV sp2hp and hp2sp output projection P2P
 
-    使用全局 StreamManager 统一管理 stream，确保前向和反向使用相同的 stream。
+    Uses a global StreamManager so forward and backward share the same stream.
     """
 
     def __init__(self, device: torch.device, ep_size: int, cp_size: int = None):
         """
         Args:
-            device: CUDA 设备
-            ep_size: Expert Parallel size (MoE 通信)
-            cp_size: Context Parallel size (Attention 通信，默认等于 ep_size)
+            device: CUDA device
+            ep_size: Expert Parallel size (MoE communication)
+            cp_size: Context Parallel size (Attention; defaults to ep_size)
         """
         from fluid.core.stream import get_stream_manager
 
@@ -368,32 +344,45 @@ class MultiCardOverlapContext:
         self.cp_size = cp_size if cp_size is not None else ep_size
         self.num_rounds = ep_size - 1 if ep_size % 2 == 0 else ep_size
 
-        # 使用全局 StreamManager 统一管理 stream
+        # Shared stream across forward and backward.
         self._stream_manager = get_stream_manager()
         self._stream_manager.initialize(device)
 
-        # 预计算调度表
+        # Precomputed round-robin schedule.
         self.schedule = compute_round_robin_schedule(ep_size)
 
-        # 缓存：my_rank的每轮partner
+        # Per-(rank, round) partner cache.
         self._partner_cache = {}
 
     @property
     def comm_stream(self) -> torch.cuda.Stream:
-        """通信流（从 StreamManager 获取）"""
+        """Communication stream (from StreamManager)."""
         return self._stream_manager.comm_stream
 
     @property
     def data_ready_event(self) -> torch.cuda.Event:
-        """数据就绪事件（从 StreamManager 获取）"""
+        """Data-ready event (from StreamManager)."""
         return self._stream_manager.data_ready_event
 
     def get_partner(self, my_rank: int, round_idx: int) -> int:
-        """获取指定轮次的partner（带缓存）"""
+        """Partner rank for the given round (reads cached self.schedule, memoized per (rank, round))."""
         cache_key = (my_rank, round_idx)
-        if cache_key not in self._partner_cache:
-            self._partner_cache[cache_key] = get_partner_for_round(my_rank, round_idx, self.ep_size)
-        return self._partner_cache[cache_key]
+        cached = self._partner_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if round_idx >= len(self.schedule):
+            partner = -1
+        else:
+            partner = -1
+            for a, b in self.schedule[round_idx]:
+                if a == my_rank:
+                    partner = b
+                    break
+                if b == my_rank:
+                    partner = a
+                    break
+        self._partner_cache[cache_key] = partner
+        return partner
 
     def get_stream(self) -> torch.cuda.Stream:
         return self.comm_stream
@@ -408,9 +397,6 @@ __all__ = [
     '_all_to_all',
     '_all_to_all_sp2hp_forward',
     '_all_to_all_hp2sp_forward',
-    # P2P Scheduling
-    'compute_round_robin_schedule',
-    'get_partner_for_round',
     # Overlap Context
     'MultiCardOverlapContext',
 ]

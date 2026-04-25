@@ -36,9 +36,6 @@ from .core import (
     _all_to_all,
     _all_to_all_sp2hp_forward,
     _all_to_all_hp2sp_forward,
-    # P2P scheduling
-    compute_round_robin_schedule,
-    get_partner_for_round,
     # Overlap context
     MultiCardOverlapContext,
     # Scheduler
@@ -54,8 +51,6 @@ from .core import (
 from .moe import (
     # Forward operations
     router_forward,
-    merge_tokens_expert_major,
-    precompute_backward_sort_indices,
     dispatch_fc1_p2p_forward,
     fc2_combine_p2p_forward,
     # Backward - Region 1 & 2
@@ -97,9 +92,6 @@ __all__ = [
     "_all_to_all",
     "_all_to_all_sp2hp_forward",
     "_all_to_all_hp2sp_forward",
-    # Core - P2P scheduling
-    "compute_round_robin_schedule",
-    "get_partner_for_round",
     # Core - Overlap context
     "MultiCardOverlapContext",
     # Core - Scheduler
@@ -110,8 +102,6 @@ __all__ = [
 
     # MoE - Forward operations
     "router_forward",
-    "merge_tokens_expert_major",
-    "precompute_backward_sort_indices",
     "dispatch_fc1_p2p_forward",
     "fc2_combine_p2p_forward",
     # MoE - Backward (Region 1 & 2)

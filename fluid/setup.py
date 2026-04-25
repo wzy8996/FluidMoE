@@ -37,7 +37,7 @@ class FluidDDP(torch.nn.Module):
 
     def __init__(self, config, module, scheduler):
         super().__init__()
-        self.module = module  # Float16Module-wrapped FluidMoEModel
+        self.module = module  # Float16Module-wrapped Megatron GPTModel
         self.config = config
         from megatron.core.distributed import DistributedDataParallelConfig
         self.ddp_config = DistributedDataParallelConfig()
@@ -47,27 +47,44 @@ class FluidDDP(torch.nn.Module):
         self._configure_scheduler()
 
     def _get_raw_model(self):
-        """Navigate through Float16Module to get FluidMoEModel."""
+        """Navigate through Float16Module to get the underlying model."""
         raw = self.module
         if hasattr(raw, 'module'):
             raw = raw.module
         return raw
 
+    def _collect_fluid_layers(self):
+        """Return list of inner FluidMoE TransformerLayer instances.
+
+        Megatron GPTModel with FluidTransformerLayer adapter:
+            decoder.layers[i].layer is the FluidMoE TransformerLayer
+        A layer is recognized by having _get_qkv_weight (method unique to it).
+        """
+        raw = self._get_raw_model()
+        if not hasattr(raw, 'decoder') or not hasattr(raw.decoder, 'layers'):
+            return []
+        fluid_layers = []
+        for layer in raw.decoder.layers:
+            if hasattr(layer, '_get_qkv_weight'):
+                fluid_layers.append(layer)
+            elif hasattr(layer, 'layer') and hasattr(layer.layer, '_get_qkv_weight'):
+                fluid_layers.append(layer.layer)
+        return fluid_layers
+
     def _setup_grad_buffer(self):
         """Allocate contiguous grad buffer for model-level params and register hooks."""
         from megatron.core import parallel_state as ps
 
-        raw_model = self._get_raw_model()
+        # Params managed by the scheduler: everything inside FluidMoE TransformerLayers.
+        scheduler_param_ids = set()
+        for fluid_layer in self._collect_fluid_layers():
+            for p in fluid_layer.parameters():
+                scheduler_param_ids.add(id(p))
 
-        # Identify decoder params (managed by scheduler)
-        decoder_param_ids = set()
-        if hasattr(raw_model, 'decoder'):
-            for p in raw_model.decoder.parameters():
-                decoder_param_ids.add(id(p))
-
-        # Model-level params: everything NOT in decoder
+        # Model-level params: everything NOT owned by a FluidMoE TransformerLayer
+        # (embedding, final_layernorm, output_layer, etc.)
         self._buffer_params = [
-            p for p in self.module.parameters() if id(p) not in decoder_param_ids
+            p for p in self.module.parameters() if id(p) not in scheduler_param_ids
         ]
 
         if not self._buffer_params:
@@ -81,9 +98,10 @@ class FluidDDP(torch.nn.Module):
         self._dp_cp_group = dp_cp_group if dp_cp_size > 1 else None
         self._dp_cp_size = dp_cp_size
 
-        # Allocate contiguous grad buffer in fp32 (matching Megatron's
-        # accumulate_allreduce_grads_in_fp32=True default).
-        self._buffer_dtype = torch.float32
+        # Allocate contiguous grad buffer in param dtype so communication buffer
+        # and main_grad follow the official Megatron DDP behavior when
+        # grad_reduce_in_fp32=False.
+        self._buffer_dtype = self._buffer_params[0].dtype
         total_numel = sum(p.numel() for p in self._buffer_params)
         self._grad_buffer = torch.zeros(total_numel, dtype=self._buffer_dtype,
                                         device=torch.cuda.current_device())
@@ -94,7 +112,7 @@ class FluidDDP(torch.nn.Module):
         for p in self._buffer_params:
             numel = p.numel()
             self._param_offsets[p] = (offset, numel)
-            # main_grad: optimizer reads from here (contiguous fp32, matching Megatron)
+            # main_grad: optimizer reads from here (contiguous buffer in grad dtype)
             p.main_grad = self._grad_buffer[offset:offset + numel].view(p.shape)
             offset += numel
 
@@ -146,10 +164,23 @@ class FluidDDP(torch.nn.Module):
             gap_budgets=gap_budgets if gap_budgets else None,
         )
 
-        # Setup AR buffers for decoder params
-        raw_model = self._get_raw_model()
-        if hasattr(raw_model, 'decoder'):
-            raw_model.decoder.setup_ar_buffer()
+        # Setup AR buffers for FluidMoE TransformerLayer params.
+        fluid_layers = self._collect_fluid_layers()
+        if fluid_layers:
+            shared_params = []
+            expert_params = []
+            for layer in reversed(fluid_layers):
+                expert_params.extend([layer.moe_w2, layer.moe_w1])
+                shared_params.extend([
+                    layer.router_weight,
+                    layer.ln2_weight, layer.ln2_bias,
+                    layer._get_proj_weight(),
+                    layer._get_qkv_weight(),
+                    layer.ln1_weight, layer.ln1_bias,
+                ])
+            self._scheduler.setup_ar_buffer(shared_params)
+            if expert_params:
+                self._scheduler.setup_expert_ar_buffer(expert_params)
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -165,7 +196,7 @@ class FluidDDP(torch.nn.Module):
         if self._grad_buffer is not None:
             self._grad_buffer.zero_()
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: bool = False):
         """Complete all gradient computation and synchronization.
 
         1. scheduler.finish_batch(): decoder params dW + AR

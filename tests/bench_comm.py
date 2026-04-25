@@ -16,6 +16,27 @@ import torch
 import torch.distributed as dist
 
 
+def _tournament_partners(my_rank: int, ep_size: int) -> list:
+    """Partner sequence matching production CPPlan/EPPlan (round-robin tournament).
+
+    Each tournament round is a symmetric pair (a↔b) — both ranks see each
+    other as partner in the same round. Mirrors compute_round_robin_schedule
+    in fluid/core/comm.py and the partner-extraction loop in CPPlan.__init__.
+    """
+    from fluid.core.comm import compute_round_robin_schedule
+    schedule = compute_round_robin_schedule(ep_size)
+    partners = []
+    for round_pairs in schedule:
+        for a, b in round_pairs:
+            if a == my_rank:
+                partners.append(b)
+                break
+            if b == my_rank:
+                partners.append(a)
+                break
+    return partners
+
+
 def bench_alltoall(chunk_numel: int, ep_group, device, warmup=10, iters=50):
     """Bulk AllToAll benchmark."""
     ep_size = ep_group.size()
@@ -42,33 +63,33 @@ def bench_alltoall(chunk_numel: int, ep_group, device, warmup=10, iters=50):
 
 
 def bench_p2p_roundrobin(chunk_numel: int, ep_group, device, warmup=10, iters=50):
-    """P2P round-robin benchmark (matching FluidMoE forward pattern).
+    """P2P round-robin benchmark using production tournament schedule.
 
+    Each round is a symmetric pair (a↔b) — same partner for send and recv,
+    matching the NCCL/NVSHMEM exchange() call in fluid/attention/forward.py.
     One partner at a time: start P2P_i, wait P2P_i, then next.
     """
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
     global_ranks = dist.get_process_group_ranks(ep_group)
+    partners = _tournament_partners(my_rank, ep_size)
+    n_rounds = len(partners)
 
-    # Pre-allocate persistent buffers and pre-compute per-round data (list, not dict)
-    rounds = []
     send_buf_list = []
     recv_buf_list = []
-    for r in range(1, ep_size):
-        send_to = (my_rank + r) % ep_size
-        recv_from = (my_rank - r + ep_size) % ep_size
+    global_partners = []
+    for partner in partners:
         send_buf_list.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
         recv_buf_list.append(torch.empty(chunk_numel, dtype=torch.bfloat16, device=device))
-        rounds.append((global_ranks[recv_from], global_ranks[send_to]))
-    n_rounds = len(rounds)
+        global_partners.append(global_ranks[partner])
 
     def run_once():
         last_reqs = None
         for i in range(n_rounds):
-            gr_recv, gr_send = rounds[i]
+            gr = global_partners[i]
             ops = [
-                dist.P2POp(dist.irecv, recv_buf_list[i], gr_recv, group=ep_group),
-                dist.P2POp(dist.isend, send_buf_list[i], gr_send, group=ep_group),
+                dist.P2POp(dist.irecv, recv_buf_list[i], gr, group=ep_group),
+                dist.P2POp(dist.isend, send_buf_list[i], gr, group=ep_group),
             ]
             last_reqs = dist.batch_isend_irecv(ops)
         for req in last_reqs:
@@ -89,23 +110,20 @@ def bench_p2p_roundrobin(chunk_numel: int, ep_group, device, warmup=10, iters=50
 
 
 def bench_p2p_all_concurrent(chunk_numel: int, ep_group, device, warmup=10, iters=50):
-    """P2P all-pairs concurrent (all send/recv launched at once)."""
+    """P2P all-pairs concurrent using tournament partners (all send/recv launched at once)."""
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
     global_ranks = dist.get_process_group_ranks(ep_group)
+    partners = _tournament_partners(my_rank, ep_size)
+    n_partners = len(partners)
 
-    # Pre-allocate persistent buffers and pre-compute partner data (list, not dict)
-    partner_list = []
     send_buf_list = []
     recv_buf_list = []
     global_partner_list = []
-    for r in range(1, ep_size):
-        partner = (my_rank + r) % ep_size
-        partner_list.append(partner)
+    for partner in partners:
         send_buf_list.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
         recv_buf_list.append(torch.empty(chunk_numel, dtype=torch.bfloat16, device=device))
         global_partner_list.append(global_ranks[partner])
-    n_partners = len(partner_list)
 
     def run_once():
         ops = []
@@ -142,22 +160,25 @@ def _try_nvshmem_backend():
 
 def bench_nvshmem_roundrobin(chunk_numel: int, ep_group, device, nvshmem_backend,
                              warmup=10, iters=50):
-    """NVSHMEM P2P round-robin benchmark (stream-ordered, no blocking wait)."""
+    """NVSHMEM P2P round-robin using production tournament schedule.
+
+    Each round is a symmetric pair (a↔b): both peers issue put+signal and
+    signal_wait against each other in the same round, so the per-round
+    signal handshake closes locally without cross-round dependency.
+    """
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
-    n_rounds = ep_size - 1
+    partners = _tournament_partners(my_rank, ep_size)
+    n_rounds = len(partners)
 
     comm_stream = torch.cuda.Stream(device=device)
 
     send_bufs = []
     recv_bufs = []
-    partners = []
-    for r in range(1, ep_size):
-        partner = (my_rank + r) % ep_size
-        partners.append(partner)
+    for i in range(n_rounds):
         send_bufs.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
         recv_bufs.append(nvshmem_backend.alloc_recv_buffer(
-            f"bench_nvshmem_recv_{r}", chunk_numel, torch.bfloat16, device))
+            f"bench_nvshmem_recv_{i}", chunk_numel, torch.bfloat16, device))
 
     global_ranks = dist.get_process_group_ranks(ep_group)
     events = [torch.cuda.Event() for _ in range(n_rounds)]
@@ -189,36 +210,71 @@ def bench_nvshmem_roundrobin(chunk_numel: int, ep_group, device, nvshmem_backend
 
 def bench_nvshmem_all_concurrent(chunk_numel: int, ep_group, device, nvshmem_backend,
                                  warmup=10, iters=50):
-    """NVSHMEM all-pairs concurrent (all put+signal launched back-to-back)."""
+    """NVSHMEM all-pairs truly concurrent: phase 1 issues all puts, phase 2 waits all signals.
+
+    Uses tournament partners (same set as production) but breaks the per-pair
+    put→wait coupling so multiple puts can be in flight on different NVLinks.
+    Calls the raw NVSHMEM ops directly instead of exchange() because we need
+    a single signal-counter increment per partner per iter (exchange would
+    increment it twice if split into put-only + wait-only halves).
+    """
     my_rank = ep_group.rank()
     ep_size = ep_group.size()
-    n_partners = ep_size - 1
+    partners_local = _tournament_partners(my_rank, ep_size)
+    n_partners = len(partners_local)
 
     comm_stream = torch.cuda.Stream(device=device)
 
-    send_bufs = []
-    recv_bufs = []
-    partners = []
-    for r in range(1, ep_size):
-        partner = (my_rank + r) % ep_size
-        partners.append(partner)
-        send_bufs.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
-        recv_bufs.append(nvshmem_backend.alloc_recv_buffer(
-            f"bench_nvshmem_conc_recv_{r}", chunk_numel, torch.bfloat16, device))
+    nvshmem_backend._ensure_init()
+    nvshmem_backend._ensure_group(ep_group)
+    gid = id(ep_group)
+    partners_pe = [nvshmem_backend._pe_map[gid][p] for p in partners_local]
 
-    global_ranks = dist.get_process_group_ranks(ep_group)
+    _ops = nvshmem_backend._ops
+    SIGNAL_SET = nvshmem_backend._SIGNAL_SET
+    CMP_GE = nvshmem_backend._CMP_GE
+    INT64_SIZE = nvshmem_backend._INT64_SIZE
+    my_pe = nvshmem_backend._my_pe
+    sig_base_local = nvshmem_backend._signal_array.data_ptr()
+
+    send_bufs = []
+    remote_recv_ptrs = []
+    remote_sig_addrs = []
+    local_sig_addrs = []
+    for i, p_pe in enumerate(partners_pe):
+        send_bufs.append(torch.randn(chunk_numel, dtype=torch.bfloat16, device=device))
+        recv_buf = nvshmem_backend.alloc_recv_buffer(
+            f"bench_nvshmem_conc_recv_{i}", chunk_numel, torch.bfloat16, device)
+        rptr = _ops.nvshmem_ptr(recv_buf, p_pe)
+        if rptr == 0:
+            raise RuntimeError(
+                f"nvshmem_ptr returned NULL for PE {p_pe}; "
+                f"recv_buf must live on the symmetric heap.")
+        remote_recv_ptrs.append(rptr)
+        remote_sig_addrs.append(
+            nvshmem_backend._get_remote_signal_base(p_pe) + my_pe * INT64_SIZE)
+        local_sig_addrs.append(sig_base_local + p_pe * INT64_SIZE)
+
+    nbytes = chunk_numel * send_bufs[0].element_size()
+    counters = [nvshmem_backend._signal_counter.get(p_pe, 0) for p_pe in partners_pe]
     final_event = torch.cuda.Event()
+    stream_ptr = comm_stream.cuda_stream
 
     def run_once():
         with torch.cuda.stream(comm_stream):
             for i in range(n_partners):
-                evt = final_event if i == n_partners - 1 else None
-                nvshmem_backend.exchange(
-                    send_buf=send_bufs[i], recv_buf=recv_bufs[i],
-                    partner_global_rank=global_ranks[partners[i]],
-                    partner_local_rank=partners[i],
-                    group=ep_group, comm_stream=comm_stream, event=evt,
+                send_bufs[i].record_stream(comm_stream)
+                counters[i] += 1
+                _ops.putmem_signal_on_stream(
+                    remote_recv_ptrs[i], send_bufs[i], nbytes,
+                    remote_sig_addrs[i], counters[i], SIGNAL_SET,
+                    partners_pe[i], stream_ptr,
                 )
+            for i in range(n_partners):
+                _ops.signal_wait_until_on_stream(
+                    local_sig_addrs[i], CMP_GE, counters[i], stream_ptr,
+                )
+            final_event.record(comm_stream)
         torch.cuda.current_stream().wait_event(final_event)
 
     for _ in range(warmup):
@@ -232,6 +288,10 @@ def bench_nvshmem_all_concurrent(chunk_numel: int, ep_group, device, nvshmem_bac
         run_once()
     ev_e.record()
     torch.cuda.synchronize()
+
+    for i, p_pe in enumerate(partners_pe):
+        nvshmem_backend._signal_counter[p_pe] = counters[i]
+
     return ev_s.elapsed_time(ev_e) / iters
 
 

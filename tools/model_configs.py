@@ -44,7 +44,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "num_experts": 8,
         "top_k": 2,
         "num_layers": 2,
-        "seq_len": 4096,
+        "seq_len": 8192,
         "batch_size": 4,
         "capacity_factor": 1.0,
     },

@@ -24,6 +24,7 @@ Key functions:
 
 import os
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from typing import List, Tuple, Optional, Dict
 
@@ -271,8 +272,13 @@ def _reorder_chunks(
     return out
 
 
-def _maybe_execute_dw_tasks(scheduler, for_dispatch: bool = False) -> None:
-    """Execute deferred dW tasks if not skipped by current policy flags."""
+def _maybe_execute_dw_tasks(scheduler, for_dispatch: bool = False,
+                            max_defer_tasks=None) -> None:
+    """Execute deferred dW tasks if not skipped by current policy flags.
+
+    max_defer_tasks caps how many queued dW tasks run per region (see
+    scheduler.execute_dw_tasks). Leftover stay queued for the next region.
+    """
     if for_dispatch:
         should_skip = skip_dispatch_dw() or skip_all_dw()
     else:
@@ -280,7 +286,7 @@ def _maybe_execute_dw_tasks(scheduler, for_dispatch: bool = False) -> None:
     if should_skip:
         return
     nvtx_range_push("dw_tasks")
-    scheduler.execute_dw_tasks()
+    scheduler.execute_dw_tasks(max_defer_tasks=max_defer_tasks)
     nvtx_range_pop()
 
 
@@ -714,10 +720,15 @@ def combine_fc2_backward(
     total_output = grad_output.shape[0]
     total_recv = sum(output_splits_list)
 
+    # Ablation: --no-stage2 forces num_chunks=1 (disables chunked refinement).
+    if not get_backward_scheduler().stage2_enabled:
+        num_chunks = 1
     # Validate token-dim chunking: use pre-computed config or check dynamically
     _r1_cfg = chunk_config.get('r1') if chunk_config is not None else None
     if _r1_cfg is not None:
         num_chunks = _r1_cfg['num_chunks']  # pre-validated
+        if not get_backward_scheduler().stage2_enabled:
+            num_chunks = 1
     elif num_chunks > 1:
         _is_uniform = (len(set(input_splits_list)) == 1 and
                        len(set(output_splits_list)) == 1)
@@ -791,7 +802,7 @@ def combine_fc2_backward(
 
         # FC1 GEMM recompute (overlaps with AllToAll; merge+sort done in forward)
         all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
-        _maybe_execute_dw_tasks(scheduler, for_dispatch=False)
+        _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=1)
 
         scheduler.wait_alltoall(task_id)
         grad_combined_recv = result_holder[0]
@@ -916,8 +927,8 @@ def combine_fc2_backward(
     # Step 3: FC1 GEMM recompute (overlaps with AllToAll)
     all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
 
-    # Step 4: dW tasks overlap with AllToAll
-    _maybe_execute_dw_tasks(scheduler, for_dispatch=False)
+    # Step 4: dW tasks overlap with AllToAll (bounded by per-region cap)
+    _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=1)
 
     # Chunk layout index and metadata
     skip_index = False
@@ -1102,10 +1113,15 @@ def fc1_dispatch_backward(
     total_recv = grad_all_fc1.shape[0]
     hidden_size = weight1.shape[1]
 
+    # Ablation: --no-stage2 forces num_chunks=1.
+    if not get_backward_scheduler().stage2_enabled:
+        num_chunks = 1
     # Validate token-dim chunking: use pre-computed config or check dynamically
     _r2_cfg = chunk_config.get('r2') if chunk_config is not None else None
     if _r2_cfg is not None:
         num_chunks = _r2_cfg['num_chunks']  # pre-validated
+        if not get_backward_scheduler().stage2_enabled:
+            num_chunks = 1
     elif num_chunks > 1:
         _is_uniform = (len(set(input_splits_list)) == 1 and
                        len(set(output_splits_list)) == 1)
@@ -1159,7 +1175,7 @@ def fc1_dispatch_backward(
 
             task_id = scheduler.submit_alltoall(do_alltoall)
 
-            _maybe_execute_dw_tasks(scheduler, for_dispatch=True)
+            _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=1)
 
             scheduler.wait_alltoall(task_id)
             grad_tokens = result_holder[0]
@@ -1243,7 +1259,6 @@ def fc1_dispatch_backward(
     nle_c = _r2_cfg.get('nle_c', nle) if _r2_cfg is not None else nle
     cap_c = _r2_cfg.get('cap_c', cap) if _r2_cfg is not None else cap
     skip_index = _r2_cfg.get('skip_index', False) if _r2_cfg is not None else False
-    C_expert = _r2_cfg.get('C_expert', num_chunks) if _r2_cfg is not None else num_chunks
     C_cap = _r2_cfg.get('C_cap', 1) if _r2_cfg is not None else 1
 
     if _r2_mode == 'expert':
@@ -1334,8 +1349,8 @@ def fc1_dispatch_backward(
             ))
             nvtx_range_pop()
 
-    # Step 3: dW tasks overlap with remaining AllToAll
-    _maybe_execute_dw_tasks(scheduler, for_dispatch=True)
+    # Step 3: dW tasks overlap with remaining AllToAll (bounded by per-region cap)
+    _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=1)
 
     # Step 4: Wait for last AllToAll (NCCL FIFO guarantees all prior chunks done),
     #         then batch reassemble all chunks.
@@ -1358,7 +1373,6 @@ def fc1_dispatch_backward(
                     ep_size, nle_c, cap, hidden_size)
             )
     elif _r2_mode == 'hybrid':
-        scatter_indices = _r2_cfg['scatter_idx']
         grad_tokens_4d = grad_tokens.view(ep_size, nle, cap, hidden_size)
         for c in range(num_chunks):
             off = c * chunk_total
@@ -1408,6 +1422,13 @@ def router_backward(
     num_experts: int,
     top_k: int,
     dtype: torch.dtype,
+    expert_ids: Optional[torch.Tensor] = None,
+    # MoE stability losses: analytical gradient injection (matches Megatron's
+    # MoEAuxLossAutoScaler effect without needing its autograd hook).
+    aux_loss_coeff: float = 0.0,
+    z_loss_coeff: float = 0.0,
+    router_logits: Optional[torch.Tensor] = None,
+    routing_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute router backward: gradients through post-softmax routing and linear projection.
@@ -1432,9 +1453,14 @@ def router_backward(
     device = grad_permuted_probs.device
 
     # Step 1: Scatter grad from permuted [num_real] to [T, E]
-    expert_ids = torch.repeat_interleave(
-        torch.arange(num_experts, device=device), tokens_per_expert
-    )
+    # expert_ids is a flat tensor mapping each permuted row to its expert id.
+    # Fast path (padded): caller passes a pre-built [0]*cap+[1]*cap+... tensor
+    # from EPPlan — avoids the repeat_interleave(arange, GPU-tensor) sync that
+    # blocks the CPU while waiting for tokens_per_expert.sum() to read back.
+    if expert_ids is None:
+        expert_ids = torch.repeat_interleave(
+            torch.arange(num_experts, device=device), tokens_per_expert
+        )
     grad_routing_probs = torch.zeros(
         num_tokens, num_experts, dtype=grad_permuted_probs.dtype, device=device
     )
@@ -1453,11 +1479,39 @@ def router_backward(
     )
     grad_router_logits.scatter_(1, top_indices, grad_top_logits)
 
+    # Step 4b: Inject aux_loss gradient.
+    # aux_loss = coeff * N * sum_e (f_e * P_e)
+    #   f_e = (tokens_per_expert_e * N) / (T * topk)   [non-diff]
+    #   P_e = mean_t routing_probs[t, e]
+    # d aux / d routing_probs[t, e] = coeff * N * f_e / T
+    # Non-zero only at top-k positions; propagate through top-k softmax.
+    if aux_loss_coeff > 0 and routing_map is not None:
+        real_tokens_per_expert = routing_map.to(torch.float32).sum(dim=0)  # [E]
+        f_e = real_tokens_per_expert * num_experts / (num_tokens * top_k)  # [E]
+        # d aux / d top_probs[t, k] = coeff * N / T * f_e[top_indices[t, k]]
+        grad_top_probs_aux = (aux_loss_coeff * num_experts / num_tokens) * f_e[top_indices]
+        grad_top_probs_aux = grad_top_probs_aux.to(top_probs.dtype)
+        sum_grad_aux = (grad_top_probs_aux * top_probs).sum(dim=-1, keepdim=True)
+        grad_top_logits_aux = top_probs * (grad_top_probs_aux - sum_grad_aux)
+        grad_router_logits.scatter_add_(1, top_indices, grad_top_logits_aux)
+
+    # Step 4c: Inject z_loss gradient.
+    # z_loss = coeff * (1/T) * sum_t logsumexp(logits_t)^2
+    # d z_loss / d logits[t, e] = coeff * 2 / T * logsumexp(logits_t) * softmax_e_t
+    if z_loss_coeff > 0 and router_logits is not None:
+        logits_f32 = router_logits.to(torch.float32)
+        L_t = torch.logsumexp(logits_f32, dim=-1, keepdim=True)  # [T, 1]
+        softmax_full = F.softmax(logits_f32, dim=-1)             # [T, E]
+        grad_z = (z_loss_coeff * 2.0 / num_tokens) * L_t * softmax_full
+        grad_router_logits = grad_router_logits + grad_z.to(grad_router_logits.dtype)
+
     # Step 5: Backward through router linear: logits = hidden @ weight
-    # Matmul in grad dtype matching Megatron
+    # Matmul in router grad dtype (fp32 when moe_router_dtype='fp32').
+    # grad_hidden must be cast back to `dtype` (input dtype) so TE layernorm_bwd
+    # gets dz matching gamma (both bf16).
     grad_hidden_from_router = torch.matmul(
         grad_router_logits, router_weight.to(grad_router_logits.dtype).t()
-    )
+    ).to(dtype)
 
     return grad_hidden_from_router, grad_router_logits
 
@@ -1484,12 +1538,17 @@ def register_router_dw_task(
     """
     scheduler = get_backward_scheduler()
 
+    # Router grad compute may be in fp32 (moe_router_dtype='fp32'); scheduler
+    # _execute_one_dw_task auto-casts to weight dtype before writing to AR buffer.
+    compute_dtype = grad_router_logits.dtype
+
     if scheduler.is_enabled():
         hidden_saved = hidden_states.detach()
         grad_logits_saved = grad_router_logits.detach()
 
         def compute_router_dw():
-            return torch.matmul(hidden_saved.t(), grad_logits_saved)
+            return torch.matmul(
+                hidden_saved.to(compute_dtype).t(), grad_logits_saved)
 
         scheduler.register_dw_task(
             layer_name=f"router_weight_layer{layer_id}",
@@ -1499,8 +1558,8 @@ def register_router_dw_task(
         )
         return None
     else:
-        grad_router_weight = torch.matmul(hidden_states.t(), grad_router_logits)
-        return grad_router_weight
+        return torch.matmul(
+            hidden_states.to(compute_dtype).t(), grad_router_logits)
 
 
 __all__ = [

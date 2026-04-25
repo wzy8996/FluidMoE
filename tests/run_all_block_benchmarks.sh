@@ -143,15 +143,16 @@ ds_fwd, ds_iter = map(float, deepspeed_match.groups())
 meg_fwd, meg_iter = map(float, megatron_match.groups())
 fluid_fwd, fluid_sync, fluid_inter = map(float, fluidmoe_match.groups())
 
-# Parse overlap ratio (last line is the float value from rank 0)
-overlap_ratio = None
-for line in reversed(overlap_text.splitlines()):
+a2a_overlap = None
+ar_overlap = None
+for line in overlap_text.splitlines():
     line = line.strip()
-    try:
-        overlap_ratio = float(line)
-        break
-    except ValueError:
-        continue
+    m = re.search(r'a2a_overlap=([0-9.]+)', line)
+    if m:
+        a2a_overlap = float(m.group(1))
+    m = re.search(r'ar_overlap=([0-9.]+)', line)
+    if m:
+        ar_overlap = float(m.group(1))
 
 print("============================================================")
 print("Benchmark Results")
@@ -159,8 +160,10 @@ print("------------------------------------------------------------")
 print(f"  DeepSpeed Baseline:  forward={ds_fwd:.2f}ms  iter={ds_iter:.2f}ms")
 print(f"  Megatron Baseline:   forward={meg_fwd:.2f}ms  iter={meg_iter:.2f}ms")
 print(f"  FluidMoE:            forward={fluid_fwd:.2f}ms  sync_iter={fluid_sync:.2f}ms  interleaved_iter={fluid_inter:.2f}ms")
-if overlap_ratio is not None:
-    print(f"  A2A overlap ratio:   {overlap_ratio:.1%}")
+if a2a_overlap is not None:
+    print(f"  A2A overlap ratio:   {a2a_overlap:.1%}")
+if ar_overlap is not None:
+    print(f"  AR overlap ratio:    {ar_overlap:.1%}")
 print("------------------------------------------------------------")
 print("Speedup (vs Megatron Baseline)")
 print(f"  forward speedup      = {meg_fwd / fluid_fwd:.3f}x")

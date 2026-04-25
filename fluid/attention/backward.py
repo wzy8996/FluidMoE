@@ -31,9 +31,34 @@ from typing import Optional, Tuple
 
 from fluid.core import _all_to_all_sp2hp_forward, _all_to_all_hp2sp_forward
 from fluid.core.scheduler import get_backward_scheduler
+from fluid.core.python_profile import profile_section
+
+
+def _alltoall_sp2hp_into(data: torch.Tensor, group: dist.ProcessGroup, out: torch.Tensor):
+    return _all_to_all_sp2hp_forward(data, group, output=out)
+
+
+def _alltoall_hp2sp_into(data: torch.Tensor, group: dist.ProcessGroup, out: torch.Tensor):
+    return _all_to_all_hp2sp_forward(data, group, output=out)
 
 
 def outproj_sp2hp_backward(
+    grad_output: torch.Tensor,
+    weight_proj: torch.Tensor,
+    total_heads: int,
+    head_dim: int,
+    cp_group: dist.ProcessGroup,
+    num_chunks: int = 4,
+    comm_stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    with profile_section("attn_bwd.outproj_sp2hp"):
+        return _outproj_sp2hp_backward_impl(
+            grad_output, weight_proj, total_heads, head_dim, cp_group,
+            num_chunks=num_chunks, comm_stream=comm_stream,
+        )
+
+
+def _outproj_sp2hp_backward_impl(
     grad_output: torch.Tensor,
     weight_proj: torch.Tensor,
     total_heads: int,
@@ -73,6 +98,9 @@ def outproj_sp2hp_backward(
     cp_size = cp_group.size()
     heads_local = total_heads // cp_size
 
+    # Ablation: --no-stage2 forces num_chunks=1.
+    if not get_backward_scheduler().stage2_enabled:
+        num_chunks = 1
     # Validate chunk size
     if seq_local % num_chunks != 0:
         num_chunks = 1
@@ -84,19 +112,14 @@ def outproj_sp2hp_backward(
         grad_attn_sp = grad_attn_flat.view(seq_local, batch_size, total_heads, head_dim)
 
         if scheduler.is_enabled():
-            result_holder = [None]
-            def do_alltoall():
-                result_holder[0] = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
-                return result_holder[0]
+            task_id = scheduler.submit_alltoall_call(
+                _all_to_all_sp2hp_forward, grad_attn_sp, cp_group)
 
-            task_id = scheduler.submit_alltoall(do_alltoall)
-
-            # Execute dW tasks while AllToAll is running
-            scheduler.execute_dw_tasks()
+            # Execute dW tasks bounded by per-region cap; leftover defers.
+            scheduler.execute_dw_tasks(max_defer_tasks=1)
 
             # Wait for AllToAll
-            scheduler.wait_alltoall(task_id)
-            return result_holder[0]
+            return scheduler.wait_alltoall(task_id)
         else:
             grad_attn_output = _all_to_all_sp2hp_forward(grad_attn_sp, cp_group)
             return grad_attn_output
@@ -116,33 +139,35 @@ def outproj_sp2hp_backward(
 
     scheduler_enabled = scheduler.is_enabled()
 
-    # Pipeline loop: compute dX, submit AllToAll (overlaps with next dX)
-    for chunk_idx in range(num_chunks):
-        s_start = chunk_idx * seq_chunk
-        s_end = s_start + seq_chunk
-        o_start = chunk_idx * seq_chunk_out
-        o_end = o_start + seq_chunk_out
+    if scheduler_enabled:
+        chunk_args = []
+        for chunk_idx in range(num_chunks):
+            s_start = chunk_idx * seq_chunk
+            s_end = s_start + seq_chunk
+            o_start = chunk_idx * seq_chunk_out
+            o_end = o_start + seq_chunk_out
 
-        grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
-        grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
+            grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
+            grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
+            chunk_args.append((grad_chunk, cp_group, grad_attn_output[o_start:o_end]))
 
-        if scheduler_enabled:
-            def make_alltoall_fn(data, out_slice):
-                def do_alltoall():
-                    return _all_to_all_sp2hp_forward(data, cp_group, output=out_slice)
-                return do_alltoall
+        task_ids = scheduler.submit_alltoall_batch_call(_alltoall_sp2hp_into, chunk_args)
+    else:
+        for chunk_idx in range(num_chunks):
+            s_start = chunk_idx * seq_chunk
+            s_end = s_start + seq_chunk
+            o_start = chunk_idx * seq_chunk_out
+            o_end = o_start + seq_chunk_out
 
-            task_id = scheduler.submit_alltoall(make_alltoall_fn(grad_chunk, grad_attn_output[o_start:o_end]))
-            task_ids.append(task_id)
-        else:
+            grad_chunk = torch.matmul(grad_output[s_start:s_end], weight_proj)
+            grad_chunk = grad_chunk.view(seq_chunk, batch_size, total_heads, head_dim)
             _all_to_all_sp2hp_forward(grad_chunk, cp_group, output=grad_attn_output[o_start:o_end])
 
     # ============================================
-    # During AllToAll: dW tasks
+    # During AllToAll: dW tasks (bounded by per-region cap)
     # ============================================
     if scheduler_enabled:
-        # Execute dW tasks
-        scheduler.execute_dw_tasks()
+        scheduler.execute_dw_tasks(max_defer_tasks=1)
 
         # Wait for the last AllToAll only
         if task_ids:
@@ -157,6 +182,27 @@ def outproj_sp2hp_backward(
 # =============================================================================
 
 def hp2sp_qkv_backward(
+    grad_q: torch.Tensor,
+    grad_k: torch.Tensor,
+    grad_v: torch.Tensor,
+    cp_group: dist.ProcessGroup,
+    tokens: torch.Tensor,
+    weight_qkv: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    layer_id: int = 0,
+    num_chunks: int = 4,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    with profile_section("attn_bwd.hp2sp_qkv"):
+        return _hp2sp_qkv_backward_impl(
+            grad_q, grad_k, grad_v, cp_group, tokens, weight_qkv,
+            num_heads, num_kv_heads, head_dim, layer_id=layer_id,
+            num_chunks=num_chunks,
+        )
+
+
+def _hp2sp_qkv_backward_impl(
     grad_q: torch.Tensor,
     grad_k: torch.Tensor,
     grad_v: torch.Tensor,
@@ -206,7 +252,6 @@ def hp2sp_qkv_backward(
 
     scheduler = get_backward_scheduler()
     q_per_group = num_heads // num_kv_heads
-    groups_per_rank = num_kv_heads // cp_size
     _, batch_t, hidden_size = tokens.shape
 
     if cp_size == 1:
@@ -241,14 +286,10 @@ def hp2sp_qkv_backward(
         # ---- Non-chunked fallback ----
         # hp2sp AllToAll
         if scheduler.is_enabled():
-            result_holder = [None]
-            def do_alltoall():
-                result_holder[0] = _all_to_all_hp2sp_forward(grad_qkv_hp, cp_group)
-                return result_holder[0]
-            task_id = scheduler.submit_alltoall(do_alltoall)
-            scheduler.execute_dw_tasks()
-            scheduler.wait_alltoall(task_id)
-            grad_qkv_sp = result_holder[0]
+            task_id = scheduler.submit_alltoall_call(
+                _all_to_all_hp2sp_forward, grad_qkv_hp, cp_group)
+            scheduler.execute_dw_tasks(max_defer_tasks=1)
+            grad_qkv_sp = scheduler.wait_alltoall(task_id)
         else:
             grad_qkv_sp = _all_to_all_hp2sp_forward(grad_qkv_hp, cp_group)
 
@@ -268,6 +309,9 @@ def hp2sp_qkv_backward(
     # Step 3: Communication-first pipeline
     # Submit all hp2sp AllToAll chunks, then compute QKV dX as each arrives
     # ============================================
+    # Ablation: --no-stage2 forces num_chunks=1.
+    if not get_backward_scheduler().stage2_enabled:
+        num_chunks = 1
     # Validate chunk size (chunk along seq_full)
     if seq_full % num_chunks != 0:
         num_chunks = 1
@@ -290,29 +334,21 @@ def hp2sp_qkv_backward(
         dtype=dtype, device=device,
     )
 
-    # Prepare all input chunks
-    input_chunks = []
+    comm_args = []
     for chunk_idx in range(num_chunks):
         s_start = chunk_idx * seq_chunk_full
         s_end = s_start + seq_chunk_full
-        input_chunks.append(grad_qkv_hp[s_start:s_end])
-
-    def make_alltoall_fn(idx, data, out_slice):
-        def do_alltoall():
-            return _all_to_all_hp2sp_forward(data, cp_group, output=out_slice)
-        return do_alltoall
+        comm_args.append((grad_qkv_hp[s_start:s_end], cp_group, chunk_results_buf[chunk_idx]))
 
     # Batch submit: single stream switch for all chunks
-    comm_fns = [make_alltoall_fn(i, input_chunks[i], chunk_results_buf[i]) for i in range(num_chunks)]
-    task_ids = scheduler.submit_alltoall_batch(comm_fns)
+    task_ids = scheduler.submit_alltoall_batch_call(_alltoall_hp2sp_into, comm_args)
 
-    # Execute dW tasks during AllToAll
-    scheduler.execute_dw_tasks()
+    # Execute dW tasks during AllToAll (bounded by per-region cap)
+    scheduler.execute_dw_tasks(max_defer_tasks=1)
 
     # Process each chunk as it arrives: QKV dX only
     grad_tokens = torch.empty(seq_local, batch, hidden_size, dtype=tokens.dtype, device=device)
-    # Collect grad_qkv chunks for single dW registration after all chunks arrive
-    grad_qkv_chunks = []
+    grad_qkv_full = torch.empty(seq_local * batch, total_proj, dtype=dtype, device=device)
 
     for chunk_idx in range(num_chunks):
         s_start_local = chunk_idx * seq_chunk_local
@@ -325,14 +361,11 @@ def hp2sp_qkv_backward(
         # Flatten and compute dX
         grad_qkv_chunk_flat = grad_qkv_sp_chunk.reshape(seq_chunk_local, batch, -1)
         grad_tokens[s_start_local:s_end_local] = torch.matmul(grad_qkv_chunk_flat, weight_qkv)
-        grad_qkv_chunks.append(grad_qkv_chunk_flat.reshape(-1, total_proj).detach())
-
-        # Execute other dW tasks during AllToAll wait (not on last chunk)
-        if not is_last:
-            scheduler.execute_dw_tasks()
+        flat_start = s_start_local * batch
+        flat_end = s_end_local * batch
+        grad_qkv_full[flat_start:flat_end].copy_(grad_qkv_chunk_flat.reshape(-1, total_proj))
 
     # Register single QKV dW task (complete gradient, single atomic write)
-    grad_qkv_full = torch.cat(grad_qkv_chunks, dim=0)
     grad_weight = _register_qkv_dw(grad_qkv_full, tokens.detach(), weight_qkv, hidden_size, layer_id)
 
     return grad_tokens, grad_weight
