@@ -273,7 +273,7 @@ def _reorder_chunks(
 
 
 def _maybe_execute_dw_tasks(scheduler, for_dispatch: bool = False,
-                            max_defer_tasks=None) -> None:
+                            max_defer_tasks=1) -> None:
     """Execute deferred dW tasks if not skipped by current policy flags.
 
     max_defer_tasks caps how many queued dW tasks run per region (see

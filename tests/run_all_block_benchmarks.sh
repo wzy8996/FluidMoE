@@ -128,7 +128,8 @@ baseline_re = r"RESULT impl=\S+ forward_ms=([0-9.]+) iter_ms=([0-9.]+)"
 deepspeed_match = re.search(baseline_re, deepspeed_text)
 megatron_match = re.search(baseline_re, megatron_text)
 fluidmoe_match = re.search(
-    r"RESULT impl=fluidmoe forward_ms=([0-9.]+) sync_iter_ms=([0-9.]+) interleaved_iter_ms=([0-9.]+)",
+    r"RESULT impl=fluidmoe(?:-\w+)? forward_ms=([0-9.]+) "
+    r"f_iter_ms=([0-9.]+) fb_iter_ms=([0-9.]+) full_iter_ms=([0-9.]+)",
     fluidmoe_text,
 )
 
@@ -141,7 +142,7 @@ if failed:
 
 ds_fwd, ds_iter = map(float, deepspeed_match.groups())
 meg_fwd, meg_iter = map(float, megatron_match.groups())
-fluid_fwd, fluid_sync, fluid_inter = map(float, fluidmoe_match.groups())
+fluid_fwd, fluid_f, fluid_fb, fluid_full = map(float, fluidmoe_match.groups())
 
 a2a_overlap = None
 ar_overlap = None
@@ -159,20 +160,22 @@ print("Benchmark Results")
 print("------------------------------------------------------------")
 print(f"  DeepSpeed Baseline:  forward={ds_fwd:.2f}ms  iter={ds_iter:.2f}ms")
 print(f"  Megatron Baseline:   forward={meg_fwd:.2f}ms  iter={meg_iter:.2f}ms")
-print(f"  FluidMoE:            forward={fluid_fwd:.2f}ms  sync_iter={fluid_sync:.2f}ms  interleaved_iter={fluid_inter:.2f}ms")
+print(f"  FluidMoE:            forward={fluid_fwd:.2f}ms  F={fluid_f:.2f}ms  FB={fluid_fb:.2f}ms  full={fluid_full:.2f}ms")
 if a2a_overlap is not None:
     print(f"  A2A overlap ratio:   {a2a_overlap:.1%}")
 if ar_overlap is not None:
     print(f"  AR overlap ratio:    {ar_overlap:.1%}")
 print("------------------------------------------------------------")
 print("Speedup (vs Megatron Baseline)")
-print(f"  forward speedup      = {meg_fwd / fluid_fwd:.3f}x")
-print(f"  sync iter speedup    = {meg_iter / fluid_sync:.3f}x")
-print(f"  interleaved speedup  = {meg_iter / fluid_inter:.3f}x")
+print(f"  forward speedup    = {meg_fwd / fluid_fwd:.3f}x")
+print(f"  F iter speedup     = {meg_iter / fluid_f:.3f}x  (no overlap)")
+print(f"  FB iter speedup    = {meg_iter / fluid_fb:.3f}x  (+dW || A2A)")
+print(f"  full iter speedup  = {meg_iter / fluid_full:.3f}x  (+inline AR)")
 print("------------------------------------------------------------")
 print("Speedup (vs DeepSpeed Baseline)")
-print(f"  forward speedup      = {ds_fwd / fluid_fwd:.3f}x")
-print(f"  sync iter speedup    = {ds_iter / fluid_sync:.3f}x")
-print(f"  interleaved speedup  = {ds_iter / fluid_inter:.3f}x")
+print(f"  forward speedup    = {ds_fwd / fluid_fwd:.3f}x")
+print(f"  F iter speedup     = {ds_iter / fluid_f:.3f}x")
+print(f"  FB iter speedup    = {ds_iter / fluid_fb:.3f}x")
+print(f"  full iter speedup  = {ds_iter / fluid_full:.3f}x")
 print("============================================================")
 PY

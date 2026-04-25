@@ -890,13 +890,27 @@ class BackwardScheduler:
 
         All param grads were written directly to ``param.grad`` in
         ``register_dw_task`` synchronous path. AR buffer is not populated,
-        so all_reduce per-param directly on ``param.grad``.
+        so all_reduce per-param directly on ``param.grad``. Routes shared
+        params (router/LN/qkv/outproj) through shared_dp_group, expert
+        params (moe_w1/w2) through expert_dp_group — same convention as
+        ``_sync_allreduce_all_params`` so F-mode numerics match FB/full
+        and time isn't inflated by 8-way AR'ing expert params.
         """
-        if self.shared_dp_group is not None and self.shared_dp_world_size > 1:
-            for p, _ in self._param_to_buffer.items():
-                if p.grad is not None:
+        for p, buf in self._param_to_buffer.items():
+            if p.grad is None:
+                continue
+            if buf is self._expert_ar:
+                # Expert params: pre-scale by full dp_cp_world (matches FB/full
+                # AVG convention), AR over expert_dp_group only when dp>1.
+                p.grad.div_(self.shared_dp_world_size)
+                if self.expert_dp_world_size > 1 and self.expert_dp_group is not None:
+                    dist.all_reduce(p.grad, group=self.expert_dp_group)
+            else:
+                # Shared params: pre-scale + AR over shared_dp_group.
+                if self.shared_dp_world_size > 1:
                     p.grad.div_(self.shared_dp_world_size)
-                    dist.all_reduce(p.grad, group=self.shared_dp_group)
+                    if self.shared_dp_group is not None:
+                        dist.all_reduce(p.grad, group=self.shared_dp_group)
 
     def _sync_allreduce_all_params(self):
         if self.shared_dp_world_size > 1:

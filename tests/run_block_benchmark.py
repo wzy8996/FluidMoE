@@ -380,25 +380,34 @@ def main():
     fluidmoe_fwd = ev_s.elapsed_time(ev_e) / args.iters
 
     # Three FluidMoE mechanism variants (paper §5.4 Component Ablation):
-    #   F    = forward tournament only (disable scheduler -> sync dW, no chunk, no inline AR)
+    #   F    = forward tournament only (disable scheduler -> sync dW, no inline AR)
     #   FB   = forward + backward schedule (scheduler.enable, ar_enabled=False)
     #   full = all mechanisms (scheduler.enable, ar_enabled=True)
-    # A plain --impl=fluidmoe reports all three and uses full as the primary.
+    #
+    # --impl=fluidmoe: run all 3 (combined; for run_all_block_benchmarks.sh).
+    # --impl=fluidmoe-f / -fb / -full: run ONLY that mode (clean isolation,
+    #   no NCCL/allocator state pollution between modes).
     primary = args.impl if args.impl.startswith("fluidmoe") else "fluidmoe-full"
     if primary == "fluidmoe":
         primary = "fluidmoe-full"
+        run_f = run_fb = run_full = True
+    else:
+        run_f = primary == "fluidmoe-f"
+        run_fb = primary == "fluidmoe-fb"
+        run_full = primary == "fluidmoe-full"
 
-    # F mode: disable scheduler entirely. register_dw_task becomes a no-op;
-    # TransformerLayerFunction.backward falls back to synchronous dW.
-    scheduler.enabled = False
-    fluidmoe_f = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
-    scheduler.enabled = True
-    # FB mode: backward schedule on, no inline AR.
-    scheduler.ar_enabled = False
-    fluidmoe_fb = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
-    # full mode: everything on.
-    scheduler.ar_enabled = True
-    fluidmoe_full = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    fluidmoe_f = fluidmoe_fb = fluidmoe_full = float("nan")
+
+    if run_f:
+        scheduler.enabled = False
+        fluidmoe_f = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+        scheduler.enabled = True
+    if run_fb:
+        scheduler.ar_enabled = False
+        fluidmoe_fb = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    if run_full:
+        scheduler.ar_enabled = True
+        fluidmoe_full = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
 
     tokens_per_iter = seq_len * batch_size * dp_size
     tokps_f    = tokens_per_iter / (fluidmoe_f    / 1000.0)
@@ -407,7 +416,7 @@ def main():
     p0(rank, f"FluidMoE: forward={fluidmoe_fwd:.2f}ms")
     p0(rank, f"  F (fwd only):    iter={fluidmoe_f:.2f}ms  {tokps_f:.0f} tok/s")
     p0(rank, f"  FB (fwd+bwd):    iter={fluidmoe_fb:.2f}ms  {tokps_fb:.0f} tok/s")
-    p0(rank, f"  full (+sync AR): iter={fluidmoe_full:.2f}ms  {tokps_full:.0f} tok/s")
+    p0(rank, f"  full (+inline AR): iter={fluidmoe_full:.2f}ms  {tokps_full:.0f} tok/s")
     p0(rank, f"RESULT impl={primary} forward_ms={fluidmoe_fwd:.6f} "
              f"f_iter_ms={fluidmoe_f:.6f} fb_iter_ms={fluidmoe_fb:.6f} full_iter_ms={fluidmoe_full:.6f} "
              f"f_tokens_per_sec={tokps_f:.6f} fb_tokens_per_sec={tokps_fb:.6f} full_tokens_per_sec={tokps_full:.6f}")

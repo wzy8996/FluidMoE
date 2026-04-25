@@ -67,9 +67,13 @@ torch::Tensor nvshmem_malloc_tensor(int64_t numel, c10::ScalarType dtype) {
 
     cudaMemset(ptr, 0, nbytes);
 
+    // nvshmem_malloc allocates on the current CUDA device. Reflect that in
+    // the returned Tensor so .to()/cross-device assertions don't trip.
+    int cur_dev = -1;
+    cudaGetDevice(&cur_dev);
     auto options = torch::TensorOptions()
         .dtype(dtype)
-        .device(torch::kCUDA, nvshmem_my_pe() % torch::cuda::device_count());
+        .device(torch::kCUDA, cur_dev);
     return torch::from_blob(ptr, {numel}, options);
 }
 
