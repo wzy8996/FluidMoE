@@ -236,9 +236,9 @@ def _hp2sp_qkv_backward_impl(
     default_stream: |merge|dW|wait0+dx0|wait1+dx1|...|
 
     Args:
-        grad_q: [batch, q_heads_local, seq_full, head_dim] gradient w.r.t. Q
-        grad_k: [batch, kv_heads_local, seq_full, head_dim] gradient w.r.t. K (native GQA)
-        grad_v: [batch, kv_heads_local, seq_full, head_dim] gradient w.r.t. V (native GQA)
+        grad_q: [seq_full, batch, q_heads_local, head_dim] gradient w.r.t. Q (sbhd)
+        grad_k: [seq_full, batch, kv_heads_local, head_dim] gradient w.r.t. K (sbhd, native GQA)
+        grad_v: [seq_full, batch, kv_heads_local, head_dim] gradient w.r.t. V (sbhd, native GQA)
         cp_group: context parallel process group
         tokens: [seq_local, batch, hidden] input tokens (for dW registration)
         weight_qkv: [total_proj, hidden] QKV weight
@@ -252,7 +252,7 @@ def _hp2sp_qkv_backward_impl(
         grad_tokens: [seq_local, batch, hidden] gradient w.r.t. input tokens
         grad_weight: [total_proj, hidden] or None if scheduler enabled
     """
-    batch, heads_local, seq_full, _ = grad_q.shape
+    seq_full, batch, _q_heads_local, _ = grad_q.shape
     device = grad_q.device
     dtype = grad_q.dtype
     cp_size = cp_group.size()
@@ -263,23 +263,20 @@ def _hp2sp_qkv_backward_impl(
     _, batch_t, hidden_size = tokens.shape
 
     if cp_size == 1:
-        # No AllToAll needed, just do QKV projection backward directly
-        grad_q_sp = grad_q.permute(2, 0, 1, 3)  # [seq, batch, heads, head_dim]
-        grad_k_sp = grad_k.permute(2, 0, 1, 3)
-        grad_v_sp = grad_v.permute(2, 0, 1, 3)
+        # No AllToAll needed, just do QKV projection backward directly.
+        # Inputs already sbhd, pass through.
         return _qkv_dx_and_dw(
-            grad_q_sp, grad_k_sp, grad_v_sp, tokens, weight_qkv,
+            grad_q, grad_k, grad_v, tokens, weight_qkv,
             num_heads, num_kv_heads, head_dim, layer_id, cp_size
         )
 
     # ============================================
     # Step 1: QKV reassembly in HP format (native GQA)
+    # Inputs are already sbhd; reshape Q's last two dims for grouped layout.
     # ============================================
-    # Permute to [seq_full, batch, heads_local, head_dim]
-    # Native GQA: grad_q has q_heads_local, grad_k/grad_v have kv_heads_local
-    grad_q_hp = grad_q.permute(2, 0, 1, 3)  # [seq_full, batch, q_heads_local, head_dim]
-    grad_k_hp = grad_k.permute(2, 0, 1, 3)  # [seq_full, batch, kv_heads_local, head_dim]
-    grad_v_hp = grad_v.permute(2, 0, 1, 3)  # [seq_full, batch, kv_heads_local, head_dim]
+    grad_q_hp = grad_q   # [seq_full, batch, q_heads_local, head_dim]
+    grad_k_hp = grad_k   # [seq_full, batch, kv_heads_local, head_dim]
+    grad_v_hp = grad_v   # [seq_full, batch, kv_heads_local, head_dim]
 
     # QKV reassembly (native GQA: K/V already have kv_heads shape, no contraction needed)
     kv_heads_local = num_kv_heads // cp_size

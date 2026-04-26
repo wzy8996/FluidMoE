@@ -165,7 +165,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             # Reshape TE output from 3D [seq, batch, hidden] to 4D [seq, batch, heads, dim]
             attn_out = attn_out_te.view(
                 q_hp.shape[0], q_hp.shape[1], q_heads_local, head_dim
-            ).contiguous()
+            )
         else:
             # PyTorch SDPA: needs bhsd format [batch, heads, seq, dim]
             q_bf = q_hp.permute(1, 2, 0, 3)
@@ -674,21 +674,23 @@ class TransformerLayerFunction(torch.autograd.Function):
             grad_attn_3d = grad_attn_output.view(
                 grad_attn_output.shape[0], grad_attn_output.shape[1], -1
             )
+            # autograd.grad returns sbhd 4D matching q_for_attn layout.
+            # hp2sp_qkv_backward consumes sbhd directly — no permute needed.
             grad_q, grad_k, grad_v = torch.autograd.grad(
                 attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
                 grad_attn_3d, retain_graph=False
             )
-            # grad_q/k/v are sbhd 4D [seq, batch, heads, dim]
-            grad_q = grad_q.permute(1, 2, 0, 3).contiguous()
-            grad_k = grad_k.permute(1, 2, 0, 3).contiguous()
-            grad_v = grad_v.permute(1, 2, 0, 3).contiguous()
         else:
-            # PyTorch SDPA: attn_out_bf is bhsd [batch, heads, seq, dim]
+            # PyTorch SDPA: attn_out_bf and q_for_attn are bhsd. Convert grads
+            # back to sbhd for hp2sp_qkv_backward.
             grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
             grad_q, grad_k, grad_v = torch.autograd.grad(
                 attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
                 grad_attn_hp, retain_graph=False
             )
+            grad_q = grad_q.permute(2, 0, 1, 3).contiguous()
+            grad_k = grad_k.permute(2, 0, 1, 3).contiguous()
+            grad_v = grad_v.permute(2, 0, 1, 3).contiguous()
 
         grad_ln1_weight = None
         grad_ln1_bias = None

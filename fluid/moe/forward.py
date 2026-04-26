@@ -422,6 +422,9 @@ def router_forward(
     # Build padded_routing_map: each expert has exactly expert_capacity True entries.
     # Argsort (real-first, padding from non-routed) selects which tokens belong
     # to each expert's slots; padded_routing_map marks them.
+    # .contiguous() needed: .T returns a strided view; argsort below
+    # is much faster on contiguous input (otherwise it does the
+    # materialization internally on a slow path).
     routing_map_int_T = routing_map.to(torch.int8).T.contiguous()  # [E, T]
     sorted_per_expert = routing_map_int_T.argsort(
         dim=-1, descending=True, stable=True
