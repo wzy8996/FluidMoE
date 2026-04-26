@@ -273,7 +273,7 @@ def _reorder_chunks(
 
 
 def _maybe_execute_dw_tasks(scheduler, for_dispatch: bool = False,
-                            max_defer_tasks=1) -> None:
+                            max_defer_tasks=2) -> None:
     """Execute deferred dW tasks if not skipped by current policy flags.
 
     max_defer_tasks caps how many queued dW tasks run per region (see
@@ -669,6 +669,8 @@ def combine_fc2_backward(
     chunk_config: Optional[dict] = None,
     # Megatron-aligned: probs applied inside expert computation
     all_expert_probs: Optional[torch.Tensor] = None,
+    # FC1 captured in forward; if provided, backward skips recompute.
+    all_fc1_saved: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, List[int], Dict[str, torch.Tensor],
            Optional[torch.Tensor]]:
@@ -762,7 +764,8 @@ def combine_fc2_backward(
         )
         nvtx_range_pop()
 
-        all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
+        all_fc1 = (all_fc1_saved if all_fc1_saved is not None
+                   else recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1))
         grad_all_fc1, act_output, grad_all_fc2, grad_probs = _post_combine_single_alltoall(
             grad_combined_recv=grad_combined_recv,
             backward_indices=backward_indices,
@@ -801,8 +804,9 @@ def combine_fc2_backward(
         task_id = scheduler.submit_alltoall(do_alltoall)
 
         # FC1 GEMM recompute (overlaps with AllToAll; merge+sort done in forward)
-        all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
-        _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=1)
+        all_fc1 = (all_fc1_saved if all_fc1_saved is not None
+                   else recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1))
+        _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=2)
 
         scheduler.wait_alltoall(task_id)
         grad_combined_recv = result_holder[0]
@@ -924,11 +928,12 @@ def combine_fc2_backward(
     task_ids = scheduler.submit_alltoall_batch(comm_fns)
     nvtx_range_pop()  # rearrange_submit
 
-    # Step 3: FC1 GEMM recompute (overlaps with AllToAll)
-    all_fc1 = recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1)
+    # Step 3: FC1 (use saved from forward, else recompute as fallback).
+    all_fc1 = (all_fc1_saved if all_fc1_saved is not None
+               else recompute_fc1_gemm(all_expert_tokens, all_tokens_per_expert, weight1))
 
     # Step 4: dW tasks overlap with AllToAll (bounded by per-region cap)
-    _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=1)
+    _maybe_execute_dw_tasks(scheduler, for_dispatch=False, max_defer_tasks=2)
 
     # Chunk layout index and metadata
     skip_index = False
@@ -1175,7 +1180,7 @@ def fc1_dispatch_backward(
 
             task_id = scheduler.submit_alltoall(do_alltoall)
 
-            _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=1)
+            _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=2)
 
             scheduler.wait_alltoall(task_id)
             grad_tokens = result_holder[0]
@@ -1350,7 +1355,7 @@ def fc1_dispatch_backward(
             nvtx_range_pop()
 
     # Step 3: dW tasks overlap with remaining AllToAll (bounded by per-region cap)
-    _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=1)
+    _maybe_execute_dw_tasks(scheduler, for_dispatch=True, max_defer_tasks=2)
 
     # Step 4: Wait for last AllToAll (NCCL FIFO guarantees all prior chunks done),
     #         then batch reassemble all chunks.

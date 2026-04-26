@@ -108,17 +108,73 @@ class StreamManager:
         self._ensure_initialized(device)
 
     def init_nvshmem(self):
-        """Initialize NVSHMEM (called once by NVSHMEMBackend)."""
+        """Initialize NVSHMEM (called once by NVSHMEMBackend).
+
+        Bootstrap selection:
+          * If ``NVSHMEM_BOOTSTRAP`` is set in the env, honor it and use the
+            env-driven init path (PMI/MPI/SHMEM). Required for srun --mpi=pmix
+            and similar PMI-aware launchers.
+          * Otherwise, if ``torch.distributed`` is initialized (the typical
+            torchrun deployment), use **UID bootstrap**: rank 0 mints a
+            ``nvshmemx_uniqueid_t``, broadcasts it via the WORLD process
+            group, and every PE inits with ``NVSHMEMX_INIT_WITH_UNIQUEID``.
+            This avoids the silent NVSHMEM init failure that previously
+            forced FluidMoE back to NCCL on every torchrun launch.
+          * As a last resort, fall back to the env-driven path with no
+            bootstrap explicitly chosen — this will fail loudly if no
+            launcher provided one, which is what we want.
+        """
         if self._nvshmem_initialized:
             return
         with self._lock:
             if self._nvshmem_initialized:
                 return
             import os
-            if "NVSHMEM_BOOTSTRAP" not in os.environ:
-                os.environ["NVSHMEM_BOOTSTRAP"] = "pmi"
-            from fluid.csrc import nvshmem_init
-            nvshmem_init()
+            import torch
+            import torch.distributed as dist
+
+            env_bootstrap = os.environ.get("NVSHMEM_BOOTSTRAP")
+            from fluid.csrc import (
+                nvshmem_init,
+                nvshmem_init_with_uniqueid,
+                nvshmem_get_uniqueid,
+                nvshmem_uniqueid_size,
+            )
+
+            if env_bootstrap is None and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+                uid_size = int(nvshmem_uniqueid_size())
+
+                # Broadcast the UID over the existing torch.distributed WORLD
+                # group as a uint8 byte tensor. Use a CUDA tensor when the
+                # default backend is NCCL; gloo handles CPU tensors natively.
+                # We pick the device by checking the current CUDA device,
+                # which both NCCL and gloo paths can produce a tensor for.
+                pg = dist.group.WORLD
+                backend = dist.get_backend(pg)
+                if backend == "nccl":
+                    uid_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                else:
+                    uid_dev = torch.device("cpu")
+                uid_buf = torch.zeros(uid_size, dtype=torch.uint8, device=uid_dev)
+
+                if rank == 0:
+                    uid_bytes = nvshmem_get_uniqueid()
+                    assert len(uid_bytes) == uid_size, \
+                        f"uniqueid size mismatch: {len(uid_bytes)} vs {uid_size}"
+                    uid_buf.copy_(torch.frombuffer(
+                        bytearray(uid_bytes), dtype=torch.uint8).to(uid_dev))
+                dist.broadcast(uid_buf, src=0)
+                uid_bytes = bytes(uid_buf.cpu().numpy().tobytes())
+
+                nvshmem_init_with_uniqueid(rank, world_size, uid_bytes)
+            else:
+                # Env-driven path. If env_bootstrap is None we leave it unset
+                # and let NVSHMEM's default selection logic surface a clear
+                # error rather than guessing a wrong default.
+                nvshmem_init()
+
             self._nvshmem_initialized = True
             import atexit
             atexit.register(self._finalize_nvshmem)

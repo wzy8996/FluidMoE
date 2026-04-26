@@ -31,13 +31,16 @@ def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
     parser.add_argument("--model", type=str, default="mixtral_8x7b", help="Model name (from tools/model_configs.py)")
-    parser.add_argument("--impl", type=str, default="fluidmoe",
+    parser.add_argument("--impl", type=str, default="fluidmoe-full",
                         choices=["megatron", "megatron-overlap", "megatron-overlap-dw",
-                                 "fluidmoe", "fluidmoe-f", "fluidmoe-fb", "fluidmoe-full",
+                                 "fluidmoe-f", "fluidmoe-fb", "fluidmoe-full",
                                  "deepspeed"],
-                        help="Implementation to run. fluidmoe-{f,fb,full} map to "
-                             "FluidMoE mechanism variants (forward only / +backward / all). "
-                             "Plain 'fluidmoe' is an alias for 'fluidmoe-full'.")
+                        help="Implementation to run. Each invocation runs EXACTLY ONE "
+                             "implementation; if you want the F/FB/full FluidMoE "
+                             "ablation, launch the script three times. The variants:\n"
+                             "  fluidmoe-f    = forward tournament only (scheduler off)\n"
+                             "  fluidmoe-fb   = forward + backward dW||A2A (scheduler on, no inline AR)\n"
+                             "  fluidmoe-full = +inline AR (the headline mode, default)")
     parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
     parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])
@@ -379,47 +382,35 @@ def main():
     torch.cuda.synchronize()
     fluidmoe_fwd = ev_s.elapsed_time(ev_e) / args.iters
 
-    # Three FluidMoE mechanism variants (paper §5.4 Component Ablation):
+    # FluidMoE mechanism variants (paper §5.4 Component Ablation):
     #   F    = forward tournament only (disable scheduler -> sync dW, no inline AR)
     #   FB   = forward + backward schedule (scheduler.enable, ar_enabled=False)
     #   full = all mechanisms (scheduler.enable, ar_enabled=True)
     #
-    # --impl=fluidmoe: run all 3 (combined; for run_all_block_benchmarks.sh).
-    # --impl=fluidmoe-f / -fb / -full: run ONLY that mode (clean isolation,
-    #   no NCCL/allocator state pollution between modes).
-    primary = args.impl if args.impl.startswith("fluidmoe") else "fluidmoe-full"
-    if primary == "fluidmoe":
-        primary = "fluidmoe-full"
-        run_f = run_fb = run_full = True
-    else:
-        run_f = primary == "fluidmoe-f"
-        run_fb = primary == "fluidmoe-fb"
-        run_full = primary == "fluidmoe-full"
-
-    fluidmoe_f = fluidmoe_fb = fluidmoe_full = float("nan")
-
-    if run_f:
+    # ONE invocation = ONE mode (clean isolation; no NCCL/allocator state
+    # bleed between modes). For the full F/FB/full ablation, launch this
+    # script three times with --impl=fluidmoe-{f,fb,full}.
+    if args.impl == "fluidmoe-f":
         scheduler.enabled = False
-        fluidmoe_f = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+        # ar_enabled is irrelevant when scheduler is off; leave it as configured.
+    elif args.impl == "fluidmoe-fb":
         scheduler.enabled = True
-    if run_fb:
         scheduler.ar_enabled = False
-        fluidmoe_fb = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
-    if run_full:
+    elif args.impl == "fluidmoe-full":
+        scheduler.enabled = True
         scheduler.ar_enabled = True
-        fluidmoe_full = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
+    else:
+        raise ValueError(f"unexpected fluidmoe variant: {args.impl}")
+
+    iter_ms = bench(run_fluid_bwd, scheduler, ev_s, ev_e, args.warmup, args.iters)
 
     tokens_per_iter = seq_len * batch_size * dp_size
-    tokps_f    = tokens_per_iter / (fluidmoe_f    / 1000.0)
-    tokps_fb   = tokens_per_iter / (fluidmoe_fb   / 1000.0)
-    tokps_full = tokens_per_iter / (fluidmoe_full / 1000.0)
-    p0(rank, f"FluidMoE: forward={fluidmoe_fwd:.2f}ms")
-    p0(rank, f"  F (fwd only):    iter={fluidmoe_f:.2f}ms  {tokps_f:.0f} tok/s")
-    p0(rank, f"  FB (fwd+bwd):    iter={fluidmoe_fb:.2f}ms  {tokps_fb:.0f} tok/s")
-    p0(rank, f"  full (+inline AR): iter={fluidmoe_full:.2f}ms  {tokps_full:.0f} tok/s")
-    p0(rank, f"RESULT impl={primary} forward_ms={fluidmoe_fwd:.6f} "
-             f"f_iter_ms={fluidmoe_f:.6f} fb_iter_ms={fluidmoe_fb:.6f} full_iter_ms={fluidmoe_full:.6f} "
-             f"f_tokens_per_sec={tokps_f:.6f} fb_tokens_per_sec={tokps_fb:.6f} full_tokens_per_sec={tokps_full:.6f}")
+    tokps = tokens_per_iter / (iter_ms / 1000.0)
+    p0(rank, f"FluidMoE [{args.impl}]: forward={fluidmoe_fwd:.2f}ms  iter={iter_ms:.2f}ms  throughput={tokps:.0f} tok/s")
+    # RESULT line uses the same shape as the baselines so external parsers
+    # (e.g. run_all_block_benchmarks.sh) can use one regex for everything.
+    p0(rank, f"RESULT impl={args.impl} forward_ms={fluidmoe_fwd:.6f} "
+             f"iter_ms={iter_ms:.6f} tokens_per_sec={tokps:.6f}")
 
     dist.destroy_process_group()
     p0(rank, "Done!")

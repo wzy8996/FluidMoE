@@ -540,7 +540,8 @@ def dispatch_fc1_p2p_forward(
     permuted_probs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor,
-           Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
+           Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]],
+           Optional[torch.Tensor], Dict[int, torch.Tensor]]:
     with profile_section("moe_fwd.dispatch_fc1_p2p"):
         return _dispatch_fc1_p2p_forward_impl(
             tokens, weight1, ep_group, overlap_ctx, activation_func,
@@ -559,7 +560,8 @@ def _dispatch_fc1_p2p_forward_impl(
     permuted_probs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor],
            List[int], Dict[int, int], torch.Tensor,
-           Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
+           Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]],
+           Optional[torch.Tensor], Dict[int, torch.Tensor]]:
     """
     Dispatch phase with P2P overlap (padded mode, EPPlan required).
 
@@ -570,7 +572,8 @@ def _dispatch_fc1_p2p_forward_impl(
 
     Returns:
         local_tokens, local_act, recv_act_results, recv_buffer_views,
-        partners, recv_offsets, tokens_cpu, local_probs, recv_probs
+        partners, recv_offsets, tokens_cpu, local_probs, recv_probs,
+        local_fc1, recv_fc1_results
     """
     nvtx_range_push("dispatch_fc1_p2p")
     device = tokens.device
@@ -654,8 +657,12 @@ def _dispatch_fc1_p2p_forward_impl(
     # all_reqs removed — P2P backend manages request lifecycle internally
     p2p_events = []
     recv_act_results = [None] * len(partners)
+    # FC1 pre-activation kept alongside post-act so backward can skip
+    # recompute_fc1_gemm (FC1 was already computed inside grouped_fc1_act).
+    recv_fc1_results = [None] * len(partners)
     recv_buffer_views = [None] * len(partners)
     local_act = None
+    local_fc1 = None
 
     def extract_tokens(idx):
         """Split flat buffer into tokens and probs (zero-copy views)."""
@@ -703,9 +710,9 @@ def _dispatch_fc1_p2p_forward_impl(
         nvtx_range_push(f"fc1_compute_R{round_idx}")
         if round_idx == 0:
             if local_count > 0:
-                local_act = grouped_fc1_act(
+                local_fc1, local_act = grouped_fc1_act(
                     local_tokens, weight1, local_tokens_per_expert_cpu,
-                    activation_func, probs=local_probs)
+                    activation_func, probs=local_probs, return_fc1=True)
         elif prev_idx >= 0:
             _sched_f.record_fwd_wait('r3_f', p2p_events[round_idx - 1])
             extract_tokens(prev_idx)
@@ -713,10 +720,11 @@ def _dispatch_fc1_p2p_forward_impl(
             if recv_buffer_views[prev_idx] is not None:
                 recv_data = recv_buffer_views[prev_idx]
                 partner_probs = recv_probs_list[prev_idx]
-                recv_act = grouped_fc1_act(
+                recv_fc1, recv_act = grouped_fc1_act(
                     recv_data, weight1, tokens_cpu[prev_p],
-                    activation_func, probs=partner_probs)
+                    activation_func, probs=partner_probs, return_fc1=True)
                 recv_act_results[prev_idx] = recv_act
+                recv_fc1_results[prev_idx] = recv_fc1
         nvtx_range_pop()
 
         prev_idx = round_idx
@@ -732,10 +740,11 @@ def _dispatch_fc1_p2p_forward_impl(
         if recv_buffer_views[last_idx] is not None:
             recv_data = recv_buffer_views[last_idx]
             partner_probs = recv_probs_list[last_idx]
-            recv_act = grouped_fc1_act(
+            recv_fc1, recv_act = grouped_fc1_act(
                 recv_data, weight1, tokens_cpu[last_p],
-                activation_func, probs=partner_probs)
+                activation_func, probs=partner_probs, return_fc1=True)
             recv_act_results[last_idx] = recv_act
+            recv_fc1_results[last_idx] = recv_fc1
         nvtx_range_pop()
 
     if _p2p.needs_final_wait():
@@ -751,6 +760,7 @@ def _dispatch_fc1_p2p_forward_impl(
         partners, recv_offsets, tokens_cpu,
         local_probs,
         recv_probs,
+        local_fc1, recv_fc1_results,
     )
 
 
@@ -771,15 +781,18 @@ def fc2_combine_p2p_forward(
     needs_backward: bool = True,
     local_probs: Optional[torch.Tensor] = None,
     recv_probs: Optional[Dict[int, torch.Tensor]] = None,
+    local_fc1: Optional[torch.Tensor] = None,
+    recv_fc1_results: Optional[List[Optional[torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[list], Optional[dict],
-           Optional[torch.Tensor]]:
+           Optional[torch.Tensor], Optional[torch.Tensor]]:
     with profile_section("moe_fwd.fc2_combine_p2p"):
         return _fc2_combine_p2p_forward_impl(
             local_tokens, local_act, recv_act_results, recv_buffer_views,
             weight2, ep_group, overlap_ctx, num_local_experts, ep_plan,
             needs_backward=needs_backward,
             local_probs=local_probs, recv_probs=recv_probs,
+            local_fc1=local_fc1, recv_fc1_results=recv_fc1_results,
         )
 
 
@@ -796,9 +809,11 @@ def _fc2_combine_p2p_forward_impl(
     needs_backward: bool = True,
     local_probs: Optional[torch.Tensor] = None,
     recv_probs: Optional[Dict[int, torch.Tensor]] = None,
+    local_fc1: Optional[torch.Tensor] = None,
+    recv_fc1_results: Optional[List[Optional[torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[list], Optional[dict],
-           Optional[torch.Tensor]]:
+           Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     FC2 + Combine phase with P2P overlap (padded mode, EPPlan required).
 
@@ -810,7 +825,10 @@ def _fc2_combine_p2p_forward_impl(
     Returns:
         combined_output, local_fc2,
         all_expert_tokens (expert-major), all_tokens_per_expert, backward_indices,
-        all_expert_probs (expert-major, for backward probs gradient; None if local_probs is None)
+        all_expert_probs (expert-major, for backward probs gradient; None if local_probs is None),
+        all_fc1 (expert-major FC1 pre-activation, for backward to skip
+                 recompute_fc1_gemm; None when ``local_fc1``/``recv_fc1_results``
+                 weren't supplied or ``needs_backward=False``)
     """
     nvtx_range_push("fc2_combine_p2p")
     device = local_tokens.device
@@ -934,6 +952,7 @@ def _fc2_combine_p2p_forward_impl(
     all_tokens_per_expert = None
     backward_indices = None
     all_expert_probs = None
+    all_fc1 = None
     if needs_backward and tokens_cpu is not None:
         nvtx_range_push("merge_sort_fwd")
 
@@ -956,6 +975,22 @@ def _fc2_combine_p2p_forward_impl(
         # Reorder to expert-major using cached index
         all_expert_tokens = torch.empty(total_tokens_merge, hidden_size, dtype=dtype, device=device)
         torch.index_select(rank_major, 0, row_idx_r2e, out=all_expert_tokens)
+
+        # Build expert-major all_fc1 from per-partner FC1 captured during
+        # dispatch (no extra compute), so backward can skip recompute.
+        # Memory: total_tokens_merge * ffn_hidden bf16 per layer.
+        if local_fc1 is not None:
+            ffn_hidden = local_fc1.shape[-1]
+            rank_major_fc1 = torch.empty(total_tokens_merge, ffn_hidden,
+                                         dtype=dtype, device=device)
+            rank_major_fc1[my_rank * n_per_rank:(my_rank + 1) * n_per_rank] = local_fc1
+            for p in partners:
+                p_idx = partner_to_index[p]
+                if recv_fc1_results[p_idx] is not None:
+                    rank_major_fc1[p * n_per_rank:(p + 1) * n_per_rank] = recv_fc1_results[p_idx]
+            all_fc1 = torch.empty(total_tokens_merge, ffn_hidden,
+                                  dtype=dtype, device=device)
+            torch.index_select(rank_major_fc1, 0, row_idx_r2e, out=all_fc1)
 
         # Merge probs to expert-major by direct copy_ per rank (no cat)
         if local_probs is not None and recv_probs is not None:
@@ -1014,7 +1049,8 @@ def _fc2_combine_p2p_forward_impl(
         combined_output[local_start:local_start + local_count] = local_fc2
 
     nvtx_range_pop()  # fc2_combine_p2p
-    return combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert, backward_indices, all_expert_probs
+    return (combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert,
+            backward_indices, all_expert_probs, all_fc1)
 
 
 def pad_moe_dispatch(

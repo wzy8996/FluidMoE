@@ -98,8 +98,8 @@ echo "[2/4] Megatron Baseline"
 "${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl megatron | tee "${MEGATRON_LOG}"
 echo
 
-echo "[3/4] FluidMoE"
-"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl fluidmoe | tee "${FLUIDMOE_LOG}"
+echo "[3/4] FluidMoE (full mode: scheduler + inline AR)"
+"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl fluidmoe-full | tee "${FLUIDMOE_LOG}"
 echo
 
 echo "[4/4] Overlap Analysis"
@@ -127,11 +127,7 @@ with open(overlap_log, "r", encoding="utf-8") as f:
 baseline_re = r"RESULT impl=\S+ forward_ms=([0-9.]+) iter_ms=([0-9.]+)"
 deepspeed_match = re.search(baseline_re, deepspeed_text)
 megatron_match = re.search(baseline_re, megatron_text)
-fluidmoe_match = re.search(
-    r"RESULT impl=fluidmoe(?:-\w+)? forward_ms=([0-9.]+) "
-    r"f_iter_ms=([0-9.]+) fb_iter_ms=([0-9.]+) full_iter_ms=([0-9.]+)",
-    fluidmoe_text,
-)
+fluidmoe_match = re.search(baseline_re, fluidmoe_text)
 
 failed = []
 if deepspeed_match is None: failed.append("deepspeed")
@@ -142,7 +138,7 @@ if failed:
 
 ds_fwd, ds_iter = map(float, deepspeed_match.groups())
 meg_fwd, meg_iter = map(float, megatron_match.groups())
-fluid_fwd, fluid_f, fluid_fb, fluid_full = map(float, fluidmoe_match.groups())
+fluid_fwd, fluid_iter = map(float, fluidmoe_match.groups())
 
 a2a_overlap = None
 ar_overlap = None
@@ -160,7 +156,7 @@ print("Benchmark Results")
 print("------------------------------------------------------------")
 print(f"  DeepSpeed Baseline:  forward={ds_fwd:.2f}ms  iter={ds_iter:.2f}ms")
 print(f"  Megatron Baseline:   forward={meg_fwd:.2f}ms  iter={meg_iter:.2f}ms")
-print(f"  FluidMoE:            forward={fluid_fwd:.2f}ms  F={fluid_f:.2f}ms  FB={fluid_fb:.2f}ms  full={fluid_full:.2f}ms")
+print(f"  FluidMoE (full):     forward={fluid_fwd:.2f}ms  iter={fluid_iter:.2f}ms")
 if a2a_overlap is not None:
     print(f"  A2A overlap ratio:   {a2a_overlap:.1%}")
 if ar_overlap is not None:
@@ -168,14 +164,14 @@ if ar_overlap is not None:
 print("------------------------------------------------------------")
 print("Speedup (vs Megatron Baseline)")
 print(f"  forward speedup    = {meg_fwd / fluid_fwd:.3f}x")
-print(f"  F iter speedup     = {meg_iter / fluid_f:.3f}x  (no overlap)")
-print(f"  FB iter speedup    = {meg_iter / fluid_fb:.3f}x  (+dW || A2A)")
-print(f"  full iter speedup  = {meg_iter / fluid_full:.3f}x  (+inline AR)")
+print(f"  iter speedup       = {meg_iter / fluid_iter:.3f}x")
 print("------------------------------------------------------------")
 print("Speedup (vs DeepSpeed Baseline)")
 print(f"  forward speedup    = {ds_fwd / fluid_fwd:.3f}x")
-print(f"  F iter speedup     = {ds_iter / fluid_f:.3f}x")
-print(f"  FB iter speedup    = {ds_iter / fluid_fb:.3f}x")
-print(f"  full iter speedup  = {ds_iter / fluid_full:.3f}x")
+print(f"  iter speedup       = {ds_iter / fluid_iter:.3f}x")
+print()
+print("Note: this script runs FluidMoE in 'full' mode (scheduler + inline AR).")
+print("      For the F/FB/full ablation, run run_block_benchmark.py three times")
+print("      with --impl=fluidmoe-{f,fb,full}.")
 print("============================================================")
 PY

@@ -218,19 +218,21 @@ class TransformerLayerFunction(torch.autograd.Function):
         # Dispatch + FC1 with P2P overlap (Megatron-aligned: probs applied between act and FC2)
         (local_tokens, local_act, recv_act_results, recv_buffers,
          moe_partners, _recv_offsets, tokens_cpu,
-         local_probs, recv_probs_dict) = dispatch_fc1_p2p_forward(
+         local_probs, recv_probs_dict,
+         local_fc1, recv_fc1_results) = dispatch_fc1_p2p_forward(
             permuted_tokens, moe_w1_d, ep_group, moe_overlap_ctx,
             activation_func, num_local_experts, ep_plan,
             permuted_probs=permuted_probs,
         )
 
-        # FC2 + Combine with P2P overlap
+        # FC2 + Combine with P2P overlap.
         (combined_output, local_fc2, all_expert_tokens, all_tokens_per_expert,
-         backward_indices, all_expert_probs) = fc2_combine_p2p_forward(
+         backward_indices, all_expert_probs, all_fc1) = fc2_combine_p2p_forward(
             local_tokens, local_act, recv_act_results, recv_buffers,
             moe_w2_d, ep_group, moe_overlap_ctx, num_local_experts, ep_plan,
             needs_backward=needs_grad,
             local_probs=local_probs, recv_probs=recv_probs_dict,
+            local_fc1=local_fc1, recv_fc1_results=recv_fc1_results,
         )
 
         # Unpermute: scatter FC2 output back to token positions (NO probs — already applied inside experts)
@@ -271,6 +273,8 @@ class TransformerLayerFunction(torch.autograd.Function):
                 # LN stats for TE fused backward
                 ln1_mu, ln1_rsigma, ln2_mu, ln2_rsigma,
             )
+            # Saved here so backward can skip recompute_fc1_gemm.
+            ctx._all_fc1_saved = all_fc1
             # Store non-tensor merge results on ctx
             ctx.all_tokens_per_expert = all_tokens_per_expert
             ctx.backward_indices = backward_indices
@@ -451,6 +455,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             backward_indices=backward_indices,
             chunk_config=chunk_config,
             all_expert_probs=all_expert_probs,
+            all_fc1_saved=getattr(ctx, '_all_fc1_saved', None),
         )
 
         scheduler.end_region()
