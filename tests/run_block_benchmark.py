@@ -2,9 +2,9 @@
 
 Variants (one impl per invocation):
 
-  --impl megatron-baseline : mcore_DDP, overlap_grad_reduce=False
+  --impl megatron          : mcore_DDP, overlap_grad_reduce=False
                               (AR all stacked at end of backward)
-  --impl megatron          : mcore_DDP, overlap_grad_reduce=True
+  --impl megatron-overlap  : mcore_DDP, overlap_grad_reduce=True
                               (bucket-wise AR overlapped with backward)
   --impl deepspeed         : DeepSpeed-style flat-buffer AR with expert filter
                               (= DeepSpeed engine ZeRO-0 sync mode, AR at end)
@@ -166,13 +166,13 @@ def parse_args():
     parser.add_argument("--model", type=str, default="mixtral_8x7b",
                         help="Model name (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe-full",
-                        choices=["megatron-baseline", "megatron",
+                        choices=["megatron", "megatron-overlap",
                                  "deepspeed",
                                  "fluidmoe-f", "fluidmoe-fb", "fluidmoe-full"],
                         help="Implementation to run. One per invocation. "
                              "Each impl uses its native DDP/AR mechanism:\n"
-                             "  megatron-baseline = mcore_DDP overlap=False (AR at end)\n"
-                             "  megatron          = mcore_DDP overlap=True  (within-bwd AR overlap)\n"
+                             "  megatron          = mcore_DDP overlap=False (AR at end)\n"
+                             "  megatron-overlap  = mcore_DDP overlap=True  (within-bwd AR overlap)\n"
                              "  deepspeed         = DeepSpeed ZeRO-0 sync AR at end (expert-aware)\n"
                              "  fluidmoe-f        = FluidDDP, scheduler off\n"
                              "  fluidmoe-fb       = FluidDDP, scheduler on, ar=False\n"
@@ -321,7 +321,7 @@ def main():
 
     # ---- Build model + DDP wrapper per --impl ----
 
-    if args.impl in ("megatron-baseline", "megatron"):
+    if args.impl in ("megatron", "megatron-overlap"):
         # mcore_DDP needs Megatron parallel_state initialized to find groups.
         from megatron.core import parallel_state
         if not parallel_state.model_parallel_is_initialized():
@@ -353,7 +353,7 @@ def main():
         transformer_config = model.layers[0].config
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=False,
-            overlap_grad_reduce=(args.impl == "megatron"),
+            overlap_grad_reduce=(args.impl == "megatron-overlap"),
             use_distributed_optimizer=False,
             bucket_size=None,
         )
@@ -376,6 +376,12 @@ def main():
             dp_size=dp_size,
             dp_cp_size=dp_cp_size,
         )
+        n_shared = sum(1 for _, _, e in ddp_model._buckets if not e)
+        n_expert = sum(1 for _, _, e in ddp_model._buckets if e)
+        shared_elems = sum(f.numel() for f, _, e in ddp_model._buckets if not e)
+        expert_elems = sum(f.numel() for f, _, e in ddp_model._buckets if e)
+        p0(rank, f"  deepspeed buckets: shared={n_shared} ({shared_elems/1e6:.1f}M elems) "
+                 f"expert={n_expert} ({expert_elems/1e6:.1f}M elems), cap={int(5e8/1e6)}M")
 
     elif args.impl in ("fluidmoe-f", "fluidmoe-fb", "fluidmoe-full"):
         from fluid.core.scheduler import get_backward_scheduler
