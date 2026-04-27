@@ -35,14 +35,37 @@ class FluidDDP(torch.nn.Module):
       - AR done in finish_grad_sync() (pre-scale + SUM = AVG)
     """
 
-    def __init__(self, config, module, scheduler):
+    def __init__(self, config, module, scheduler, *,
+                 dp_cp_group=None, expert_dp_group=None):
+        """
+        Args:
+            config: Megatron TransformerConfig (kept for API compat; unused
+                internally). Pass ``None`` for block-test usage.
+            module: model to wrap. Either a Megatron-wrapped GPTModel
+                (with ``decoder.layers``) or a standalone
+                ``fluid.layer.TransformerModel`` (with ``.layers``).
+            scheduler: FluidMoE BackwardScheduler instance.
+            dp_cp_group: explicit data+context parallel process group. If
+                ``None``, falls back to
+                ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
+                Pass explicitly when running outside Megatron's parallel_state
+                (e.g. block-level benchmarks that build groups manually).
+            expert_dp_group: explicit expert-data parallel group. ``None``
+                falls back to ``parallel_state.get_data_modulo_expert_parallel_group()``.
+
+        AR tuning values (gap budgets, bandwidth) are read from ``FLUIDMOE_*``
+        env vars (set by callers like ``run_training.sh`` or block-bench
+        scripts before constructing this wrapper).
+        """
         super().__init__()
-        self.module = module  # Float16Module-wrapped Megatron GPTModel
+        self.module = module  # Megatron Float16Module(GPTModel) or standalone TransformerModel
         self.config = config
         from megatron.core.distributed import DistributedDataParallelConfig
         self.ddp_config = DistributedDataParallelConfig()
         self._scheduler = scheduler
         self._hooks = []
+        self._explicit_dp_cp_group = dp_cp_group
+        self._explicit_expert_dp_group = expert_dp_group
         self._setup_grad_buffer()
         self._configure_scheduler()
 
@@ -56,15 +79,22 @@ class FluidDDP(torch.nn.Module):
     def _collect_fluid_layers(self):
         """Return list of inner FluidMoE TransformerLayer instances.
 
-        Megatron GPTModel with FluidTransformerLayer adapter:
-            decoder.layers[i].layer is the FluidMoE TransformerLayer
-        A layer is recognized by having _get_qkv_weight (method unique to it).
+        Two supported layouts (block test vs production training):
+          1. Megatron GPTModel with FluidTransformerLayer adapter:
+             ``module.decoder.layers[i].layer`` is the FluidMoE TransformerLayer.
+          2. Standalone ``fluid.layer.TransformerModel`` (block-test path):
+             ``module.layers[i]`` is the FluidMoE TransformerLayer directly.
+        A layer is recognized by having ``_get_qkv_weight`` (method unique to it).
         """
         raw = self._get_raw_model()
-        if not hasattr(raw, 'decoder') or not hasattr(raw.decoder, 'layers'):
+        if hasattr(raw, 'decoder') and hasattr(raw.decoder, 'layers'):
+            layers_iter = raw.decoder.layers
+        elif hasattr(raw, 'layers'):
+            layers_iter = raw.layers
+        else:
             return []
         fluid_layers = []
-        for layer in raw.decoder.layers:
+        for layer in layers_iter:
             if hasattr(layer, '_get_qkv_weight'):
                 fluid_layers.append(layer)
             elif hasattr(layer, 'layer') and hasattr(layer.layer, '_get_qkv_weight'):
@@ -72,9 +102,11 @@ class FluidDDP(torch.nn.Module):
         return fluid_layers
 
     def _setup_grad_buffer(self):
-        """Allocate contiguous grad buffer for model-level params and register hooks."""
-        from megatron.core import parallel_state as ps
+        """Allocate contiguous grad buffer for model-level params and register hooks.
 
+        When the model has no params outside FluidMoE TransformerLayers (block-test
+        case), buffer/hooks are skipped and ``self._grad_buffer`` is ``None``.
+        """
         # Params managed by the scheduler: everything inside FluidMoE TransformerLayers.
         scheduler_param_ids = set()
         for fluid_layer in self._collect_fluid_layers():
@@ -92,8 +124,12 @@ class FluidDDP(torch.nn.Module):
             self._dp_cp_group = None
             return
 
-        # DP+CP group for allreduce
-        dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+        # DP+CP group for allreduce: explicit takes precedence over parallel_state.
+        if self._explicit_dp_cp_group is not None:
+            dp_cp_group = self._explicit_dp_cp_group
+        else:
+            from megatron.core import parallel_state as ps
+            dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
         dp_cp_size = dist.get_world_size(dp_cp_group)
         self._dp_cp_group = dp_cp_group if dp_cp_size > 1 else None
         self._dp_cp_size = dp_cp_size
@@ -130,20 +166,29 @@ class FluidDDP(torch.nn.Module):
 
     def _configure_scheduler(self):
         """Configure scheduler's allreduce groups and AR buffers for decoder params."""
-        from megatron.core import parallel_state as ps
+        # Resolve groups: explicit kwargs take precedence over parallel_state.
+        if self._explicit_dp_cp_group is not None:
+            dp_cp_group = self._explicit_dp_cp_group
+            dp_cp_size = dist.get_world_size(dp_cp_group)
+        else:
+            from megatron.core import parallel_state as ps
+            dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+            dp_cp_size = dist.get_world_size(dp_cp_group)
 
-        dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
-        dp_cp_size = dist.get_world_size(dp_cp_group)
+        if self._explicit_expert_dp_group is not None:
+            expert_dp_group = self._explicit_expert_dp_group
+            expert_dp_size = (dist.get_world_size(expert_dp_group)
+                              if expert_dp_group is not None else 1)
+        else:
+            from megatron.core import parallel_state as ps
+            try:
+                expert_dp_group = ps.get_data_modulo_expert_parallel_group()
+                expert_dp_size = dist.get_world_size(expert_dp_group) if expert_dp_group else 1
+            except Exception:
+                expert_dp_group = None
+                expert_dp_size = 1
 
-        # Expert DP group
-        try:
-            expert_dp_group = ps.get_data_modulo_expert_parallel_group()
-            expert_dp_size = dist.get_world_size(expert_dp_group) if expert_dp_group else 1
-        except Exception:
-            expert_dp_group = None
-            expert_dp_size = 1
-
-        # AR bandwidth and gap budgets from env
+        # AR bandwidth and gap budgets from env (callers set FLUIDMOE_* vars).
         import os as _os
         _env_float = lambda key, default: float(_os.environ.get(key, str(default)))
         gap_budgets = {}
