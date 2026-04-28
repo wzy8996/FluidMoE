@@ -68,9 +68,8 @@ class _DeepSpeedZeRO0AR(nn.Module):
         uses fp32 grad accumulation). bf16 grads cast on copy_ into the flat.
 
     Naive ``torch.nn.parallel.DistributedDataParallel`` would AR every param
-    across the whole group, including experts — for mixtral_8x7b that means
-    ~7.5 GB of wasted traffic per iter. This wrapper filters expert grads by
-    parameter name, matching what DeepSpeed engine does.
+    across the whole group, including experts. This wrapper filters expert
+    grads by parameter name, matching what DeepSpeed engine does.
     """
 
     _BUCKET_SIZE_ELEMS = int(5e8)  # DeepSpeed reduce_bucket_size default
@@ -172,7 +171,7 @@ class _DeepSpeedZeRO0AR(nn.Module):
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
-    parser.add_argument("--model", type=str, default="mixtral_8x7b",
+    parser.add_argument("--model", type=str, default="dbrx_base",
                         help="Model name (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe-full",
                         choices=["megatron", "megatron-overlap",
@@ -255,10 +254,11 @@ def main():
 
     model_cfg = get_model_config(args.model)
 
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{rank}")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", device_id=device)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     hidden_size = int(model_cfg.get("hidden_size", 4096))

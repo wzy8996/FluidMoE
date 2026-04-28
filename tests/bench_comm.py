@@ -281,7 +281,11 @@ def bench_nvshmem_roundrobin(chunk_numel: int, ep_group, device, nvshmem_backend
     recv_bufs = []
     global_ranks = dist.get_process_group_ranks(ep_group)
     for i, partner_local in enumerate(partners):
-        sb = torch.empty(chunk_numel, dtype=torch.bfloat16, device=device)
+        # IBRC requires the local source buffer to be NVSHMEM-registered or
+        # symmetric. Use symmetric send buffers so cross-node puts do not trip
+        # IBV_WC_LOC_PROT_ERR.
+        sb = nvshmem_backend.alloc_recv_buffer(
+            f"bench_nvshmem_send_{i}", chunk_numel, torch.bfloat16, device)
         _fill_pattern(sb, sender_rank=my_rank, receiver_rank=partner_local)
         send_bufs.append(sb)
         # Allocate symmetric recv via the production helper.
@@ -357,7 +361,11 @@ def bench_nvshmem_all_concurrent(chunk_numel: int, ep_group, device, nvshmem_bac
     local_recv_sym_ptrs = []
     local_sig_addrs = []
     for i, partner_local in enumerate(partners_local):
-        sb = torch.empty(chunk_numel, dtype=torch.bfloat16, device=device)
+        # IBRC requires the local source buffer to be NVSHMEM-registered or
+        # symmetric. Use symmetric send buffers so cross-node puts do not trip
+        # IBV_WC_LOC_PROT_ERR.
+        sb = nvshmem_backend.alloc_recv_buffer(
+            f"bench_nvshmem_conc_send_{i}", chunk_numel, torch.bfloat16, device)
         _fill_pattern(sb, sender_rank=my_rank, receiver_rank=partner_local)
         send_bufs.append(sb)
 
@@ -436,17 +444,37 @@ def main():
     parser = argparse.ArgumentParser(description="AllToAll vs P2P communication benchmark")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--skip-nvshmem",
+        action="store_true",
+        help="Skip NVSHMEM benchmark/probe and only run NCCL AllToAll/P2P.",
+    )
+    parser.add_argument(
+        "--sizes-mb",
+        default="0.5,1,2,4,8,16,32,64,128",
+        help="Comma-separated per-peer message sizes in MiB.",
+    )
     args = parser.parse_args()
 
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{rank}")
+    # ``LOCAL_RANK`` is per-node (for cuda device pick); ``RANK`` is global
+    # (for "single rank prints" checks). On a single node they collapse, so
+    # the previous code worked single-node — but on multi-node every node's
+    # local-rank-0 would print headers/rows, duplicating output.
+    # See https://pytorch.org/docs/stable/elastic/run.html for the contract.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", device_id=device)
+    rank = dist.get_rank()  # global rank — used only for printing
 
     ep_group = dist.group.WORLD
     ep_size = dist.get_world_size()
 
-    nvshmem_backend, has_nvshmem = _try_nvshmem_backend()
+    p2p_backend_choice = os.environ.get("FLUIDMOE_P2P_BACKEND", "").lower()
+    if args.skip_nvshmem or p2p_backend_choice == "nccl":
+        nvshmem_backend, has_nvshmem = None, False
+    else:
+        nvshmem_backend, has_nvshmem = _try_nvshmem_backend()
 
     if rank == 0:
         print(f"{'='*100}")
@@ -469,7 +497,9 @@ def main():
         print(hdr)
         print("  ".join("-" * 10 for _ in cols + bw_cols))
 
-    chunk_sizes_mb = [0.5, 1, 2, 4, 8, 16, 32, 64, 128]
+    chunk_sizes_mb = [float(x) for x in args.sizes_mb.split(",") if x.strip()]
+    if any(x <= 0 for x in chunk_sizes_mb):
+        raise ValueError(f"--sizes-mb must contain positive numbers: {args.sizes_mb}")
 
     def fmt_ms(x):
         return f"{x:>8.3f}ms" if x == x else f"{'nan':>8s}ms"  # nan check via x==x

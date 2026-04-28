@@ -108,7 +108,7 @@ def main():
     dist.init_process_group(backend="nccl", device_id=device)
     world = dist.get_world_size()
 
-    cfg = get_model_config("mixtral_8x7b")
+    cfg = get_model_config("dbrx_base")
     bench = get_block_benchmark_defaults()
     dp_size = int(bench["dp_size"]); cp_size = int(bench["cp_size"]); ep_size = int(bench["ep_size"])
     assert cp_size == ep_size
@@ -124,7 +124,7 @@ def main():
     x_grad = x.clone().detach().requires_grad_(True)
 
     p0(rank, "="*70)
-    p0(rank, "Phase 1 smoke test: mixtral_8x7b, dp=%d cp=%d ep=%d" % (dp_size, cp_size, ep_size))
+    p0(rank, "Phase 1 smoke test: dbrx_base, dp=%d cp=%d ep=%d" % (dp_size, cp_size, ep_size))
     p0(rank, "="*70)
 
     model = build_model(cfg, bench, cp_group, ep_group, device)

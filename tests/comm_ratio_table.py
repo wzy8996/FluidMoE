@@ -126,13 +126,18 @@ def _build_groups(rank, dp_size, cp_size, world_size, num_gpus):
 
 
 def measure_megatron_block(model_cfg, dp_size, cp_size, ep_size,
-                           warmup, iters, rank, world_size, num_gpus):
+                           warmup, iters, rank, num_gpus,
+                           all_group, cp_group, ep_group, dp_group, dp_cp_size):
     """Build Megatron baseline block, run warmup + timed iters, return per-iter
-    metrics dict (fwd_a2a_ms, bwd_a2a_ms, ar_tail_ms, iter_ms)."""
-    device = torch.device(f'cuda:{rank}')
+    metrics dict (fwd_a2a_ms, bwd_a2a_ms, ar_tail_ms, iter_ms).
 
-    all_group, cp_group, ep_group, dp_group, dp_cp_size = _build_groups(
-        rank, dp_size, cp_size, world_size, num_gpus)
+    Process groups and ``parallel_state`` are passed in (initialized once in
+    ``main()``); we never destroy/recreate them across models since that
+    leaks NCCL communicator state and hangs the next model's first
+    collective. Same parallel_state config (cp/ep/tp) works for every model
+    because the parallelism layout is shared across the run.
+    """
+    device = torch.device(f'cuda:{rank}')
 
     hidden = int(model_cfg['hidden_size'])
     num_heads = int(model_cfg['num_heads'])
@@ -146,115 +151,109 @@ def measure_megatron_block(model_cfg, dp_size, cp_size, ep_size,
     capacity_factor = float(model_cfg.get('capacity_factor', 1.0))
     seq_local = seq_len // cp_size
 
-    from megatron.core import parallel_state
-    if not parallel_state.model_parallel_is_initialized():
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
-            context_parallel_size=cp_size, expert_model_parallel_size=ep_size,
+    # Wrap construction + run in try/finally so we ALWAYS free model + ddp
+    # before returning, even on OOM. Without this, exception unwinds the
+    # frame but autograd graph / NCCL workspaces may keep tensors alive,
+    # leaving the next dist.barrier() with no headroom.
+    model = None
+    ddp_model = None
+    x_grad = None
+    try:
+        from megatron_baseline import MegatronBaselineTransformerModel
+        model = MegatronBaselineTransformerModel(
+            num_layers=num_layers, hidden_size=hidden,
+            num_heads=num_heads, num_kv_heads=num_kv_heads,
+            ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
+            cp_group=cp_group, ep_group=ep_group,
+            shared_dp_group=all_group,
+            expert_dp_group=dp_group if dp_size > 1 else None,
+            overlap_a2a=False, delay_wgrad=False,
+            capacity_factor=capacity_factor,
+            dtype=torch.bfloat16, device=device,
         )
 
-    from megatron_baseline import MegatronBaselineTransformerModel
-    model = MegatronBaselineTransformerModel(
-        num_layers=num_layers, hidden_size=hidden,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        ffn_hidden_size=ffn_hidden, num_experts=num_experts, top_k=top_k,
-        cp_group=cp_group, ep_group=ep_group,
-        shared_dp_group=all_group,
-        expert_dp_group=dp_group if dp_size > 1 else None,
-        overlap_a2a=False, delay_wgrad=False,
-        capacity_factor=capacity_factor,
-        dtype=torch.bfloat16, device=device,
-    )
+        from megatron.core.distributed import (
+            DistributedDataParallel as McoreDDP,
+            DistributedDataParallelConfig,
+        )
+        transformer_config = model.layers[0].config
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,         # match real-training default
+            overlap_grad_reduce=False,        # paper "DP sync tail": all AR at end
+            use_distributed_optimizer=False,
+            bucket_size=None,
+        )
+        ddp_model = McoreDDP(transformer_config, ddp_config, model)
 
-    from megatron.core.distributed import (
-        DistributedDataParallel as McoreDDP,
-        DistributedDataParallelConfig,
-    )
-    transformer_config = model.layers[0].config
-    ddp_config = DistributedDataParallelConfig(
-        grad_reduce_in_fp32=True,         # match real-training default
-        overlap_grad_reduce=False,        # paper "DP sync tail": all AR at end
-        use_distributed_optimizer=False,
-        bucket_size=None,
-    )
-    ddp_model = McoreDDP(transformer_config, ddp_config, model)
+        x_grad = torch.randn(seq_local, batch_size, hidden,
+                             dtype=torch.bfloat16, device=device, requires_grad=True)
 
-    x_grad = torch.randn(seq_local, batch_size, hidden,
-                         dtype=torch.bfloat16, device=device, requires_grad=True)
-
-    def run_iter():
-        ddp_model.zero_grad_buffer()
-        out = ddp_model(x_grad).sum()
-        out.backward()
-        ddp_model.finish_grad_sync()
-
-    # Warmup (no timing)
-    for _ in range(warmup):
-        run_iter()
-    torch.cuda.synchronize()
-
-    # Timed run with comm timing patched. A2A in Megatron's MoE dispatcher and
-    # CP attention go through ``dist.all_to_all_single`` directly, so the
-    # CommTimer patch catches them. AR in mcore_DDP.finish_grad_sync goes
-    # through ``_coalescing_manager``, which bypasses ``dist.all_reduce`` —
-    # so we measure AR phase wall-clock with a dedicated CUDA event pair
-    # instead. Since finish_grad_sync only does AR (no compute), the
-    # phase wall equals the AR time.
-    #
-    # ``torch.cuda.synchronize()`` at each phase boundary forces strict-serial
-    # execution: all GPU work from the previous phase must complete before the
-    # next phase's CPU launches begin. This makes ``iter_ms = fwd + bwd + ar``
-    # bit-additive (eliminates any chance of accidental cross-phase overlap)
-    # at the cost of ~10us CPU stall per sync, negligible vs iter_ms.
-    iter_evt_s = torch.cuda.Event(enable_timing=True)
-    iter_evt_e = torch.cuda.Event(enable_timing=True)
-    ar_phase_events = []  # list of (start, end) per iter
-    with CommTimer() as timer:
-        iter_evt_s.record()
-        for _ in range(iters):
+        def run_iter():
             ddp_model.zero_grad_buffer()
-
-            timer.phase = 'fwd'
             out = ddp_model(x_grad).sum()
-            torch.cuda.synchronize()  # phase boundary: force fwd fully done
-
-            timer.phase = 'bwd'
             out.backward()
-            torch.cuda.synchronize()  # phase boundary: force bwd fully done
-
-            timer.phase = 'ar'
-            ar_s = torch.cuda.Event(enable_timing=True)
-            ar_e = torch.cuda.Event(enable_timing=True)
-            ar_s.record()
             ddp_model.finish_grad_sync()
-            ar_e.record()
-            torch.cuda.synchronize()  # phase boundary: force ar fully done
-            ar_phase_events.append((ar_s, ar_e))
-        iter_evt_e.record()
-        comm_ms = timer.aggregate_ms()
 
-    iter_total_ms = iter_evt_s.elapsed_time(iter_evt_e)
-    ar_phase_total_ms = sum(s.elapsed_time(e) for s, e in ar_phase_events)
+        # Warmup (no timing)
+        for _ in range(warmup):
+            run_iter()
+        torch.cuda.synchronize()
 
-    # Free this model before moving to the next (release GPU memory).
-    del ddp_model, model
-    gc.collect()
-    torch.cuda.empty_cache()
+        # Timed run with comm timing patched. A2A in Megatron's MoE dispatcher
+        # goes through ``dist.all_to_all_single`` directly, so the CommTimer
+        # patch catches them. AR in mcore_DDP.finish_grad_sync goes through
+        # ``_coalescing_manager`` which bypasses ``dist.all_reduce`` — so
+        # we measure AR phase wall-clock with a dedicated CUDA event pair.
+        # ``torch.cuda.synchronize()`` at each phase boundary forces
+        # strict-serial execution so iter_ms = fwd + bwd + ar bit-additively.
+        iter_evt_s = torch.cuda.Event(enable_timing=True)
+        iter_evt_e = torch.cuda.Event(enable_timing=True)
+        ar_phase_events = []
+        with CommTimer() as timer:
+            iter_evt_s.record()
+            for _ in range(iters):
+                ddp_model.zero_grad_buffer()
 
-    return {
-        'fwd_a2a_ms': comm_ms.get(('fwd', 'a2a'), 0.0) / iters,
-        'bwd_a2a_ms': comm_ms.get(('bwd', 'a2a'), 0.0) / iters,
-        # AR uses phase wall-clock since finish_grad_sync goes through
-        # _coalescing_manager and bypasses our dist.all_reduce patch.
-        'ar_tail_ms': ar_phase_total_ms / iters,
-        # Stray AR via dist.all_reduce during fwd/bwd, or A2A within AR
-        # phase — should be ~0 if Megatron only uses coalesced AR in
-        # finish_grad_sync. Reported as a sanity check.
-        'fwd_ar_ms':  comm_ms.get(('fwd', 'ar'),  0.0) / iters,
-        'bwd_ar_ms':  comm_ms.get(('bwd', 'ar'),  0.0) / iters,
-        'ar_a2a_ms':  comm_ms.get(('ar',  'a2a'), 0.0) / iters,
-        'iter_ms': iter_total_ms / iters,
-    }
+                timer.phase = 'fwd'
+                out = ddp_model(x_grad).sum()
+                torch.cuda.synchronize()
+
+                timer.phase = 'bwd'
+                out.backward()
+                torch.cuda.synchronize()
+
+                timer.phase = 'ar'
+                ar_s = torch.cuda.Event(enable_timing=True)
+                ar_e = torch.cuda.Event(enable_timing=True)
+                ar_s.record()
+                ddp_model.finish_grad_sync()
+                ar_e.record()
+                torch.cuda.synchronize()
+                ar_phase_events.append((ar_s, ar_e))
+            iter_evt_e.record()
+            comm_ms = timer.aggregate_ms()
+
+        iter_total_ms = iter_evt_s.elapsed_time(iter_evt_e)
+        ar_phase_total_ms = sum(s.elapsed_time(e) for s, e in ar_phase_events)
+
+        return {
+            'fwd_a2a_ms': comm_ms.get(('fwd', 'a2a'), 0.0) / iters,
+            'bwd_a2a_ms': comm_ms.get(('bwd', 'a2a'), 0.0) / iters,
+            'ar_tail_ms': ar_phase_total_ms / iters,
+            'fwd_ar_ms':  comm_ms.get(('fwd', 'ar'),  0.0) / iters,
+            'bwd_ar_ms':  comm_ms.get(('bwd', 'ar'),  0.0) / iters,
+            'ar_a2a_ms':  comm_ms.get(('ar',  'a2a'), 0.0) / iters,
+            'iter_ms': iter_total_ms / iters,
+        }
+    finally:
+        # ALWAYS release model + ddp + autograd graph before returning,
+        # even on OOM. Without this, an exception leaves the (huge) ddp
+        # main_grad buffer alive in stack frames the GC may not reach
+        # before the next dist.barrier(), which itself needs CUDA workspace.
+        del ddp_model, model, x_grad
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +305,12 @@ def emit_table(rows):
 # Main
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODELS = ['mixtral_8x7b', 'dbrx', 'phi_3_5_moe', 'olmoe_1b_7b']
+DEFAULT_MODELS = [
+    'dbrx_base',
+    'deepseek_v3_mha_proxy',
+    'glm4_5_air_mha_proxy',
+    'qwen3_30b_a3b',
+]
 
 
 def main():
@@ -342,6 +346,21 @@ def main():
         if args.seq_len is not None:
             print(f"# seq_len override: {args.seq_len}")
 
+    # Build process groups + initialize parallel_state ONCE for the whole run.
+    # Re-initializing (via destroy_model_parallel + initialize_model_parallel)
+    # between models leaks NCCL communicator state and reliably hangs the
+    # second model's first collective. Same cp/ep config works for every
+    # model since the parallelism layout is fixed across the run.
+    all_group, cp_group, ep_group, dp_group, dp_cp_size = _build_groups(
+        rank, args.dp_size, args.cp_size, world_size, num_gpus)
+    from megatron.core import parallel_state
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
+            context_parallel_size=args.cp_size,
+            expert_model_parallel_size=args.ep_size,
+        )
+
     rows = []
     for model_name in args.models:
         try:
@@ -360,17 +379,21 @@ def main():
         try:
             metrics = measure_megatron_block(
                 cfg, args.dp_size, args.cp_size, args.ep_size,
-                args.warmup, args.iters, rank, world_size, num_gpus)
+                args.warmup, args.iters, rank, num_gpus,
+                all_group, cp_group, ep_group, dp_group, dp_cp_size)
             rows.append((model_name, metrics, None))
         except Exception as e:
             err = type(e).__name__ + ": " + str(e).split('\n')[0]
             rows.append((model_name, None, err))
-            torch.cuda.empty_cache()
 
-        # Tear down parallel_state so the next model can re-init it cleanly.
-        from megatron.core import parallel_state as ps
-        if ps.model_parallel_is_initialized():
-            ps.destroy_model_parallel()
+        # Between models: aggressive cleanup + barrier. The finally inside
+        # measure_megatron_block already del's the model and empties cache,
+        # but we double-up here in case the failure path didn't reach
+        # finally (e.g. OOM during construction before assignment).
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        dist.barrier()
 
     if rank == 0:
         emit_table(rows)

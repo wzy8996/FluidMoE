@@ -1,25 +1,13 @@
 """Paper-oriented MoE benchmark presets.
 
-These presets are tailored for the NeurIPS-facing FluidMoE paper:
+These presets target the long-sequence Ulysses CP + EP setting used by the
+FluidMoE paper: ``dp=2, cp=4, ep=4`` and 32K-token blocks.
 
-- Main paper, default setting: ``dp=2, cp=4, ep=4``
-- Scaling setting: ``dp=2, cp=8, ep=8``
-
-Model choice is driven by the paper's core problem setting rather than by
-"newest model wins". The final paper plan uses:
-
-- public and recognizable MoE families
-- a main-result set that stays close to real public models
-- a scaling set that stresses higher-CP / higher-expert-count behavior
-- complementary roles across models:
-  - canonical balanced case
-  - expert-heavier / higher-top-k case
-  - modern long-context case
-  - higher-expert-count scaling case
-
-For public frontier models, we keep the per-layer architecture faithful to the
-official configs while using reduced depth and conservative sequence/batch
-settings so the benchmarks remain practical on 8/16-GPU nodes.
+For public MoE models, the per-layer dimensions follow the released configs as
+closely as this block benchmark supports; ``num_layers`` is reduced to keep the
+8-GPU experiments practical. Entries ending in ``_proxy`` use the official MoE
+dimensions but map non-standard attention variants (MLA, separated head_dim, or
+sliding attention) onto FluidMoE's current MHA/GQA block.
 """
 
 from __future__ import annotations
@@ -29,32 +17,15 @@ from typing import Dict, Any
 
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ------------------------------------------------------------------
-    # Main-paper presets (default setting: dp=2, cp=4, ep=4)
-    # These are the headline models used in the main-result tables.
+    # Long-sequence Ulysses CP + EP presets (default: dp=2, cp=4, ep=4)
+    #
+    # ``seq_len`` is the benchmark workload length. For models whose original
+    # context is shorter, this is a long-sequence block stress setting rather
+    # than a checkpoint-compatible full-model setting.
     # ------------------------------------------------------------------
-    # 1) Mistral AI - Mixtral-8x7B-v0.1
-    # Canonical GQA + top-k=2 MoE model.
-    # Also the cleanest "all baselines comparable" case.
-    "mixtral_8x7b": {
-        "hf_model_id": "mistralai/Mixtral-8x7B-v0.1",
-        "hidden_size": 4096,
-        "num_heads": 32,
-        "num_kv_heads": 8,
-        "ffn_hidden": 14336,
-        "num_experts": 8,
-        "top_k": 2,
-        "num_layers": 2,
-        "seq_len": 4096,
-        "batch_size": 2,
-        "capacity_factor": 1.0,
-    },
-
-    # 2) Databricks - DBRX
-    # Expert-heavier public MoE model:
-    # kv_n_heads=8, top-k=4, 16 experts, 32K context.
-    # This preset stresses expert-path communication while remaining compatible
-    # with both cp=4 and cp=8.
-    "dbrx": {
+    # 1) Databricks - DBRX Base.
+    # Official per-layer MoE dimensions; layers reduced from 40.
+    "dbrx_base": {
         "hf_model_id": "databricks/dbrx-base",
         "hidden_size": 6144,
         "num_heads": 48,
@@ -62,46 +33,61 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "ffn_hidden": 10752,
         "num_experts": 16,
         "top_k": 4,
-        "num_layers": 6,
-        "seq_len": 8192,
+        "num_layers": 4,
+        "seq_len": 4096,
         "batch_size": 2,
         "capacity_factor": 1.0,
     },
 
-    # 3) Microsoft - Phi-3.5-MoE
-    # Modern long-context GQA + top-k=2 model that remains close to a standard
-    # Transformer+MoE block and is compatible with both cp=4 and cp=8.
-    "phi_3_5_moe": {
-        "hf_model_id": "microsoft/Phi-3.5-MoE-instruct",
+    # 2) DeepSeek AI - DeepSeek-V3.
+    # Official MoE dimensions: hidden=7168, routed experts=256, top-k=8,
+    # moe_intermediate=2048, layers=61. DeepSeek-V3 uses MLA; this proxy maps
+    # it to an MHA block while keeping the MoE sizes. Layers are capped at 2
+    # because the true expert count is very memory-heavy even on 8x H100.
+    "deepseek_v3_mha_proxy": {
+        "hf_model_id": "deepseek-ai/DeepSeek-V3",
+        "hidden_size": 7168,
+        "num_heads": 128,
+        "num_kv_heads": 128,
+        "ffn_hidden": 2048,
+        "num_experts": 256,
+        "top_k": 8,
+        "num_layers": 2,
+        "seq_len": 4096,
+        "batch_size": 2,
+        "capacity_factor": 1.0,
+    },
+
+    # 3) Z.ai - GLM-4.5-Air.
+    # Modern GLM MoE with 128 routed experts, top-k=8, 131K context, and 46
+    # layers. Official GLM attention has a separate head_dim with 96 attention
+    # heads; this proxy uses 32 heads so hidden=4096 maps cleanly to head_dim=128.
+    "glm4_5_air_mha_proxy": {
+        "hf_model_id": "zai-org/GLM-4.5-Air",
         "hidden_size": 4096,
         "num_heads": 32,
         "num_kv_heads": 8,
-        "ffn_hidden": 6400,
-        "num_experts": 16,
-        "top_k": 2,
-        "num_layers": 8,
-        "seq_len": 8192,
+        "ffn_hidden": 1408,
+        "num_experts": 128,
+        "top_k": 8,
+        "num_layers": 4,
+        "seq_len": 4096,
         "batch_size": 2,
         "capacity_factor": 1.0,
     },
 
-    # ------------------------------------------------------------------
-    # Scaling / extension preset
-    # Used in higher-CP and higher-expert-count stress experiments.
-    # ------------------------------------------------------------------
-    # 4) AllenAI - OLMoE-1B-7B-0924
-    # Higher-expert-count public model (64 experts, top-k=8, MHA) that is
-    # well-suited to cp=8 / ep=8 scaling experiments.
-    "olmoe_1b_7b": {
-        "hf_model_id": "allenai/OLMoE-1B-7B-0924",
+    # 4) Qwen - Qwen3-30B-A3B.
+    # Official per-layer MoE dimensions; layers reduced from 48.
+    "qwen3_30b_a3b": {
+        "hf_model_id": "Qwen/Qwen3-30B-A3B",
         "hidden_size": 2048,
-        "num_heads": 16,
-        "num_kv_heads": 16,
-        "ffn_hidden": 1024,
-        "num_experts": 64,
+        "num_heads": 32,
+        "num_kv_heads": 4,
+        "ffn_hidden": 768,
+        "num_experts": 128,
         "top_k": 8,
         "num_layers": 4,
-        "seq_len": 4096,
+        "seq_len": 2048,
         "batch_size": 2,
         "capacity_factor": 1.0,
     },

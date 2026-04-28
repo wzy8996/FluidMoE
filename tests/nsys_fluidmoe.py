@@ -40,7 +40,7 @@ from model_configs import get_model_config
 def parse_args():
     d = get_block_benchmark_defaults()
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=str, default="mixtral_8x7b")
+    p.add_argument("--model", type=str, default="dbrx_base")
     p.add_argument("--dp-size", type=int, default=d["dp_size"])
     p.add_argument("--cp-size", type=int, default=d["cp_size"])
     p.add_argument("--ep-size", type=int, default=d["ep_size"])

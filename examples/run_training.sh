@@ -8,8 +8,8 @@
 # Experiment configs (parallelism, chunks, AR) are read from tools/experiment_configs.py.
 #
 # Usage:
-#   bash examples/run_training.sh                          # default: mixtral_8x7b
-#   MODEL=mixtral_8x7b bash examples/run_training.sh      # different model
+#   bash examples/run_training.sh                          # default: dbrx_base
+#   MODEL=qwen3_30b_a3b bash examples/run_training.sh      # different model
 #   TRAIN_ITERS=500 bash examples/run_training.sh          # more iterations
 set -euo pipefail
 
@@ -20,7 +20,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
-MODEL="${MODEL:-mixtral_8x7b}"
+MODEL="${MODEL:-dbrx_base}"
 TRAIN_ITERS="${TRAIN_ITERS:-300}"
 LR_WARMUP="${LR_WARMUP:- 30}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"

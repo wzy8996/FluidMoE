@@ -28,7 +28,7 @@ from model_configs import get_model_config, list_model_names
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE parameter search")
-    parser.add_argument("--model", type=str, default="mixtral_8x7b", help="Model name (from tools/model_configs.py)")
+    parser.add_argument("--model", type=str, default="dbrx_base", help="Model name (from tools/model_configs.py)")
     parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     return parser.parse_args()
 
@@ -43,10 +43,11 @@ model_name = args.model
 model_cfg = get_model_config(model_name)
 tune_defaults = get_tune_defaults()
 
-rank = int(os.environ.get('LOCAL_RANK', 0))
-device = torch.device(f'cuda:{rank}')
+local_rank = int(os.environ.get('LOCAL_RANK', 0))
+device = torch.device(f'cuda:{local_rank}')
 torch.cuda.set_device(device)
 dist.init_process_group(backend='nccl', device_id=device)
+rank = dist.get_rank()
 world_size = dist.get_world_size()
 
 
@@ -449,10 +450,26 @@ persist_updates = {
     "expert_ar_bw": round(expert_ar_bw, 2),
 }
 
-if rank == 0:
-    persist_block_benchmark_defaults(persist_updates)
-    p0(f"\n  Wrote back to BLOCK_BENCHMARK_DEFAULTS in tools/experiment_configs.py")
+import socket
 
-dist.barrier()
+# Each node's LOCAL_RANK == 0 writes its own copy of
+# ``tools/experiment_configs.py``:
+#   - On shared FS (NFS / Lustre): all writers target the same inode.
+#     We sequence writes node-by-node so concurrent writes don't garble
+#     the file. Last writer effectively wins; per-node ar_bw / gap_budgets
+#     differ only within measurement noise.
+#   - On per-node local FS: every node ends up with its own tuned config
+#     from its own bw / gap measurements (which is what you want — each
+#     node's network can differ).
+nproc_per_node = int(os.environ.get('LOCAL_WORLD_SIZE', world_size))
+my_node = rank // nproc_per_node
+n_nodes = max(1, world_size // nproc_per_node)
+for write_node in range(n_nodes):
+    if local_rank == 0 and my_node == write_node:
+        persist_block_benchmark_defaults(persist_updates)
+        print(f"  [{socket.gethostname()}] wrote BLOCK_BENCHMARK_DEFAULTS in "
+              f"tools/experiment_configs.py", flush=True)
+    dist.barrier()
+
 dist.destroy_process_group()
 p0("\nDone!")

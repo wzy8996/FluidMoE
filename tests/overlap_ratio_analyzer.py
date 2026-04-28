@@ -27,7 +27,7 @@ from fluid.core.scheduler import get_backward_scheduler
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="Overlap ratio analyzer")
-    parser.add_argument("--model", type=str, default="mixtral_8x7b")
+    parser.add_argument("--model", type=str, default="dbrx_base")
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
     parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])
@@ -48,10 +48,11 @@ def main():
         return
 
     cfg = get_model_config(args.model)
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{rank}")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", device_id=device)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     hidden_size = int(cfg.get("hidden_size", 4096))
