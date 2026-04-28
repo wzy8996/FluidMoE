@@ -168,6 +168,5 @@ if __name__ == "__main__":
         args_defaults={
             'tokenizer_type': 'NullTokenizer',
             'vocab_size': 50257,
-            'grad_reduce_in_bf16': True,
         },
     )

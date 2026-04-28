@@ -45,6 +45,23 @@ from fluid.moe.backward import (
 )
 
 
+def _apply_rotary(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply non-interleaved RoPE to ``t`` of shape [seq, batch, heads, dim]
+    with ``freqs`` of shape [seq, 1, 1, rot_dim]. Matches Megatron's
+    ``_apply_rotary_pos_emb_bshd`` (rotary_interleaved=False, mscale=1.0).
+    Inside an autograd-tracked block, this propagates grad through to ``t``."""
+    rot_dim = freqs.shape[-1]
+    t_rot = t[..., :rot_dim]
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+    x1, x2 = torch.chunk(t_rot, 2, dim=-1)
+    rotated = torch.cat((-x2, x1), dim=-1)
+    t_rot = t_rot * cos_ + rotated * sin_
+    if rot_dim == t.shape[-1]:
+        return t_rot
+    return torch.cat((t_rot, t[..., rot_dim:]), dim=-1)
+
+
 class TransformerLayerFunction(torch.autograd.Function):
     """
     Unified autograd.Function for complete Transformer layer.
@@ -100,6 +117,9 @@ class TransformerLayerFunction(torch.autograd.Function):
         router_dtype: torch.dtype = torch.bfloat16,
         aux_loss_coeff: float = 0.0,
         z_loss_coeff: float = 0.0,
+        # Rotary positional embedding (full sequence, [seq_full, 1, 1, rot_dim]).
+        # ``None`` skips RoPE (legacy block-test path / models without RoPE).
+        rotary_pos_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for complete Transformer layer."""
         needs_grad = hidden_states.requires_grad
@@ -148,6 +168,9 @@ class TransformerLayerFunction(torch.autograd.Function):
 
         # Scaled Dot-Product Attention
         # Keep computation graph for backward: avoids redundant forward in backward.
+        # When rotary_pos_emb is supplied, RoPE is applied inside the
+        # ``enable_grad`` block so autograd propagates dQ/dK back through the
+        # rotation onto the leaf q_for_attn/k_for_attn tensors.
         if te_attn is not None:
             # TE DotProductAttention: uses sbhd format [seq, batch, heads, dim]
             # Output is 3D [seq, batch, hidden] (heads*head_dim flattened)
@@ -156,32 +179,57 @@ class TransformerLayerFunction(torch.autograd.Function):
                     q_for_attn = q_hp.detach().requires_grad_(True)
                     k_for_attn = k_hp.detach().requires_grad_(True)
                     v_for_attn = v_hp.detach().requires_grad_(True)
+                    if rotary_pos_emb is not None:
+                        q_attn_in = _apply_rotary(q_for_attn, rotary_pos_emb)
+                        k_attn_in = _apply_rotary(k_for_attn, rotary_pos_emb)
+                    else:
+                        q_attn_in, k_attn_in = q_for_attn, k_for_attn
                     attn_out_te = te_attn(
-                        q_for_attn, k_for_attn, v_for_attn,
+                        q_attn_in, k_attn_in, v_for_attn,
                         attention_mask=None,
                     )
             else:
-                attn_out_te = te_attn(q_hp, k_hp, v_hp, attention_mask=None)
+                if rotary_pos_emb is not None:
+                    q_attn_in = _apply_rotary(q_hp, rotary_pos_emb)
+                    k_attn_in = _apply_rotary(k_hp, rotary_pos_emb)
+                else:
+                    q_attn_in, k_attn_in = q_hp, k_hp
+                attn_out_te = te_attn(q_attn_in, k_attn_in, v_hp, attention_mask=None)
             # Reshape TE output from 3D [seq, batch, hidden] to 4D [seq, batch, heads, dim]
             attn_out = attn_out_te.view(
                 q_hp.shape[0], q_hp.shape[1], q_heads_local, head_dim
             )
         else:
-            # PyTorch SDPA: needs bhsd format [batch, heads, seq, dim]
-            q_bf = q_hp.permute(1, 2, 0, 3)
-            k_bf = k_hp.permute(1, 2, 0, 3)
-            v_bf = v_hp.permute(1, 2, 0, 3)
+            # PyTorch SDPA: needs bhsd format [batch, heads, seq, dim].
+            # Save sbhd leaves on ctx so backward (autograd.grad) lands grads
+            # in sbhd, pre-rotation — what hp2sp_qkv_backward expects.
             if needs_grad:
                 with torch.enable_grad():
-                    q_for_attn = q_bf.detach().requires_grad_(True)
-                    k_for_attn = k_bf.detach().requires_grad_(True)
-                    v_for_attn = v_bf.detach().requires_grad_(True)
+                    q_for_attn = q_hp.detach().requires_grad_(True)
+                    k_for_attn = k_hp.detach().requires_grad_(True)
+                    v_for_attn = v_hp.detach().requires_grad_(True)
+                    if rotary_pos_emb is not None:
+                        q_attn_in = _apply_rotary(q_for_attn, rotary_pos_emb)
+                        k_attn_in = _apply_rotary(k_for_attn, rotary_pos_emb)
+                    else:
+                        q_attn_in, k_attn_in = q_for_attn, k_for_attn
                     attn_out_bf = scaled_dot_product_attention_forward(
-                        q_for_attn, k_for_attn, v_for_attn, scale=scale, is_causal=True, enable_gqa=enable_gqa
+                        q_attn_in.permute(1, 2, 0, 3),
+                        k_attn_in.permute(1, 2, 0, 3),
+                        v_for_attn.permute(1, 2, 0, 3),
+                        scale=scale, is_causal=True, enable_gqa=enable_gqa,
                     )
             else:
+                if rotary_pos_emb is not None:
+                    q_in = _apply_rotary(q_hp, rotary_pos_emb)
+                    k_in = _apply_rotary(k_hp, rotary_pos_emb)
+                else:
+                    q_in, k_in = q_hp, k_hp
                 attn_out_bf = scaled_dot_product_attention_forward(
-                    q_bf, k_bf, v_bf, scale=scale, is_causal=True, enable_gqa=enable_gqa
+                    q_in.permute(1, 2, 0, 3),
+                    k_in.permute(1, 2, 0, 3),
+                    v_hp.permute(1, 2, 0, 3),
+                    scale=scale, is_causal=True, enable_gqa=enable_gqa,
                 )
             attn_out = attn_out_bf.permute(2, 0, 1, 3).contiguous()
 
@@ -518,6 +566,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             _z_loss_coeff = getattr(ctx, 'z_loss_coeff', 0.0)
             _router_logits_saved = getattr(ctx, '_router_logits', None)
             _routing_map_saved = getattr(ctx, '_routing_map', None)
+            _cp_group = ctx.cp_group
 
             def _router_bwd_task():
                 router_result[0], router_result[1] = router_backward(
@@ -536,6 +585,7 @@ class TransformerLayerFunction(torch.autograd.Function):
                     z_loss_coeff=_z_loss_coeff,
                     router_logits=_router_logits_saved,
                     routing_map=_routing_map_saved,
+                    cp_group=_cp_group,
                 )
                 return None  # no gradient to write
 
@@ -603,6 +653,7 @@ class TransformerLayerFunction(torch.autograd.Function):
                 z_loss_coeff=getattr(ctx, 'z_loss_coeff', 0.0),
                 router_logits=getattr(ctx, '_router_logits', None),
                 routing_map=getattr(ctx, '_routing_map', None),
+                cp_group=ctx.cp_group,
             )
             grad_router_weight = register_router_dw_task(
                 hidden_states=ln2_flat,
@@ -681,16 +732,14 @@ class TransformerLayerFunction(torch.autograd.Function):
                 grad_attn_3d, retain_graph=False
             )
         else:
-            # PyTorch SDPA: attn_out_bf and q_for_attn are bhsd. Convert grads
-            # back to sbhd for hp2sp_qkv_backward.
+            # PyTorch SDPA: attn_out_bf is bhsd; q_for_attn/k_for_attn/v_for_attn
+            # are sbhd leaves saved in forward. autograd.grad lands sbhd grads
+            # at the leaves (pre-RoPE if rotary was applied), no permute needed.
             grad_attn_hp = grad_attn_output.permute(1, 2, 0, 3)
             grad_q, grad_k, grad_v = torch.autograd.grad(
                 attn_out_bf, (q_for_attn, k_for_attn, v_for_attn),
                 grad_attn_hp, retain_graph=False
             )
-            grad_q = grad_q.permute(2, 0, 1, 3).contiguous()
-            grad_k = grad_k.permute(2, 0, 1, 3).contiguous()
-            grad_v = grad_v.permute(2, 0, 1, 3).contiguous()
 
         grad_ln1_weight = None
         grad_ln1_bias = None
@@ -757,6 +806,7 @@ class TransformerLayerFunction(torch.autograd.Function):
             None, None,           # ep_plan, cp_plan
             None, None, None,     # te_qkv_linear, te_proj_linear, te_attn
             None, None, None,     # router_dtype, aux_loss_coeff, z_loss_coeff
+            None,                 # rotary_pos_emb
         )
 
 
@@ -1024,12 +1074,15 @@ class TransformerLayer(nn.Module):
         )
         return cfg, cap, signature
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                rotary_pos_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass.
 
         Args:
             x: [seq, batch, hidden] input tensor
+            rotary_pos_emb: optional [seq_full, 1, 1, rot_dim] RoPE freqs.
+                ``None`` skips RoPE (block-test path / models without RoPE).
 
         Returns:
             [seq, batch, hidden] output tensor
@@ -1092,6 +1145,7 @@ class TransformerLayer(nn.Module):
             self._ep_plan, self._cp_plan,
             self.te_qkv_linear, self.te_proj_linear, self.te_attn,
             self.router_dtype, self.aux_loss_coeff, self.z_loss_coeff,
+            rotary_pos_emb,
         )
 
 

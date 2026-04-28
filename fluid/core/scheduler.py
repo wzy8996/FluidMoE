@@ -384,13 +384,20 @@ class BackwardScheduler:
 
         self._init_cuda(force_reinit=True)
 
-    def setup_ar_buffer(self, params):
-        self._shared_ar.setup(params)
+    def setup_ar_buffer(self, params, accumulate_in_fp32: bool = False):
+        """Allocate flat AR buffer for shared params.
+
+        ``accumulate_in_fp32=True`` matches Megatron's default
+        ``accumulate_allreduce_grads_in_fp32=True``: bf16 grads cast to fp32
+        on write, AR runs in fp32, optimizer reads fp32 main_grad.
+        """
+        self._shared_ar.setup(params, accumulate_in_fp32=accumulate_in_fp32)
         for p in params:
             self._param_to_buffer[p] = self._shared_ar
 
-    def setup_expert_ar_buffer(self, params):
-        self._expert_ar.setup(params)
+    def setup_expert_ar_buffer(self, params, accumulate_in_fp32: bool = False):
+        """Same as ``setup_ar_buffer`` but for expert-DP grad reduction."""
+        self._expert_ar.setup(params, accumulate_in_fp32=accumulate_in_fp32)
         for p in params:
             self._param_to_buffer[p] = self._expert_ar
 
@@ -548,9 +555,13 @@ class BackwardScheduler:
 
         Uses gap_budgets (ms) + AR bandwidth (bytes/ms) to dynamically
         compute how much AR data to submit, with expert-first splitting.
-        Falls back to 0 (unlimited) if not configured.
 
-        Returns (expert_budget, shared_budget) in bytes.  0 = unlimited.
+        Returns (expert_budget, shared_budget) in bytes.
+          >0 : cap submission to this many bytes
+          ==0: skip this category in this gap (caller in ``_submit_ar_inline``
+               gates on >0). The drain path (``budgeted=False``) does not
+               call this function — it passes 0 directly to ``submit_block``
+               where 0 means unlimited.
         """
         region = self._region_name
         has_expert = self.expert_dp_world_size > 1 and self.expert_dp_group is not None
@@ -626,24 +637,29 @@ class BackwardScheduler:
             if ar_s:
                 ar_s.record(self.comm_stream)
 
-            # Expert: always pre_scale, only allreduce when expert_dp > 1
+            # Expert: always pre_scale, only allreduce when expert_dp > 1.
+            # Budgeted mode: budget==0 means "skip this category in this gap"
+            # (gap allocated elsewhere by _compute_ar_budget). Drain mode
+            # (budgeted=False) passes 0 = unlimited via submit_block.
             if has_expert_buf:
                 if has_expert_ar:
-                    e_ops, _ = self._expert_ar.submit_block(
-                        self.expert_dp_group, expert_budget,
-                        pre_scale=pre_scale,
-                        ceiling_bf16=ceil_ex_bf16, ceiling_fp32=ceil_ex_fp32)
-                    ops += e_ops
+                    if not budgeted or expert_budget > 0:
+                        e_ops, _ = self._expert_ar.submit_block(
+                            self.expert_dp_group, expert_budget,
+                            pre_scale=pre_scale,
+                            ceiling_bf16=ceil_ex_bf16, ceiling_fp32=ceil_ex_fp32)
+                        ops += e_ops
                 elif pre_scale != 1.0:
                     # expert_dp=1: no allreduce, just scale for AVG convention
                     self._expert_ar.scale_pending(pre_scale)
             # Shared
             if has_shared and self._shared_ar.has_pending():
-                s_ops, _ = self._shared_ar.submit_block(
-                    self.shared_dp_group, shared_budget,
-                    pre_scale=pre_scale,
-                    ceiling_bf16=ceil_sh_bf16, ceiling_fp32=ceil_sh_fp32)
-                ops += s_ops
+                if not budgeted or shared_budget > 0:
+                    s_ops, _ = self._shared_ar.submit_block(
+                        self.shared_dp_group, shared_budget,
+                        pre_scale=pre_scale,
+                        ceiling_bf16=ceil_sh_bf16, ceiling_fp32=ceil_sh_fp32)
+                    ops += s_ops
             # Fallback: params not in flat buffer
             if not budgeted:
                 while self._pending_ar_tensors:

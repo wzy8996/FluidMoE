@@ -1434,6 +1434,7 @@ def router_backward(
     z_loss_coeff: float = 0.0,
     router_logits: Optional[torch.Tensor] = None,
     routing_map: Optional[torch.Tensor] = None,
+    cp_group: Optional["dist.ProcessGroup"] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute router backward: gradients through post-softmax routing and linear projection.
@@ -1484,17 +1485,27 @@ def router_backward(
     )
     grad_router_logits.scatter_(1, top_indices, grad_top_logits)
 
-    # Step 4b: Inject aux_loss gradient.
-    # aux_loss = coeff * N * sum_e (f_e * P_e)
-    #   f_e = (tokens_per_expert_e * N) / (T * topk)   [non-diff]
-    #   P_e = mean_t routing_probs[t, e]
-    # d aux / d routing_probs[t, e] = coeff * N * f_e / T
+    # Step 4b: Inject aux_loss gradient (Megatron switch_load_balancing_loss_func).
+    # aux_loss = (N * coeff / (topk * T)) * sum_e (P_e * tokens_per_expert_e)
+    #   P_e = sum_t routing_probs[t, e]
+    # d aux / d routing_probs[t, e] = N * coeff * tokens_per_expert_e / (topk * T^2)
     # Non-zero only at top-k positions; propagate through top-k softmax.
     if aux_loss_coeff > 0 and routing_map is not None:
         real_tokens_per_expert = routing_map.to(torch.float32).sum(dim=0)  # [E]
-        f_e = real_tokens_per_expert * num_experts / (num_tokens * top_k)  # [E]
-        # d aux / d top_probs[t, k] = coeff * N / T * f_e[top_indices[t, k]]
-        grad_top_probs_aux = (aux_loss_coeff * num_experts / num_tokens) * f_e[top_indices]
+        # Match Megatron's switch_load_balancing_loss_func: aux loss uses
+        # global tokens_per_expert and total_num_tokens reduced across the
+        # tp_cp group (here cp_group, since we run with TP=1). Without this
+        # the gradient is per-rank only, diverging from Megatron's load
+        # balance signal in CP > 1 settings.
+        if cp_group is not None and cp_group.size() > 1:
+            dist.all_reduce(real_tokens_per_expert, group=cp_group)
+            global_num_tokens = num_tokens * cp_group.size()
+        else:
+            global_num_tokens = num_tokens
+        # Match Megatron exactly: d aux / d probs[t, e] = N * coeff * TPE_e / (topk * T^2)
+        grad_top_probs_aux = (aux_loss_coeff * num_experts /
+                              (top_k * global_num_tokens * global_num_tokens)) * \
+                             real_tokens_per_expert[top_indices]
         grad_top_probs_aux = grad_top_probs_aux.to(top_probs.dtype)
         sum_grad_aux = (grad_top_probs_aux * top_probs).sum(dim=-1, keepdim=True)
         grad_top_logits_aux = top_probs * (grad_top_probs_aux - sum_grad_aux)

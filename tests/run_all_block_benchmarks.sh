@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Note: -e is intentionally OFF — individual baselines may OOM or fail and
+# we want the rest to still run. Each job's exit status is captured.
+set -uo pipefail
 
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -90,24 +92,41 @@ FLUIDMOE_LOG="$(mktemp)"
 OVERLAP_LOG="$(mktemp)"
 trap 'rm -f "${DEEPSPEED_LOG}" "${MEGATRON_LOG}" "${FLUIDMOE_LOG}" "${OVERLAP_LOG}"' EXIT
 
-echo "[1/4] DeepSpeed Baseline"
-"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl deepspeed | tee "${DEEPSPEED_LOG}"
-echo
+# Per-job runner that records exit status and never aborts the whole script.
+# Caller passes label, log path, and the command. Returns 0 on success, 1 on
+# failure; the script logs which jobs failed but continues to the next one.
+run_one() {
+  local label="$1"; local log="$2"; shift 2
+  echo "${label}"
+  "$@" 2>&1 | tee "${log}"
+  local rc=${PIPESTATUS[0]}
+  if (( rc != 0 )); then
+    echo "  [WARN] ${label} FAILED (exit=${rc}) — continuing with next baseline."
+    echo "  Last 20 log lines:"
+    tail -n 20 "${log}" | sed 's/^/    /'
+  fi
+  echo
+  return $rc
+}
 
-echo "[2/4] Megatron Baseline"
-"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl megatron | tee "${MEGATRON_LOG}"
-echo
+run_one "[1/4] DeepSpeed Baseline" "${DEEPSPEED_LOG}" \
+  "${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl deepspeed
+DS_RC=$?
 
-echo "[3/4] FluidMoE (full mode: scheduler + inline AR)"
-"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl fluidmoe-full | tee "${FLUIDMOE_LOG}"
-echo
+run_one "[2/4] Megatron Baseline" "${MEGATRON_LOG}" \
+  "${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl megatron
+MEG_RC=$?
 
-echo "[4/4] Overlap Analysis"
-"${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" \
+run_one "[3/4] FluidMoE (full mode: scheduler + inline AR)" "${FLUIDMOE_LOG}" \
+  "${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" "${COMMON_ARGS[@]}" --impl fluidmoe-full
+FLU_RC=$?
+
+run_one "[4/4] Overlap Analysis" "${OVERLAP_LOG}" \
+  "${TORCHRUN_BIN}" "${TORCHRUN_ARGS[@]}" \
   tests/overlap_ratio_analyzer.py --model "${MODEL}" \
   --dp-size "${DP_SIZE}" --cp-size "${CP_SIZE}" --ep-size "${EP_SIZE}" \
-  --warmup "${WARMUP}" --iters "${ITERS}" | tee "${OVERLAP_LOG}"
-echo
+  --warmup "${WARMUP}" --iters "${ITERS}"
+OVL_RC=$?
 
 "${PYTHON_BIN}" - "${DEEPSPEED_LOG}" "${MEGATRON_LOG}" "${FLUIDMOE_LOG}" "${OVERLAP_LOG}" <<'PY'
 import re
@@ -115,63 +134,78 @@ import sys
 
 deepspeed_log, megatron_log, fluidmoe_log, overlap_log = sys.argv[1:5]
 
-with open(deepspeed_log, "r", encoding="utf-8") as f:
-    deepspeed_text = f.read()
-with open(megatron_log, "r", encoding="utf-8") as f:
-    megatron_text = f.read()
-with open(fluidmoe_log, "r", encoding="utf-8") as f:
-    fluidmoe_text = f.read()
-with open(overlap_log, "r", encoding="utf-8") as f:
-    overlap_text = f.read().strip()
-
 baseline_re = r"RESULT impl=\S+ forward_ms=([0-9.]+) iter_ms=([0-9.]+)"
-deepspeed_match = re.search(baseline_re, deepspeed_text)
-megatron_match = re.search(baseline_re, megatron_text)
-fluidmoe_match = re.search(baseline_re, fluidmoe_text)
 
-failed = []
-if deepspeed_match is None: failed.append("deepspeed")
-if megatron_match is None: failed.append("megatron")
-if fluidmoe_match is None: failed.append("fluidmoe")
-if failed:
-    raise SystemExit(f"Failed to parse RESULT lines from: {', '.join(failed)}")
+def parse_baseline(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(baseline_re, text)
+    if m is None:
+        return None
+    return tuple(map(float, m.groups()))
 
-ds_fwd, ds_iter = map(float, deepspeed_match.groups())
-meg_fwd, meg_iter = map(float, megatron_match.groups())
-fluid_fwd, fluid_iter = map(float, fluidmoe_match.groups())
+ds = parse_baseline(deepspeed_log)
+meg = parse_baseline(megatron_log)
+flu = parse_baseline(fluidmoe_log)
 
-a2a_overlap = None
-ar_overlap = None
-for line in overlap_text.splitlines():
-    line = line.strip()
-    m = re.search(r'a2a_overlap=([0-9.]+)', line)
-    if m:
-        a2a_overlap = float(m.group(1))
-    m = re.search(r'ar_overlap=([0-9.]+)', line)
-    if m:
-        ar_overlap = float(m.group(1))
+a2a_overlap = ar_overlap = None
+try:
+    overlap_text = open(overlap_log, "r", encoding="utf-8").read()
+    for line in overlap_text.splitlines():
+        m = re.search(r'a2a_overlap=([0-9.]+)', line)
+        if m: a2a_overlap = float(m.group(1))
+        m = re.search(r'ar_overlap=([0-9.]+)', line)
+        if m: ar_overlap = float(m.group(1))
+except OSError:
+    pass
 
 print("============================================================")
 print("Benchmark Results")
 print("------------------------------------------------------------")
-print(f"  DeepSpeed Baseline:  forward={ds_fwd:.2f}ms  iter={ds_iter:.2f}ms")
-print(f"  Megatron Baseline:   forward={meg_fwd:.2f}ms  iter={meg_iter:.2f}ms")
-print(f"  FluidMoE (full):     forward={fluid_fwd:.2f}ms  iter={fluid_iter:.2f}ms")
+def fmt(name, res):
+    if res is None:
+        print(f"  {name:<22} [FAILED — see log]")
+    else:
+        fwd, iter_ms = res
+        print(f"  {name:<22} forward={fwd:.2f}ms  iter={iter_ms:.2f}ms")
+fmt("DeepSpeed Baseline:", ds)
+fmt("Megatron Baseline:",  meg)
+fmt("FluidMoE (full):",    flu)
 if a2a_overlap is not None:
     print(f"  A2A overlap ratio:   {a2a_overlap:.1%}")
 if ar_overlap is not None:
     print(f"  AR overlap ratio:    {ar_overlap:.1%}")
 print("------------------------------------------------------------")
-print("Speedup (vs Megatron Baseline)")
-print(f"  forward speedup    = {meg_fwd / fluid_fwd:.3f}x")
-print(f"  iter speedup       = {meg_iter / fluid_iter:.3f}x")
-print("------------------------------------------------------------")
-print("Speedup (vs DeepSpeed Baseline)")
-print(f"  forward speedup    = {ds_fwd / fluid_fwd:.3f}x")
-print(f"  iter speedup       = {ds_iter / fluid_iter:.3f}x")
+if flu is not None:
+    fluid_fwd, fluid_iter = flu
+    if meg is not None:
+        meg_fwd, meg_iter = meg
+        print("Speedup (vs Megatron Baseline)")
+        print(f"  forward speedup    = {meg_fwd / fluid_fwd:.3f}x")
+        print(f"  iter speedup       = {meg_iter / fluid_iter:.3f}x")
+        print("------------------------------------------------------------")
+    if ds is not None:
+        ds_fwd, ds_iter = ds
+        print("Speedup (vs DeepSpeed Baseline)")
+        print(f"  forward speedup    = {ds_fwd / fluid_fwd:.3f}x")
+        print(f"  iter speedup       = {ds_iter / fluid_iter:.3f}x")
+        print("------------------------------------------------------------")
+else:
+    print("FluidMoE failed — speedup numbers omitted.")
+    print("------------------------------------------------------------")
 print()
 print("Note: this script runs FluidMoE in 'full' mode (scheduler + inline AR).")
 print("      For the F/FB/full ablation, run run_block_benchmark.py three times")
 print("      with --impl=fluidmoe-{f,fb,full}.")
 print("============================================================")
 PY
+
+# Final exit code: 0 only if ALL four jobs succeeded. Useful for CI.
+if (( DS_RC != 0 || MEG_RC != 0 || FLU_RC != 0 || OVL_RC != 0 )); then
+  echo
+  echo "[!] One or more jobs failed: ds=${DS_RC} meg=${MEG_RC} flu=${FLU_RC} overlap=${OVL_RC}"
+  exit 1
+fi

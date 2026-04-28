@@ -134,10 +134,12 @@ class FluidDDP(torch.nn.Module):
         self._dp_cp_group = dp_cp_group if dp_cp_size > 1 else None
         self._dp_cp_size = dp_cp_size
 
-        # Allocate contiguous grad buffer in param dtype so communication buffer
-        # and main_grad follow the official Megatron DDP behavior when
-        # grad_reduce_in_fp32=False.
-        self._buffer_dtype = self._buffer_params[0].dtype
+        # Allocate contiguous grad buffer in fp32 to match Megatron's default
+        # ``accumulate_allreduce_grads_in_fp32=True``. bf16 grads are cast to
+        # fp32 on the way into the buffer (see _grad_hook below); AR runs in
+        # fp32; optimizer reads fp32 main_grad. This makes FluidDDP comparable
+        # to Megatron mcore_DDP without a dtype-mismatch bias in benchmarks.
+        self._buffer_dtype = torch.float32
         total_numel = sum(p.numel() for p in self._buffer_params)
         self._grad_buffer = torch.zeros(total_numel, dtype=self._buffer_dtype,
                                         device=torch.cuda.current_device())
@@ -223,9 +225,11 @@ class FluidDDP(torch.nn.Module):
                     layer._get_qkv_weight(),
                     layer.ln1_weight, layer.ln1_bias,
                 ])
-            self._scheduler.setup_ar_buffer(shared_params)
+            # accumulate_in_fp32=True: align with Megatron's default
+            # accumulate_allreduce_grads_in_fp32 — fp32 main_grad + fp32 AR.
+            self._scheduler.setup_ar_buffer(shared_params, accumulate_in_fp32=True)
             if expert_params:
-                self._scheduler.setup_expert_ar_buffer(expert_params)
+                self._scheduler.setup_expert_ar_buffer(expert_params, accumulate_in_fp32=True)
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)

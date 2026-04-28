@@ -63,6 +63,9 @@ class _DeepSpeedZeRO0AR(nn.Module):
       - params split into ~500M-element buckets (DeepSpeed
         ``reduce_bucket_size`` default) so each AR matches DeepSpeed's
         per-bucket launch granularity rather than one giant AR per dtype
+      - all bucket flats allocated in fp32 to align with Megatron's default
+        ``accumulate_allreduce_grads_in_fp32=True`` and FluidDDP (which also
+        uses fp32 grad accumulation). bf16 grads cast on copy_ into the flat.
 
     Naive ``torch.nn.parallel.DistributedDataParallel`` would AR every param
     across the whole group, including experts — for mixtral_8x7b that means
@@ -79,6 +82,9 @@ class _DeepSpeedZeRO0AR(nn.Module):
         self._dp_group = dp_group
         self._dp_size = dp_size
         self._dp_cp_size = dp_cp_size
+        # param → (bucket_idx, offset, numel) for the post-accumulate hook.
+        self._param_to_bucket = {}
+        self._hooks = []
         self._build_flat_buffers()
 
     @staticmethod
@@ -90,36 +96,51 @@ class _DeepSpeedZeRO0AR(nn.Module):
 
     def _build_flat_buffers(self):
         device = next(self.module.parameters()).device
-        groups = {}  # (is_expert, dtype) -> [params]
+        # All flats are fp32 → no need to split groups by dtype, only by
+        # is_expert (different AR group). bf16/fp32 params co-exist in the
+        # same fp32 flat; the hook casts on write.
+        groups = {True: [], False: []}
         for name, p in self.module.named_parameters():
-            is_expert = self._is_expert_param(name)
-            groups.setdefault((is_expert, p.dtype), []).append(p)
-        # Buckets: list of (flat, params, is_expert). Each bucket sits inside
-        # a single (is_expert, dtype) group and holds <= _BUCKET_SIZE_ELEMS
-        # elements (a single param exceeding the cap goes alone).
+            groups[self._is_expert_param(name)].append(p)
         self._buckets = []
         cap = self._BUCKET_SIZE_ELEMS
-        for (is_expert, dtype), params in groups.items():
+        for is_expert, params in groups.items():
             cur, cur_n = [], 0
             for p in params:
                 if cur and cur_n + p.numel() > cap:
-                    self._buckets.append(self._make_bucket(cur, dtype, is_expert, device))
+                    self._flush_bucket(cur, is_expert, device)
                     cur, cur_n = [], 0
                 cur.append(p)
                 cur_n += p.numel()
             if cur:
-                self._buckets.append(self._make_bucket(cur, dtype, is_expert, device))
+                self._flush_bucket(cur, is_expert, device)
 
-    @staticmethod
-    def _make_bucket(params, dtype, is_expert, device):
+    def _flush_bucket(self, params, is_expert, device):
+        """Allocate flat fp32 buffer for these params and register a
+        post-accumulate hook on each so its grad is folded into the buffer
+        and freed immediately during backward (avoids p.grad + flat both
+        living through to finish_grad_sync, which previously doubled the
+        peak grad memory and caused OOM on 24GB cards)."""
         numel = sum(p.numel() for p in params)
-        flat = torch.zeros(numel, dtype=dtype, device=device)
+        flat = torch.zeros(numel, dtype=torch.float32, device=device)
+        bucket_idx = len(self._buckets)
         offset = 0
         for p in params:
             n = p.numel()
             p.main_grad = flat[offset:offset + n].view(p.shape)
+            self._param_to_bucket[p] = (bucket_idx, offset, n)
+            self._hooks.append(p.register_post_accumulate_grad_hook(self._grad_hook))
             offset += n
-        return (flat, list(params), is_expert)
+        self._buckets.append((flat, list(params), is_expert))
+
+    def _grad_hook(self, param):
+        """Fold param.grad into its fp32 flat slice and free param.grad."""
+        if param.grad is None:
+            return
+        bucket_idx, offset, n = self._param_to_bucket[param]
+        flat = self._buckets[bucket_idx][0]
+        flat[offset:offset + n].add_(param.grad.view(-1).to(flat.dtype))
+        param.grad = None
 
     def forward(self, *a, **kw):
         return self.module(*a, **kw)
@@ -131,14 +152,10 @@ class _DeepSpeedZeRO0AR(nn.Module):
             flat.zero_()
 
     def finish_grad_sync(self):
+        # Hooks already wrote (and freed) all grads into the flat fp32 buffers
+        # during backward, so this is just pre-scale + AR per bucket.
         pre_scale = 1.0 / self._dp_cp_size if self._dp_cp_size > 1 else 1.0
-        for flat, params, is_expert in self._buckets:
-            offset = 0
-            for p in params:
-                n = p.numel()
-                if p.grad is not None:
-                    flat[offset:offset + n].copy_(p.grad.view(-1))
-                offset += n
+        for flat, _params, is_expert in self._buckets:
             if pre_scale != 1.0:
                 flat.mul_(pre_scale)
             if is_expert:
@@ -146,14 +163,6 @@ class _DeepSpeedZeRO0AR(nn.Module):
                     dist.all_reduce(flat, group=self._dp_group)
             else:
                 dist.all_reduce(flat, group=self._all_group)
-            # Re-bind main_grad views (caching allocator may have moved them
-            # under us if any operation reallocated).
-            offset = 0
-            for p in params:
-                n = p.numel()
-                p.main_grad = flat[offset:offset + n].view(p.shape)
-                p.grad = None
-                offset += n
 
 
 # =============================================================================
@@ -352,7 +361,9 @@ def main():
         # Layers store the TransformerConfig; pull it from the first layer.
         transformer_config = model.layers[0].config
         ddp_config = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=False,
+            # Align with real-training Megatron default (and now DeepSpeed
+            # wrapper + FluidDDP): fp32 grad accumulation + fp32 AR.
+            grad_reduce_in_fp32=True,
             overlap_grad_reduce=(args.impl == "megatron-overlap"),
             use_distributed_optimizer=False,
             bucket_size=None,
@@ -411,6 +422,11 @@ def main():
             attn_qkv_chunks=args.attn_qkv_chunks,
             capacity_factor=capacity_factor,
             dtype=torch.bfloat16, device=device,
+            # block-test scope: aux_loss disabled to keep the comparison purely
+            # about scheduling/comm. router_dtype kept fp32 to match production
+            # numerical stability convention.
+            router_dtype=torch.float32,
+            aux_loss_coeff=0.0,
         )
         chunk_messages = fluidmoe_model.prepare_chunk_status(x)
         if chunk_messages:

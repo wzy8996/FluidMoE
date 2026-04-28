@@ -119,8 +119,13 @@ class MegatronBaselineTransformerModel(nn.Module):
             num_moe_experts=num_experts,
             moe_router_topk=top_k,
             moe_token_dispatcher_type="alltoall",
+            # block-test scope: aux_loss disabled (training-side feature; including
+            # it asymmetrically penalizes Megatron with per-layer tracker AR +
+            # MoEAuxLossAutoScaler autograd wrapping that FluidMoE doesn't pay).
+            # router_dtype='fp32' kept to match production router stability.
             moe_router_load_balancing_type="none",
             moe_aux_loss_coeff=0.0,
+            moe_router_dtype='fp32',
             moe_expert_capacity_factor=moe_capacity,
             moe_pad_expert_input_to_capacity=(moe_capacity is not None),
             moe_grouped_gemm=True,

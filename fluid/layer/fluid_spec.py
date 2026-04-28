@@ -117,7 +117,7 @@ class FluidTransformerLayer(MegatronModule, BaseTransformerLayer):
         sequence_len_offset=None,
         **kwargs,
     ):
-        output = self.layer(hidden_states)
+        output = self.layer(hidden_states, rotary_pos_emb=rotary_pos_emb)
         return output, context
 
 

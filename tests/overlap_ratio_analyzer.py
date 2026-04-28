@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--mode", choices=["sync", "interleaved"], default="interleaved")
+    parser.add_argument("--num-layers", type=int, default=None,
+                        help="Override num_layers from model config (debug)")
     return parser.parse_args()
 
 
@@ -58,7 +60,7 @@ def main():
     ffn_hidden = int(cfg.get("ffn_hidden", 14336))
     num_experts = int(cfg.get("num_experts", 8))
     top_k = int(cfg.get("top_k", 2))
-    num_layers = int(cfg.get("num_layers", 4))
+    num_layers = int(args.num_layers) if args.num_layers is not None else int(cfg.get("num_layers", 4))
     seq_len = int(cfg.get("seq_len", 4096))
     batch_size = int(cfg.get("batch_size", 4))
     capacity_factor = float(cfg.get("capacity_factor", 1.0))

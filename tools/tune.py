@@ -384,7 +384,7 @@ sched.process_gap_events()
 sched.profiling = False
 
 # Use p10 of per-region gap as gap_budgets (ms).
-SAFETY_FACTOR = 0.6
+SAFETY_FACTOR = 0.8
 gap_budgets = {}
 p0(f"\n  Per-region gap times (safety_factor={SAFETY_FACTOR}):")
 p0(f"  {'Region':<22s} {'Gap description':<42s} {'T_p10':>8s} {'T_mean':>8s} {'budget':>8s} {'n':>4s}")
