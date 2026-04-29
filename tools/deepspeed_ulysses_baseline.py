@@ -117,6 +117,7 @@ class DeepSpeedBlockBaselineLayer(nn.Module):
         capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        wire_ep_group: bool = True,
     ):
         super().__init__()
 
@@ -179,9 +180,14 @@ class DeepSpeedBlockBaselineLayer(nn.Module):
             top2_2nd_expert_sampling=True,
         )
         self.moe.to(device=device)
-        # Reuse the benchmark-created expert-parallel group instead of letting
-        # DeepSpeed create a different topology implicitly.
-        self.moe.deepspeed_moe._set_ep_group(ep_group)
+        # In block-test mode (wire_ep_group=True) we wire the benchmark's
+        # expert-parallel group manually since there is no deepspeed.initialize()
+        # step that would do it. In E2E mode (wire_ep_group=False), deepspeed
+        # engine's set_deepspeed_parallelism() handles ep_group wiring; setting
+        # it now would later trip the "override ep_group" assert in
+        # deepspeed.moe.sharded_moe._set_ep_group.
+        if wire_ep_group:
+            self.moe.deepspeed_moe._set_ep_group(ep_group)
 
         self._reset_parameters()
 
@@ -217,7 +223,10 @@ class DeepSpeedBlockBaselineLayer(nn.Module):
         hidden_after_attn = hidden_states + proj_out
 
         ln2_out = F.layer_norm(hidden_after_attn, (hidden_size,), self.ln2_weight, self.ln2_bias)
-        moe_out, _, _ = self.moe(ln2_out)
+        moe_out, l_aux, _ = self.moe(ln2_out)
+        # Captured for E2E aux-loss aggregation in pretrain_deepspeed.py;
+        # block-test callers ignore this attribute.
+        self._last_l_aux = l_aux
         return hidden_after_attn + moe_out
 
 
@@ -239,6 +248,7 @@ class DeepSpeedBlockBaselineTransformerModel(nn.Module):
         capacity_factor: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        wire_ep_group: bool = True,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -257,6 +267,7 @@ class DeepSpeedBlockBaselineTransformerModel(nn.Module):
                     capacity_factor=capacity_factor,
                     dtype=dtype,
                     device=device,
+                    wire_ep_group=wire_ep_group,
                 )
                 for i in range(num_layers)
             ]

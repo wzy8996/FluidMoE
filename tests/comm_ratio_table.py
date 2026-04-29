@@ -305,12 +305,7 @@ def emit_table(rows):
 # Main
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODELS = [
-    'dbrx_base',
-    'deepseek_v3_mha_proxy',
-    'glm4_5_air_mha_proxy',
-    'qwen3_30b_a3b',
-]
+DEFAULT_MODELS = ['mixtral_8x7b', 'dbrx', 'phi_3_5_moe', 'olmoe_1b_7b']
 
 
 def main():

@@ -28,7 +28,7 @@ from model_configs import get_model_config, list_model_names
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FluidMoE parameter search")
-    parser.add_argument("--model", type=str, default="dbrx_base", help="Model name (from tools/model_configs.py)")
+    parser.add_argument("--model", type=str, default="mixtral_8x7b", help="Model name (from tools/model_configs.py)")
     parser.add_argument("--list-models", action="store_true", help="List available models and exit")
     return parser.parse_args()
 

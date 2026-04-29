@@ -11,7 +11,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
-MODEL="${MODEL:-qwen3_30b_a3b}"
+MODEL="${MODEL:-mixtral_8x7b}"
 
 read_default() {
   local key="$1"

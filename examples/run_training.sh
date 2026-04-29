@@ -8,8 +8,8 @@
 # Experiment configs (parallelism, chunks, AR) are read from tools/experiment_configs.py.
 #
 # Usage:
-#   bash examples/run_training.sh                          # default: dbrx_base
-#   MODEL=qwen3_30b_a3b bash examples/run_training.sh      # different model
+#   bash examples/run_training.sh                          # default: mixtral_8x7b
+#   MODEL=mixtral_8x7b bash examples/run_training.sh      # different model
 #   TRAIN_ITERS=500 bash examples/run_training.sh          # more iterations
 set -euo pipefail
 
@@ -20,7 +20,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
-MODEL="${MODEL:-dbrx_base}"
+MODEL="${MODEL:-mixtral_8x7b}"
 TRAIN_ITERS="${TRAIN_ITERS:-300}"
 LR_WARMUP="${LR_WARMUP:- 30}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
@@ -62,8 +62,9 @@ print(d['dp_size'], d['cp_size'], d['ep_size'],
 
 NPROC=$((DP_SIZE * CP_SIZE))
 
-# Pretrain needs more memory than block benchmark (fp32 master + optimizer state).
-SEQ_LEN="${SEQ_LEN_OVERRIDE:-$((SEQ_LEN > 2048 ? 2048 : SEQ_LEN))}"
+# Use seq_len from model_configs.py as-is (paper-scale runs need full
+# context). Set SEQ_LEN_OVERRIDE to override on memory-constrained machines.
+SEQ_LEN="${SEQ_LEN_OVERRIDE:-${SEQ_LEN}}"
 BATCH_SIZE="${BATCH_SIZE_OVERRIDE:-1}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${BATCH_SIZE}}"
 # Megatron requires global_batch_size to be divisible by micro_batch_size * dp_size.
@@ -166,7 +167,11 @@ echo
 TMPDIR_RUN=$(mktemp -d)
 MEG_LOG="${TMPDIR_RUN}/megatron.log"
 FLUID_LOG="${TMPDIR_RUN}/fluidmoe.log"
+DS_LOG="${TMPDIR_RUN}/deepspeed.log"
 
+# Return 0 on success, non-zero on failure. Caller decides whether to continue.
+# (Previously this called `exit` on failure, which made one bad framework abort
+# the whole 3-system comparison.)
 run_training_job() {
     local label="$1"
     local log_file="$2"
@@ -179,31 +184,56 @@ run_training_job() {
 
     if [[ ${pipe_status[0]} -ne 0 ]]; then
         echo
-        echo "${label} failed. Last 80 log lines:"
+        echo "${label} failed (exit=${pipe_status[0]}). Last 80 log lines:"
         tail -n 80 "${log_file}"
-        exit "${pipe_status[0]}"
+        return "${pipe_status[0]}"
     fi
 
     if [[ ${pipe_status[2]} -ne 0 ]]; then
         echo
         echo "${label} produced no iteration logs. Last 80 log lines:"
         tail -n 80 "${log_file}"
-        exit 1
+        return 1
     fi
+    return 0
 }
 
-echo "[1/2] Megatron Baseline ..."
+# `set -e` would make a non-zero return from `run_training_job` abort the whole
+# script; disable around the per-framework block so one failure doesn't kill
+# the others. Track exit codes for the summary.
+set +e
+DS_RC=0; MEG_RC=0; FLUID_RC=0
+
+echo "[1/3] DeepSpeed-MoE Baseline ..."
+run_training_job \
+    "DeepSpeed-MoE Baseline" \
+    "${DS_LOG}" \
+    ${TORCHRUN_BIN} --nproc_per_node="${NPROC}" examples/pretrain_deepspeed.py "${COMMON_ARGS[@]}"
+DS_RC=$?
+echo
+
+echo "[2/3] Megatron Baseline ..."
 run_training_job \
     "Megatron Baseline" \
     "${MEG_LOG}" \
     ${TORCHRUN_BIN} --nproc_per_node="${NPROC}" examples/pretrain_megatron.py "${COMMON_ARGS[@]}"
+MEG_RC=$?
 echo
 
-echo "[2/2] FluidMoE ..."
+echo "[3/3] FluidMoE ..."
 run_training_job \
     "FluidMoE" \
     "${FLUID_LOG}" \
     ${TORCHRUN_BIN} --nproc_per_node="${NPROC}" examples/pretrain_fluidmoe.py "${COMMON_ARGS[@]}"
+FLUID_RC=$?
+echo
+
+set -e
+
+# Per-framework status line so `cat run.log | tail` shows what worked.
+echo "Run status:  DeepSpeed=$([[ $DS_RC -eq 0 ]] && echo OK || echo FAIL)  " \
+              "Megatron=$([[ $MEG_RC -eq 0 ]] && echo OK || echo FAIL)  " \
+              "FluidMoE=$([[ $FLUID_RC -eq 0 ]] && echo OK || echo FAIL)"
 echo
 
 # ── Summary: compute stable step time (skip first LR_WARMUP steps) ──
@@ -211,13 +241,16 @@ echo "============================================================"
 echo "Summary"
 echo "============================================================"
 "${PYTHON_BIN}" -c "
-import re, sys
+import os, re, sys
 
 def parse_log(path, warmup):
     times, losses = [], []
+    if not os.path.exists(path):
+        return times, losses
+    pat = re.compile(r'iteration +(\d+)/.*elapsed time per iteration \(ms\): ([\d.]+).*lm loss: ([\d.E+\-]+).*grad norm: ([\d.]+)')
     with open(path) as f:
         for line in f:
-            m = re.search(r'iteration +(\d+)/.*elapsed time per iteration \(ms\): ([\d.]+).*lm loss: ([\d.E+\-]+).*grad norm: ([\d.]+)', line)
+            m = pat.search(line)
             if m:
                 step, t, loss, gn = int(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
                 if step > warmup:
@@ -226,25 +259,34 @@ def parse_log(path, warmup):
     return times, losses
 
 warmup = ${LR_WARMUP}
-meg_times, meg_losses = parse_log('${MEG_LOG}', warmup)
-flu_times, flu_losses = parse_log('${FLUID_LOG}', warmup)
+results = {
+    'DeepSpeed': parse_log('${DS_LOG}', warmup),
+    'Megatron':  parse_log('${MEG_LOG}', warmup),
+    'FluidMoE':  parse_log('${FLUID_LOG}', warmup),
+}
 
-if meg_times and flu_times:
-    meg_avg = sum(meg_times) / len(meg_times)
-    flu_avg = sum(flu_times) / len(flu_times)
-    speedup = meg_avg / flu_avg
-    print(f'  Megatron  avg step time: {meg_avg:7.1f} ms  (over {len(meg_times)} steps after warmup)')
-    print(f'  FluidMoE  avg step time: {flu_avg:7.1f} ms  (over {len(flu_times)} steps after warmup)')
-    print(f'  Speedup: {speedup:.2f}x')
-    print()
-    # Final loss comparison
-    if meg_losses and flu_losses:
-        _, ml, mg = meg_losses[-1]
-        _, fl, fg = flu_losses[-1]
-        print(f'  Final loss  Megatron={ml:.4f}  FluidMoE={fl:.4f}')
-        print(f'  Final gn    Megatron={mg:.3f}   FluidMoE={fg:.3f}')
-else:
-    print('  ERROR: could not parse enough iterations', file=sys.stderr)
+avgs = {}
+for name, (times, losses) in results.items():
+    if times:
+        avg = sum(times) / len(times)
+        avgs[name] = avg
+        last_loss = losses[-1][1] if losses else float('nan')
+        last_gn = losses[-1][2] if losses else float('nan')
+        print(f'  {name:10s} avg step time: {avg:7.1f} ms  ({len(times)} steps)  '
+              f'final loss={last_loss:.4f}  gn={last_gn:.3f}')
+    else:
+        print(f'  {name:10s} (no parsed iterations)')
+
+print()
+# All meaningful pairwise speedups for whichever frameworks succeeded.
+if 'FluidMoE' in avgs and 'Megatron' in avgs:
+    print(f'  Speedup FluidMoE / Megatron : {avgs[\"Megatron\"] / avgs[\"FluidMoE\"]:.2f}x')
+if 'FluidMoE' in avgs and 'DeepSpeed' in avgs:
+    print(f'  Speedup FluidMoE / DeepSpeed: {avgs[\"DeepSpeed\"] / avgs[\"FluidMoE\"]:.2f}x')
+if 'DeepSpeed' in avgs and 'Megatron' in avgs:
+    print(f'  Speedup DeepSpeed / Megatron: {avgs[\"Megatron\"] / avgs[\"DeepSpeed\"]:.2f}x')
+if not avgs:
+    print('  ERROR: no framework produced parseable iterations', file=sys.stderr)
 "
 echo "============================================================"
 rm -rf "${TMPDIR_RUN}"

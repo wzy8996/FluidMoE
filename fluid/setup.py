@@ -101,6 +101,44 @@ class FluidDDP(torch.nn.Module):
                 fluid_layers.append(layer.layer)
         return fluid_layers
 
+    def _collect_inline_ar_model_level_params(self):
+        """Model-level params whose grads have backward A2A windows ahead and
+        therefore benefit from inline AR (vs iteration-tail AR).
+
+        Currently: ``output_layer.weight`` (untied LM head) and
+        ``decoder.final_layernorm.{weight,bias}``. Embedding params are NOT
+        included — their grads are produced at the very end of backward (after
+        block 1's bwd) so there are no A2A windows left to overlap into;
+        iteration-tail AR via ``_grad_buffer`` remains correct for them.
+
+        Skipped entirely if ``FLUIDMOE_DISABLE_MODEL_LEVEL_INLINE_AR=1``
+        (for ablation: compare FluidMoE-FBs vs FluidMoE-FBs+M).
+        """
+        import os as _os
+        if _os.environ.get('FLUIDMOE_DISABLE_MODEL_LEVEL_INLINE_AR', '0') == '1':
+            return []
+        raw = self._get_raw_model()
+        params = []
+        # Tied-weight guard: when share_embeddings_and_output_weights=True,
+        # output_layer.weight IS embedding.word_embeddings.weight. Routing it
+        # to scheduler buffer would also de-route the embedding's tail AR,
+        # so skip and let it ride the iteration-tail path.
+        emb_weight_id = None
+        if hasattr(raw, 'embedding') and hasattr(raw.embedding, 'word_embeddings'):
+            we = raw.embedding.word_embeddings.weight
+            emb_weight_id = id(we) if we is not None else None
+        if hasattr(raw, 'output_layer') and hasattr(raw.output_layer, 'weight'):
+            w = raw.output_layer.weight
+            if w is not None and w.requires_grad and id(w) != emb_weight_id:
+                params.append(w)
+        if hasattr(raw, 'decoder') and hasattr(raw.decoder, 'final_layernorm'):
+            ln = raw.decoder.final_layernorm
+            for attr in ('weight', 'bias'):
+                p = getattr(ln, attr, None)
+                if p is not None and p.requires_grad:
+                    params.append(p)
+        return params
+
     def _setup_grad_buffer(self):
         """Allocate contiguous grad buffer for model-level params and register hooks.
 
@@ -113,10 +151,18 @@ class FluidDDP(torch.nn.Module):
             for p in fluid_layer.parameters():
                 scheduler_param_ids.add(id(p))
 
-        # Model-level params: everything NOT owned by a FluidMoE TransformerLayer
-        # (embedding, final_layernorm, output_layer, etc.)
+        # Model-level params that benefit from inline AR (output_layer +
+        # final_layernorm). Routed to scheduler shared AR buffer instead of
+        # iteration-tail grad_buffer; their grads are ready at backward step 0
+        # so all 4N backward A2A windows are available for overlap.
+        self._inline_ar_model_params = self._collect_inline_ar_model_level_params()
+        inline_ar_ids = {id(p) for p in self._inline_ar_model_params}
+
+        # Remaining model-level params (embedding etc.) — no usable A2A windows
+        # ahead of their grads, so kept on the iteration-tail grad_buffer path.
         self._buffer_params = [
-            p for p in self.module.parameters() if id(p) not in scheduler_param_ids
+            p for p in self.module.parameters()
+            if id(p) not in scheduler_param_ids and id(p) not in inline_ar_ids
         ]
 
         if not self._buffer_params:
@@ -166,6 +212,28 @@ class FluidDDP(torch.nn.Module):
             self._grad_buffer[off:off + numel].add_(param.grad.view(-1).to(self._buffer_dtype))
             param.grad = None  # Free the separate grad tensor
 
+    def _inline_ar_grad_hook(self, param):
+        """Write param.grad → scheduler shared AR buffer, commit, free param.grad.
+
+        Fires once autograd finishes accumulating into ``param.grad`` for a
+        model-level inline-AR param (output_layer.weight, final_layernorm.*).
+        For output_layer this is at backward step 0; subsequent backward A2A
+        windows pick up these committed bytes via ``_submit_ar_inline``.
+
+        ``write_grad`` also sets ``param.main_grad`` to the buffer slice, so
+        the optimizer reads fp32 main_grad (matches Megatron's main_grad
+        pattern, identical to decoder shared params in the same buffer).
+        """
+        if param.grad is None:
+            return
+        grad = param.grad
+        if grad.dtype != torch.float32:
+            grad = grad.to(torch.float32)
+        handled = self._scheduler._shared_ar.write_grad(param, grad)
+        if handled:
+            self._scheduler._shared_ar.commit()
+        param.grad = None
+
     def _configure_scheduler(self):
         """Configure scheduler's allreduce groups and AR buffers for decoder params."""
         # Resolve groups: explicit kwargs take precedence over parallel_state.
@@ -211,11 +279,19 @@ class FluidDDP(torch.nn.Module):
             gap_budgets=gap_budgets if gap_budgets else None,
         )
 
-        # Setup AR buffers for FluidMoE TransformerLayer params.
+        # Setup AR buffers for FluidMoE TransformerLayer params + model-level
+        # inline-AR params (output_layer, final_layernorm).
         fluid_layers = self._collect_fluid_layers()
-        if fluid_layers:
+        inline_model_params = getattr(self, '_inline_ar_model_params', [])
+        if fluid_layers or inline_model_params:
             shared_params = []
             expert_params = []
+            # Model-level params FIRST (lowest offsets in flat buffer): their
+            # grads are produced earliest in backward (output_layer at step 0),
+            # so packing at offset 0 means the first ready-to-AR chunks are
+            # model-level bytes — dispatched into the earliest backward A2A
+            # window via the existing _submit_ar_inline machinery.
+            shared_params.extend(inline_model_params)
             for layer in reversed(fluid_layers):
                 expert_params.extend([layer.moe_w2, layer.moe_w1])
                 shared_params.extend([
@@ -230,6 +306,14 @@ class FluidDDP(torch.nn.Module):
             self._scheduler.setup_ar_buffer(shared_params, accumulate_in_fp32=True)
             if expert_params:
                 self._scheduler.setup_expert_ar_buffer(expert_params, accumulate_in_fp32=True)
+
+        # Register post-accumulate-grad hooks for the model-level inline-AR
+        # params now that the buffer's param_map has their offsets. Done here
+        # (not in _setup_grad_buffer) because write_grad needs the buffer
+        # already configured.
+        for p in inline_model_params:
+            hook = p.register_post_accumulate_grad_hook(self._inline_ar_grad_hook)
+            self._hooks.append(hook)
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)

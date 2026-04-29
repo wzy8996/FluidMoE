@@ -17,7 +17,7 @@ set -uo pipefail
 
 NPROC="${NPROC:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
-MODELS=(dbrx_base deepseek_v3_mha_proxy glm4_5_air_mha_proxy qwen3_30b_a3b)
+MODELS=(mixtral_8x7b dbrx phi_3_5_moe olmoe_1b_7b)
 
 # Forward all CLI args (--dp-size / --cp-size / --ep-size / --seq-len /
 # --warmup / --iters) verbatim to the python script.

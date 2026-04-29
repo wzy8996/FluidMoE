@@ -27,7 +27,7 @@ from fluid.core.scheduler import get_backward_scheduler
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="Overlap ratio analyzer")
-    parser.add_argument("--model", type=str, default="dbrx_base")
+    parser.add_argument("--model", type=str, default="mixtral_8x7b")
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--dp-size", type=int, default=defaults["dp_size"])
     parser.add_argument("--cp-size", type=int, default=defaults["cp_size"])

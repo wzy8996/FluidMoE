@@ -171,7 +171,7 @@ class _DeepSpeedZeRO0AR(nn.Module):
 def parse_args():
     defaults = get_block_benchmark_defaults()
     parser = argparse.ArgumentParser(description="FluidMoE Block Benchmark")
-    parser.add_argument("--model", type=str, default="dbrx_base",
+    parser.add_argument("--model", type=str, default="mixtral_8x7b",
                         help="Model name (from tools/model_configs.py)")
     parser.add_argument("--impl", type=str, default="fluidmoe-full",
                         choices=["megatron", "megatron-overlap",
